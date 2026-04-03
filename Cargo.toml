@@ -14,5 +14,6 @@ reqwest = { version = "0.12", features = ["stream", "json"] }
 ulid = "1"
 chrono = { version = "0.4", features = ["serde"] }
 toml = "0.8"
+clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 temp-env = "0.3"

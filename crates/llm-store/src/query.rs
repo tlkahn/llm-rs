@@ -7,7 +7,7 @@ use llm_core::Result;
 use crate::records::{ConversationRecord, LineRecord};
 
 /// Summary of a conversation for listing.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ConversationSummary {
     pub id: String,
     pub model: String,

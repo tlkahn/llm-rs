@@ -4,30 +4,71 @@ Status snapshot of what has been built, what remains, and key decisions made alo
 
 ---
 
-## Current state (Phase 1, Steps 1--4 complete)
+## Current state (Phase 1 complete)
+
+Phase 1 goal was: `echo "Hello" | llm` works end-to-end --- streams to stdout, logs to JSONL. All five steps are done.
 
 ### Crate map
 
 | Crate | Status | Lines | Tests | Purpose |
-|-------|--------|-------|-------|---------|
-| `llm-core` | Steps 1+3+4 done | ~1330 | 88 | Traits, types, streaming, errors, config, keys |
-| `llm-openai` | Step 2 done | 945 | 29 | OpenAI Chat API provider (streaming + non-streaming) |
-| `llm-store` | Step 3 done | 1049 | 42 | JSONL conversation file I/O and queries |
-| `llm-cli` | Not started | -- | -- | Binary entry point (Step 5) |
+|-------|--------|------:|------:|---------|
+| `llm-core` | Complete | 1745 | 88 | Traits, types, streaming, errors, config, keys |
+| `llm-openai` | Complete | 945 | 29 | OpenAI Chat API provider (streaming SSE + non-streaming) |
+| `llm-store` | Complete | 1049 | 42 | JSONL conversation file I/O and queries |
+| `llm-cli` | Complete | 1209 | 29 | Binary: prompt, keys, models, logs commands |
 
-Total: ~3324 lines, 159 tests, all passing.
+Total: ~4950 lines, 188 tests, all passing.
 
 ### What works
 
-- **`llm-core`**: `Prompt`, `Response`, `Chunk`, `Usage`, `ModelInfo`, `Attachment`, `Tool`, `ToolCall`, `ToolResult`, `Options` types. `Provider` async trait with streaming `ResponseStream`. Stream collection utilities (`collect_text`, `collect_tool_calls`, `collect_usage`). `LlmError` with `Model`, `NeedsKey`, `Provider`, `Config`, `Io`, `Store` variants. `Paths` (pure XDG path resolution with `LLM_USER_PATH` override). `Config` (TOML config loading with serde defaults, alias resolution, `LLM_DEFAULT_MODEL` env override). `KeyStore` (TOML-backed key storage with 0o600 permissions). `resolve_key()` (4-level key resolution chain: explicit → store → env var → error).
+**`llm-core`** (Steps 1 + 4)
 
-- **`llm-openai`**: `OpenAiProvider` implementing `Provider` for gpt-4o and gpt-4o-mini. Streaming via SSE with incremental `SseParser`. Non-streaming fallback. Token usage extraction. Tested with `wiremock` HTTP mocking.
+- `Prompt`, `Response`, `Chunk`, `Usage`, `ModelInfo`, `Attachment`, `Tool`, `ToolCall`, `ToolResult`, `Options` types.
+- `Provider` async trait with streaming `ResponseStream` (`Pin<Box<dyn Stream<Item=Result<Chunk>>>>`).
+- Stream collection utilities: `collect_text`, `collect_tool_calls`, `collect_usage`.
+- `LlmError` with six variants: `Model`, `NeedsKey`, `Provider`, `Config`, `Io`, `Store`.
+- `Paths`: pure XDG path resolution with `LLM_USER_PATH` override.
+- `Config`: TOML config loading with serde defaults, alias resolution, `LLM_DEFAULT_MODEL` env override.
+- `KeyStore`: TOML-backed key storage with 0o600 permissions on Unix.
+- `resolve_key()`: 4-level key resolution chain (explicit -> store -> env var -> error).
 
-- **`llm-store`**: `LogStore` struct with `open`, `log_response`, `read_conversation`. Directory-based `list_conversations` (mtime-sorted) and `latest_conversation_id`. Record types (`ConversationRecord`, `ResponseRecord`, `LineRecord` tagged enum) for JSONL serialization. `conversation_name` helper with truncation and whitespace collapsing.
+**`llm-openai`** (Step 2)
 
-### What remains in Phase 1
+- `OpenAiProvider` implementing `Provider` for `gpt-4o` and `gpt-4o-mini`.
+- Streaming via SSE with incremental `SseParser` (handles partial HTTP chunks, `[DONE]` signal).
+- Non-streaming fallback (single JSON response).
+- Token usage extraction from both streaming and non-streaming responses.
+- `OPENAI_BASE_URL` env var support for API endpoint override.
 
-- **Step 5**: `llm-cli` binary with `prompt`, `keys`, `models`, `logs list` commands
+**`llm-store`** (Step 3)
+
+- `LogStore`: `open`, `log_response` (create or append), `read_conversation`.
+- `list_conversations`: directory-based listing sorted by mtime (newest first), reads only first line per file.
+- `latest_conversation_id`: O(1) lookup via mtime.
+- Record types: `ConversationRecord`, `ResponseRecord`, `LineRecord` (tagged enum for JSONL dispatch).
+- `ConversationSummary` with `Serialize` for JSON output.
+- `conversation_name`: human-readable name generation with truncation and whitespace collapsing.
+
+**`llm-cli`** (Step 5)
+
+- `llm prompt <text>` with flags: `-m/--model`, `-s/--system`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`.
+- Default subcommand: `llm "text"` and `echo "text" | llm` work without writing `prompt`.
+- Stdin piping: reads from stdin when not a terminal; combines with positional arg if both present.
+- `llm keys set/get/list/path` --- `set` uses `rpassword` for hidden terminal input, reads plain line when piped.
+- `llm models list` --- prints model IDs with provider names.
+- `llm models default [model]` --- get or set the default model (read-modify-write on `config.toml`).
+- `llm logs list [--json] [-r/--response] [-n/--count N]` --- conversation summaries, JSONL output, most-recent response text.
+- Exit codes: 0 (success), 1 (runtime/IO), 2 (config/key/model), 3 (provider/network).
+- Automatic JSONL logging on every prompt (unless `-n` flag or `config.logging = false`).
+- Provider registry via `providers()` function with `#[cfg(feature)]`-gated provider construction.
+
+### What remains
+
+Phase 1 is the minimum viable CLI. Remaining phases from `metaplan.md`:
+
+- **Phase 2 (v0.2):** Conversations (`-c`, `--cid`, `llm chat`), Anthropic + Ollama providers, options, attachments, aliases, extract.
+- **Phase 3 (v0.3):** Tool calling, structured output, schema DSL.
+- **Phase 4 (v0.4):** Subprocess provider/tool protocol, `--verbose`, shell completions.
 
 ---
 
@@ -79,14 +120,14 @@ ULIDs via the `ulid` crate. 26-char lowercase strings, monotonically ordered by 
 
 ### Timestamps
 
-`chrono::Utc::now().to_rfc3339()` for ISO 8601 timestamps in conversation headers. Response datetimes are passed in by the caller (the CLI will set them at response completion time).
+`chrono::Utc::now().to_rfc3339()` for ISO 8601 timestamps in conversation headers. Response datetimes are set at response completion time by the CLI.
 
 ### Configuration system (Step 4)
 
 Pure XDG path resolution (no `dirs` crate). `$HOME/.config/llm/` for config, `$HOME/.local/share/llm/` for data. `LLM_USER_PATH` flattens both into a single directory (Python compat). Config and keys are TOML files (`config.toml`, `keys.toml`) consolidating what Python scattered across 6+ JSON/txt files.
 
 **Path resolution order** (`Paths::resolve()`):
-1. `$LLM_USER_PATH` → flat layout (both config and data dirs point there)
+1. `$LLM_USER_PATH` -> flat layout (both config and data dirs point there)
 2. `$XDG_CONFIG_HOME/llm` / `$XDG_DATA_HOME/llm`
 3. `$HOME/.config/llm` / `$HOME/.local/share/llm`
 
@@ -96,29 +137,77 @@ Pure XDG path resolution (no `dirs` crate). `$HOME/.config/llm/` for config, `$H
 3. Environment variable (e.g. `OPENAI_API_KEY`)
 4. `NeedsKey` error with actionable message
 
-`Config` fields use `#[serde(default)]` for graceful degradation: missing file → defaults, partial file → defaults for missing fields, extra unknown fields → ignored. `LLM_DEFAULT_MODEL` env var overrides the config file's `default_model`. Model aliases in `config.toml` resolved via `Config::resolve_model()`.
+`Config` fields use `#[serde(default)]` for graceful degradation: missing file -> defaults, partial file -> defaults for missing fields, extra unknown fields -> ignored. `LLM_DEFAULT_MODEL` env var overrides the config file's `default_model`. Model aliases in `config.toml` resolved via `Config::resolve_model()`.
 
 `keys.toml` gets 0o600 permissions on Unix. `KeyStore::set()` creates parent directories automatically.
+
+### Default subcommand (Step 5)
+
+Clap does not natively support a default subcommand. We use argv rewriting in `main.rs:rewrite_args()`: before clap parsing, if the first real argument is not a known subcommand (`prompt`, `keys`, `models`, `logs`) or global flag (`--help`, `--version`), insert `"prompt"` at position 1. When no args at all and stdin is piped, also insert `"prompt"`. This gives:
+
+- `llm "hello"` -> `llm prompt "hello"`
+- `llm -m gpt-4o "hello"` -> `llm prompt -m gpt-4o "hello"`
+- `echo "hi" | llm` -> `echo "hi" | llm prompt`
+- `llm --help` -> unchanged (shows top-level help)
+- `llm keys list` -> unchanged (recognized subcommand)
+
+### Provider registry (Step 5)
+
+`commands/mod.rs::providers()` returns a `Vec<Box<dyn Provider>>` with all compiled-in providers. Each provider is behind a `#[cfg(feature)]` gate (e.g. `feature = "openai"`). The OpenAI provider reads `OPENAI_BASE_URL` env var at construction time, defaulting to `https://api.openai.com`. This supports both OpenAI-compatible APIs (vllm, LiteLLM) and test mocking (wiremock).
+
+### Exit code mapping (Step 5)
+
+| `LlmError` variant | Exit code | Category |
+|---------------------|-----------|----------|
+| `Io`, `Store` | 1 | Runtime error |
+| `Model`, `NeedsKey`, `Config` | 2 | Configuration error |
+| `Provider` | 3 | Network/API error |
+
+Matches the design in `metaplan.md`. Errors print to stderr before exiting.
+
+### Interactive key input (Step 5)
+
+`llm keys set <name>` detects whether stdin is a terminal. If so, uses `rpassword` for hidden input (key does not appear on screen or in shell history). If stdin is piped, reads a plain line (for scripting and testing: `echo "sk-..." | llm keys set openai`).
+
+### Config mutation for `models default` (Step 5)
+
+`llm models default <model>` read-modify-writes `config.toml` using `toml::Table` to preserve unknown fields. This avoids adding a `Config::save()` method to `llm-core`, keeping the core crate focused on read-only config loading.
 
 ---
 
 ## Test strategy
 
-- All tests are inline `#[cfg(test)] mod tests` within each module.
-- `llm-core` config tests use `tempfile::TempDir` for filesystem isolation and `temp_env` for safe env var scoping.
-- `llm-store` tests use `tempfile::TempDir` for isolated filesystem state.
-- `llm-openai` tests use `wiremock::MockServer` for HTTP mocking.
-- No integration tests yet (planned for Step 5 when the CLI exists).
+- **`llm-core`** (88 tests): Inline `#[cfg(test)]` modules. `tempfile::TempDir` for filesystem isolation, `temp_env` for safe env var scoping.
+- **`llm-openai`** (29 tests): Inline modules. `wiremock::MockServer` for HTTP mocking (SSE streaming + non-streaming + error responses).
+- **`llm-store`** (42 tests): Inline modules. `tempfile::TempDir` for isolated filesystem state. JSONL round-trip tests, unicode handling, malformed-line recovery.
+- **`llm-cli`** (29 tests): Integration tests in `tests/integration.rs` using `assert_cmd` + `predicates`. Tests run the compiled binary as a subprocess, asserting on stdout/stderr/exit code. API-dependent tests use `wiremock` with `OPENAI_BASE_URL` pointing to the local mock server. All tests use `LLM_USER_PATH` for filesystem isolation. Helper functions (`openai_non_streaming_body`, `openai_streaming_body`, `write_test_conversation`) create mock data.
 - TDD was used throughout: tests written before implementation in each cycle.
 
 ---
 
 ## Dependencies
 
-| Crate | Key deps |
-|-------|----------|
-| `llm-core` | `serde`, `serde_json`, `thiserror`, `tokio`, `futures`, `async-trait`, `tokio-stream`, `toml`; dev: `temp-env`, `tempfile` |
-| `llm-openai` | `llm-core`, `reqwest` (stream+json), `wiremock` (dev) |
-| `llm-store` | `llm-core`, `serde_json`, `ulid`, `chrono`, `tempfile` (dev) |
+| Crate | Key deps | Dev deps |
+|-------|----------|----------|
+| `llm-core` | `serde`, `serde_json`, `thiserror`, `tokio`, `futures`, `async-trait`, `tokio-stream`, `toml` | `temp-env`, `tempfile` |
+| `llm-openai` | `llm-core`, `reqwest` (stream + json) | `wiremock` |
+| `llm-store` | `llm-core`, `serde_json`, `ulid`, `chrono` | `tempfile` |
+| `llm-cli` | `llm-core`, `llm-openai` (optional), `llm-store`, `clap`, `tokio`, `serde_json`, `futures`, `tokio-stream`, `toml`, `ulid`, `chrono`, `rpassword` | `assert_cmd`, `predicates`, `wiremock`, `tempfile`, `temp-env` |
 
-`rusqlite` is listed as an optional workspace dependency for the future `llm import --from-sqlite` command.
+Workspace dependencies declared in root `Cargo.toml`. `llm-openai` is an optional dependency of `llm-cli` behind the `openai` feature flag (enabled by default).
+
+---
+
+## Phase 1 build order
+
+Each step was a self-contained TDD cycle: write failing tests, make them pass, refactor.
+
+| Step | Crate | What was built | Tests added |
+|------|-------|----------------|------------:|
+| 1 | `llm-core` | `Prompt`, `Chunk`, `Response`, `Usage`, `Provider` trait, `LlmError` | 54 |
+| 2 | `llm-openai` | `OpenAiProvider`, SSE parser, message builder | 29 |
+| 3 | `llm-store` | `LogStore`, JSONL file I/O, conversation listing | 42 |
+| 4 | `llm-core` | `Paths`, `Config`, `KeyStore`, `resolve_key()` | 34 |
+| 5 | `llm-cli` | `prompt`, `keys`, `models`, `logs` commands, default subcommand, exit codes, logging | 29 |
+
+Step 5 was further broken into 12 inner TDD cycles (scaffold, keys path, keys set/get/list, models list, models default, logs list, prompt non-streaming, prompt streaming, prompt flags, stdin+default-subcmd, exit codes, logging).

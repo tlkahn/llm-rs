@@ -1,0 +1,31 @@
+use clap::{Parser, Subcommand};
+
+use crate::commands;
+
+#[derive(Parser)]
+#[command(name = "llm", version, about = "Access large language models from the command line")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+pub enum Commands {
+    /// Send a prompt to a language model
+    Prompt(commands::prompt::PromptArgs),
+    /// Manage API keys
+    Keys {
+        #[command(subcommand)]
+        command: commands::keys::KeysCommand,
+    },
+    /// List and manage models
+    Models {
+        #[command(subcommand)]
+        command: commands::models::ModelsCommand,
+    },
+    /// View and manage conversation logs
+    Logs {
+        #[command(subcommand)]
+        command: commands::logs::LogsCommand,
+    },
+}
