@@ -1,0 +1,19 @@
+[package]
+name = "llm-openai"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+llm-core = { path = "../llm-core" }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio-stream = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+wiremock = "0.6"

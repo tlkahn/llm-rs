@@ -1,0 +1,14 @@
+[package]
+name = "llm-store"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+llm-core = { path = "../llm-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ulid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
