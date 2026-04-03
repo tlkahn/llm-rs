@@ -2,7 +2,7 @@
 
 A Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) --- a CLI tool for interacting with Large Language Models from the terminal.
 
-> **Status:** Work in progress. Core types, OpenAI provider, and storage layer are implemented. The CLI binary is not yet usable.
+> **Status:** Work in progress (Phase 1, Step 5 of 5). Core types, OpenAI provider, storage layer, and configuration system are implemented. The CLI binary is next.
 
 ## Goals
 
@@ -15,9 +15,9 @@ A Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) --- a CLI
 
 ```
 crates/
-  llm-core/      # Traits, types, streaming contracts, errors
-  llm-openai/    # OpenAI Chat API provider
-  llm-store/     # JSONL conversation log storage
+  llm-core/      # Traits, types, streaming contracts, errors, config, key management
+  llm-openai/    # OpenAI Chat API provider (streaming SSE + non-streaming)
+  llm-store/     # JSONL conversation log storage and queries
   llm-cli/       # CLI binary (planned)
 ```
 
@@ -35,7 +35,7 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-126 tests across three crates, covering type contracts, HTTP mocking, serialization round-trips, and filesystem I/O.
+159 tests across three crates, covering type contracts, HTTP mocking, serialization round-trips, filesystem I/O, config parsing, and key resolution.
 
 ## Design
 
@@ -46,7 +46,39 @@ Key divergences from the Python original:
 - **No plugin system.** Providers are compiled in (feature flags) or discovered as subprocess executables on `$PATH`.
 - **JSONL storage.** One file per conversation instead of SQLite. Append-only, human-readable, no migrations.
 - **Async-first.** Single `Provider` trait using tokio streams, no sync/async class duplication.
-- **TOML config.** Two files (`config.toml` + `keys.toml`) instead of six scattered JSON/YAML/text files.
+- **TOML config.** Two files (`config.toml` + `keys.toml`) in XDG directories instead of six scattered JSON/YAML/text files. Pure XDG path resolution on all platforms.
+
+## Configuration
+
+Config files live in XDG-standard directories:
+
+```
+~/.config/llm/config.toml    # main configuration
+~/.config/llm/keys.toml      # API keys (0600 permissions)
+~/.local/share/llm/logs/     # conversation logs (JSONL)
+```
+
+Override with `LLM_USER_PATH` to put everything in one directory (e.g. for testing or migration from Python `llm`).
+
+**config.toml:**
+
+```toml
+default_model = "gpt-4o-mini"
+logging = true
+
+[aliases]
+claude = "claude-sonnet-4-20250514"
+fast = "gpt-4o-mini"
+```
+
+**keys.toml:**
+
+```toml
+openai = "sk-..."
+anthropic = "sk-ant-..."
+```
+
+API keys are resolved in order: `--key` flag, `keys.toml`, environment variable (e.g. `OPENAI_API_KEY`).
 
 ## Planned CLI usage
 

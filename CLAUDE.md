@@ -7,11 +7,11 @@ LLM-RS: Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) (v0
 ## Commands
 
 ```bash
-cargo test --workspace           # Run all 126 tests
-cargo test -p llm-core           # Core types/traits (55 tests)
+cargo test --workspace           # Run all 159 tests
+cargo test -p llm-core           # Core types/traits/config (88 tests)
 cargo test -p llm-openai         # OpenAI provider (29 tests)
 cargo test -p llm-store          # JSONL storage (42 tests)
-cargo clippy --workspace         # Lint (llm-store should be warning-free)
+cargo clippy --workspace         # Lint
 cargo check --workspace          # Type-check only
 ```
 
@@ -21,7 +21,7 @@ Cargo workspace with three crates (more planned):
 
 ```
 crates/
-  llm-core/     # Traits, types, streaming, errors. No I/O.
+  llm-core/     # Traits, types, streaming, errors, config, key management
   llm-openai/   # OpenAI Chat API provider (streaming SSE + non-streaming)
   llm-store/    # JSONL file-per-conversation log storage
 ```
@@ -36,6 +36,13 @@ Dependency flow: `llm-openai` and `llm-store` depend on `llm-core`. No cycles. A
 - `Chunk`: streaming enum (Text, ToolCallStart, ToolCallDelta, Usage, Done)
 - `LlmError`: Model, NeedsKey, Provider, Config, Io, Store
 
+### Config system (llm-core/config.rs)
+
+- `Paths`: XDG directory resolution. `LLM_USER_PATH` → flat override; else `$XDG_CONFIG_HOME/llm` + `$XDG_DATA_HOME/llm` with `~/.config` / `~/.local/share` fallbacks.
+- `Config`: TOML config loading (`config.toml`). Fields: `default_model`, `logging`, `aliases`, `options`, `providers`. All `#[serde(default)]`. `effective_default_model()` checks `LLM_DEFAULT_MODEL` env var. `resolve_model()` resolves aliases.
+- `KeyStore`: TOML key storage (`keys.toml`). `load/get/set/list/path`. `set()` writes 0o600 on Unix, creates parent dirs.
+- `resolve_key()`: 4-level chain: explicit `--key` → `keys.toml` → env var → `NeedsKey` error.
+
 ### Storage (llm-store)
 
 JSONL files, one per conversation, at `$XDG_DATA_HOME/llm/logs/{conversation_id}.jsonl`. Line 1 is a `ConversationRecord` header (`"type":"conversation"`), subsequent lines are `ResponseRecord`s (`"type":"response"`) with all data denormalized inline. `LineRecord` is the `#[serde(tag = "type")]` dispatch enum.
@@ -44,11 +51,11 @@ Public API: `LogStore::open()`, `log_response()`, `read_conversation()`, `list_c
 
 ## Implementation status
 
-Phase 1 (v0.1), Steps 1--3 of 5 complete:
+Phase 1 (v0.1), Steps 1--4 of 5 complete:
 - [x] Step 1: Core types and Provider trait
 - [x] Step 2: OpenAI provider (streaming + non-streaming)
 - [x] Step 3: JSONL storage layer
-- [ ] Step 4: Config and KeyStore (TOML, XDG paths)
+- [x] Step 4: Config and KeyStore (TOML, XDG paths, key resolution)
 - [ ] Step 5: CLI binary (prompt, keys, models, logs commands)
 
 ## Conventions
@@ -58,4 +65,4 @@ Phase 1 (v0.1), Steps 1--3 of 5 complete:
 - IDs: ULID (26-char lowercase), via `ulid` crate
 - Timestamps: RFC 3339 via `chrono`
 - Errors: single `LlmError` enum in llm-core, `#[from]` for io::Error
-- Tests: inline `#[cfg(test)]` modules, `tempfile::TempDir` for filesystem tests, `wiremock` for HTTP mocking
+- Tests: inline `#[cfg(test)]` modules, `tempfile::TempDir` for filesystem tests, `wiremock` for HTTP mocking, `temp_env` for env var tests

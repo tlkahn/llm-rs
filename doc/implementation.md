@@ -4,22 +4,22 @@ Status snapshot of what has been built, what remains, and key decisions made alo
 
 ---
 
-## Current state (Phase 1, Steps 1--3 complete)
+## Current state (Phase 1, Steps 1--4 complete)
 
 ### Crate map
 
 | Crate | Status | Lines | Tests | Purpose |
 |-------|--------|-------|-------|---------|
-| `llm-core` | Steps 1+3 done | 1075 | 55 | Traits, types, streaming, errors |
+| `llm-core` | Steps 1+3+4 done | ~1330 | 88 | Traits, types, streaming, errors, config, keys |
 | `llm-openai` | Step 2 done | 945 | 29 | OpenAI Chat API provider (streaming + non-streaming) |
 | `llm-store` | Step 3 done | 1049 | 42 | JSONL conversation file I/O and queries |
 | `llm-cli` | Not started | -- | -- | Binary entry point (Step 5) |
 
-Total: 3069 lines, 126 tests, all passing.
+Total: ~3324 lines, 159 tests, all passing.
 
 ### What works
 
-- **`llm-core`**: `Prompt`, `Response`, `Chunk`, `Usage`, `ModelInfo`, `Attachment`, `Tool`, `ToolCall`, `ToolResult`, `Options` types. `Provider` async trait with streaming `ResponseStream`. Stream collection utilities (`collect_text`, `collect_tool_calls`, `collect_usage`). `LlmError` with `Model`, `NeedsKey`, `Provider`, `Config`, `Io`, `Store` variants.
+- **`llm-core`**: `Prompt`, `Response`, `Chunk`, `Usage`, `ModelInfo`, `Attachment`, `Tool`, `ToolCall`, `ToolResult`, `Options` types. `Provider` async trait with streaming `ResponseStream`. Stream collection utilities (`collect_text`, `collect_tool_calls`, `collect_usage`). `LlmError` with `Model`, `NeedsKey`, `Provider`, `Config`, `Io`, `Store` variants. `Paths` (pure XDG path resolution with `LLM_USER_PATH` override). `Config` (TOML config loading with serde defaults, alias resolution, `LLM_DEFAULT_MODEL` env override). `KeyStore` (TOML-backed key storage with 0o600 permissions). `resolve_key()` (4-level key resolution chain: explicit → store → env var → error).
 
 - **`llm-openai`**: `OpenAiProvider` implementing `Provider` for gpt-4o and gpt-4o-mini. Streaming via SSE with incremental `SseParser`. Non-streaming fallback. Token usage extraction. Tested with `wiremock` HTTP mocking.
 
@@ -27,7 +27,6 @@ Total: 3069 lines, 126 tests, all passing.
 
 ### What remains in Phase 1
 
-- **Step 4**: `Config` and `KeyStore` in `llm-core` (TOML parsing, XDG paths, key resolution chain)
 - **Step 5**: `llm-cli` binary with `prompt`, `keys`, `models`, `logs list` commands
 
 ---
@@ -82,11 +81,31 @@ ULIDs via the `ulid` crate. 26-char lowercase strings, monotonically ordered by 
 
 `chrono::Utc::now().to_rfc3339()` for ISO 8601 timestamps in conversation headers. Response datetimes are passed in by the caller (the CLI will set them at response completion time).
 
+### Configuration system (Step 4)
+
+Pure XDG path resolution (no `dirs` crate). `$HOME/.config/llm/` for config, `$HOME/.local/share/llm/` for data. `LLM_USER_PATH` flattens both into a single directory (Python compat). Config and keys are TOML files (`config.toml`, `keys.toml`) consolidating what Python scattered across 6+ JSON/txt files.
+
+**Path resolution order** (`Paths::resolve()`):
+1. `$LLM_USER_PATH` → flat layout (both config and data dirs point there)
+2. `$XDG_CONFIG_HOME/llm` / `$XDG_DATA_HOME/llm`
+3. `$HOME/.config/llm` / `$HOME/.local/share/llm`
+
+**Key resolution chain** (`resolve_key()`):
+1. Explicit `--key` CLI flag (literal value, not an alias)
+2. `keys.toml` entry matching provider's `needs_key` name
+3. Environment variable (e.g. `OPENAI_API_KEY`)
+4. `NeedsKey` error with actionable message
+
+`Config` fields use `#[serde(default)]` for graceful degradation: missing file → defaults, partial file → defaults for missing fields, extra unknown fields → ignored. `LLM_DEFAULT_MODEL` env var overrides the config file's `default_model`. Model aliases in `config.toml` resolved via `Config::resolve_model()`.
+
+`keys.toml` gets 0o600 permissions on Unix. `KeyStore::set()` creates parent directories automatically.
+
 ---
 
 ## Test strategy
 
 - All tests are inline `#[cfg(test)] mod tests` within each module.
+- `llm-core` config tests use `tempfile::TempDir` for filesystem isolation and `temp_env` for safe env var scoping.
 - `llm-store` tests use `tempfile::TempDir` for isolated filesystem state.
 - `llm-openai` tests use `wiremock::MockServer` for HTTP mocking.
 - No integration tests yet (planned for Step 5 when the CLI exists).
@@ -98,7 +117,7 @@ ULIDs via the `ulid` crate. 26-char lowercase strings, monotonically ordered by 
 
 | Crate | Key deps |
 |-------|----------|
-| `llm-core` | `serde`, `serde_json`, `thiserror`, `tokio`, `futures`, `async-trait`, `tokio-stream` |
+| `llm-core` | `serde`, `serde_json`, `thiserror`, `tokio`, `futures`, `async-trait`, `tokio-stream`, `toml`; dev: `temp-env`, `tempfile` |
 | `llm-openai` | `llm-core`, `reqwest` (stream+json), `wiremock` (dev) |
 | `llm-store` | `llm-core`, `serde_json`, `ulid`, `chrono`, `tempfile` (dev) |
 
