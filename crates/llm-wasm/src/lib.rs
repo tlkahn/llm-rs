@@ -1,4 +1,5 @@
 use futures::StreamExt;
+use llm_anthropic::provider::AnthropicProvider;
 use llm_core::stream::Chunk;
 use llm_core::types::Prompt;
 use llm_core::Provider;
@@ -6,9 +7,29 @@ use llm_openai::provider::OpenAiProvider;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
+enum ProviderImpl {
+    OpenAi(OpenAiProvider),
+    Anthropic(AnthropicProvider),
+}
+
+impl ProviderImpl {
+    async fn execute(
+        &self,
+        model: &str,
+        prompt: &Prompt,
+        key: Option<&str>,
+        stream: bool,
+    ) -> llm_core::Result<llm_core::stream::ResponseStream> {
+        match self {
+            ProviderImpl::OpenAi(p) => p.execute(model, prompt, key, stream).await,
+            ProviderImpl::Anthropic(p) => p.execute(model, prompt, key, stream).await,
+        }
+    }
+}
+
 #[wasm_bindgen]
 pub struct LlmClient {
-    provider: OpenAiProvider,
+    provider: ProviderImpl,
     model: String,
     api_key: String,
 }
@@ -17,13 +38,31 @@ pub struct LlmClient {
 impl LlmClient {
     #[wasm_bindgen(constructor)]
     pub fn new(api_key: &str, model: &str) -> Self {
-        Self::new_with_base_url(api_key, model, "https://api.openai.com")
+        if model.starts_with("claude") {
+            Self::new_anthropic(api_key, model)
+        } else {
+            Self::new_with_base_url(api_key, model, "https://api.openai.com")
+        }
     }
 
     #[wasm_bindgen(js_name = "newWithBaseUrl")]
     pub fn new_with_base_url(api_key: &str, model: &str, base_url: &str) -> Self {
         Self {
-            provider: OpenAiProvider::new(base_url),
+            provider: ProviderImpl::OpenAi(OpenAiProvider::new(base_url)),
+            model: model.to_string(),
+            api_key: api_key.to_string(),
+        }
+    }
+
+    #[wasm_bindgen(js_name = "newAnthropic")]
+    pub fn new_anthropic(api_key: &str, model: &str) -> Self {
+        Self::new_anthropic_with_base_url(api_key, model, "https://api.anthropic.com")
+    }
+
+    #[wasm_bindgen(js_name = "newAnthropicWithBaseUrl")]
+    pub fn new_anthropic_with_base_url(api_key: &str, model: &str, base_url: &str) -> Self {
+        Self {
+            provider: ProviderImpl::Anthropic(AnthropicProvider::new(base_url)),
             model: model.to_string(),
             api_key: api_key.to_string(),
         }

@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 llm-core = { path = "../llm-core" }
 llm-openai = { path = "../llm-openai", optional = true }
+llm-anthropic = { path = "../llm-anthropic", optional = true }
 llm-store = { path = "../llm-store" }
 clap = { workspace = true }
 tokio = { workspace = true }
@@ -30,5 +31,6 @@ wiremock = "0.6"
 temp-env = { workspace = true }
 
 [features]
-default = ["openai"]
+default = ["openai", "anthropic"]
 openai = ["dep:llm-openai"]
+anthropic = ["dep:llm-anthropic"]

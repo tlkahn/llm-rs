@@ -1,4 +1,5 @@
 use futures::StreamExt;
+use llm_anthropic::provider::AnthropicProvider;
 use llm_core::stream::Chunk;
 use llm_core::types::Prompt;
 use llm_core::Provider;
@@ -6,10 +7,30 @@ use llm_openai::provider::OpenAiProvider;
 use pyo3::prelude::*;
 use std::sync::{mpsc, Mutex};
 
+enum ProviderImpl {
+    OpenAi(OpenAiProvider),
+    Anthropic(AnthropicProvider),
+}
+
+impl ProviderImpl {
+    async fn execute(
+        &self,
+        model: &str,
+        prompt: &Prompt,
+        key: Option<&str>,
+        stream: bool,
+    ) -> llm_core::Result<llm_core::stream::ResponseStream> {
+        match self {
+            ProviderImpl::OpenAi(p) => p.execute(model, prompt, key, stream).await,
+            ProviderImpl::Anthropic(p) => p.execute(model, prompt, key, stream).await,
+        }
+    }
+}
+
 #[pyclass]
 struct LlmClient {
     runtime: tokio::runtime::Runtime,
-    provider: OpenAiProvider,
+    provider: ProviderImpl,
     model: String,
     api_key: String,
     #[allow(dead_code)]
@@ -19,24 +40,45 @@ struct LlmClient {
 #[pymethods]
 impl LlmClient {
     #[new]
-    #[pyo3(signature = (api_key, model="gpt-4o-mini", *, base_url=None, log_dir=None))]
+    #[pyo3(signature = (api_key, model="gpt-4o-mini", *, provider=None, base_url=None, log_dir=None))]
     fn new(
         api_key: &str,
         model: &str,
+        provider: Option<&str>,
         base_url: Option<&str>,
         log_dir: Option<&str>,
     ) -> PyResult<Self> {
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        let base = base_url.unwrap_or("https://api.openai.com");
-        let provider = OpenAiProvider::new(base);
+
+        // Determine provider: explicit kwarg > auto-detect from model name
+        let is_anthropic = match provider {
+            Some("anthropic") => true,
+            Some("openai") => false,
+            Some(other) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown provider: {other}. Use 'openai' or 'anthropic'."
+                )));
+            }
+            None => model.starts_with("claude"),
+        };
+
+        let provider_impl = if is_anthropic {
+            let base = base_url.unwrap_or("https://api.anthropic.com");
+            ProviderImpl::Anthropic(AnthropicProvider::new(base))
+        } else {
+            let base = base_url.unwrap_or("https://api.openai.com");
+            ProviderImpl::OpenAi(OpenAiProvider::new(base))
+        };
+
         let log_store = log_dir
             .map(|d| llm_store::LogStore::open(std::path::Path::new(d)))
             .transpose()
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
         Ok(Self {
             runtime,
-            provider,
+            provider: provider_impl,
             model: model.to_string(),
             api_key: api_key.to_string(),
             log_store,

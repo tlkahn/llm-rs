@@ -12,6 +12,7 @@ wasm-opt = false
 [dependencies]
 llm-core = { path = "../llm-core" }
 llm-openai = { path = "../llm-openai" }
+llm-anthropic = { path = "../llm-anthropic" }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"

@@ -539,13 +539,13 @@ Errors: exit code 1, human-readable message to stderr.
 - Exit codes
 - WASM library target (`llm-wasm`) for browser/Obsidian plugin use --- self-contained HTTP via fetch, no storage, JS Promise-based API
 - Python native module (`llm-python`) via PyO3/maturin --- sync + streaming API with optional log storage
+- Anthropic provider (streaming + non-streaming)
 
 ### Phase 2 (v0.2) --- Conversations and Multi-Provider
 
 - `llm chat` (interactive REPL with `rustyline`)
 - `-c/--continue`, `--cid` for conversation continuation
 - `llm logs` full feature set (search, filter, status, backup, on/off)
-- Anthropic provider
 - Ollama provider
 - `llm aliases set/list/remove/path`
 - `-o/--option`, `llm options set/get/list/clear`

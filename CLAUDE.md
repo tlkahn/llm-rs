@@ -7,11 +7,12 @@ LLM-RS: Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) (v0
 ## Commands
 
 ```bash
-cargo test --workspace           # Run all 188 tests
+cargo test --workspace           # Run all 225 tests
 cargo test -p llm-core           # Core types/traits/config (88 tests)
 cargo test -p llm-openai         # OpenAI provider (29 tests)
+cargo test -p llm-anthropic      # Anthropic provider (34 tests)
 cargo test -p llm-store          # JSONL storage (42 tests)
-cargo test -p llm-cli            # CLI integration tests (29 tests)
+cargo test -p llm-cli            # CLI integration tests (32 tests)
 cargo clippy --workspace         # Lint
 cargo build --release -p llm-cli # Build optimized binary
 
@@ -22,19 +23,20 @@ cd crates/llm-python && uv run maturin develop     # Python native module
 
 ## Architecture
 
-Six crates in a Cargo workspace (Rust 2024 edition):
+Seven crates in a Cargo workspace (Rust 2024 edition):
 
 ```
 crates/
-  llm-core/     # Traits, types, streaming, errors, config, key management
-  llm-openai/   # OpenAI Chat API provider (streaming SSE + non-streaming)
-  llm-store/    # JSONL file-per-conversation log storage
-  llm-cli/      # Binary: prompt, keys, models, logs commands
-  llm-wasm/     # WASM library for browser/Obsidian (excluded from workspace)
-  llm-python/   # Python native module via PyO3 (excluded from workspace)
+  llm-core/      # Traits, types, streaming, errors, config, key management
+  llm-openai/    # OpenAI Chat API provider (streaming SSE + non-streaming)
+  llm-anthropic/ # Anthropic Messages API provider (streaming SSE + non-streaming)
+  llm-store/     # JSONL file-per-conversation log storage
+  llm-cli/       # Binary: prompt, keys, models, logs commands
+  llm-wasm/      # WASM library for browser/Obsidian (excluded from workspace)
+  llm-python/    # Python native module via PyO3 (excluded from workspace)
 ```
 
-Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry points -> `llm-openai` (optional, feature-gated) + `llm-store` -> `llm-core`. No cycles. `llm-openai` and `llm-store` are siblings that both depend only on `llm-core`. `llm-wasm` and `llm-python` are excluded from `cargo test --workspace` and built with their own toolchains (wasm-pack, maturin).
+Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry points -> `llm-openai` + `llm-anthropic` (optional, feature-gated) + `llm-store` -> `llm-core`. No cycles. `llm-openai`, `llm-anthropic`, and `llm-store` are siblings that depend only on `llm-core`. `llm-wasm` and `llm-python` are excluded from `cargo test --workspace` and built with their own toolchains (wasm-pack, maturin).
 
 ### Key types (llm-core)
 
@@ -53,6 +55,12 @@ Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry poi
 - **`KeyStore`**: TOML key storage (`keys.toml`). `load/get/set/list/path`. `set()` writes 0o600 on Unix, creates parent dirs.
 - **`resolve_key()`**: 4-level chain: explicit `--key` -> `keys.toml` -> env var -> `NeedsKey` error.
 
+### Providers
+
+**OpenAI** (`llm-openai`): `POST /v1/chat/completions`, `Authorization: Bearer` auth, SSE with `data: [DONE]` sentinel, `stream_options.include_usage` for token counts. Models: `gpt-4o`, `gpt-4o-mini`.
+
+**Anthropic** (`llm-anthropic`): `POST /v1/messages`, `x-api-key` + `anthropic-version: 2023-06-01` headers, typed SSE events (`message_start`, `content_block_delta`, `message_delta`, `message_stop`), `max_tokens` required (default 4096), system prompt as top-level field (not in messages). Models: `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`.
+
 ### Storage (llm-store)
 
 JSONL files, one per conversation, at `$XDG_DATA_HOME/llm/logs/{conversation_id}.jsonl`. Line 1: `ConversationRecord` header (`"type":"conversation"`, `"v":1`). Lines 2+: `ResponseRecord`s (`"type":"response"`) with all data denormalized inline. `LineRecord` is the `#[serde(tag = "type")]` dispatch enum.
@@ -65,7 +73,7 @@ Binary name: `llm`. Built with `clap` derive macros.
 
 **Default subcommand:** `main.rs::rewrite_args()` inserts `"prompt"` before clap parsing when the first arg is not a known subcommand or global flag. This makes `llm "hello"` and `echo "hello" | llm` work.
 
-**Provider registry:** `commands/mod.rs::providers()` returns `Vec<Box<dyn Provider>>` with `#[cfg(feature)]`-gated providers. `OPENAI_BASE_URL` env var overrides the API endpoint.
+**Provider registry:** `commands/mod.rs::providers()` returns `Vec<Box<dyn Provider>>` with `#[cfg(feature)]`-gated providers. `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` env vars override API endpoints. Both `openai` and `anthropic` features are default-on.
 
 **Commands:**
 - `llm prompt <text>` --- flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`
@@ -75,11 +83,15 @@ Binary name: `llm`. Built with `clap` derive macros.
 
 **Exit codes:** 0 success, 1 runtime, 2 config/key/model, 3 provider/network.
 
+### WASM + Python multi-provider
+
+Both `llm-wasm` and `llm-python` use an internal `ProviderImpl` enum dispatching to either `OpenAiProvider` or `AnthropicProvider`. Auto-detection from model name: `"claude*"` -> Anthropic, otherwise OpenAI. Explicit constructors available for full control.
+
 ## Implementation status
 
-Phase 1 (v0.1) complete --- `echo "Hello" | llm` works end-to-end with streaming + logging. Core crates (`llm-core`, `llm-openai`) compile for `wasm32-unknown-unknown`. WASM library (`llm-wasm`) and Python module (`llm-python`) are available.
+Phase 1 (v0.1) complete --- `echo "Hello" | llm` works end-to-end with streaming + logging for both OpenAI and Anthropic. Core crates compile for `wasm32-unknown-unknown`. WASM library (`llm-wasm`) and Python module (`llm-python`) support both providers.
 
-Next: Phase 2 (conversations, multi-provider, attachments). See `doc/metaplan.md` for the full roadmap.
+Next: Phase 2 (conversations, Ollama provider, attachments). See `doc/metaplan.md` for the full roadmap.
 
 ## Conventions
 
@@ -90,5 +102,5 @@ Next: Phase 2 (conversations, multi-provider, attachments). See `doc/metaplan.md
 - Errors: single `LlmError` enum in llm-core, `#[from]` for `io::Error`
 - Unit tests: inline `#[cfg(test)]` modules per source file
 - Integration tests: `tests/integration.rs` with `assert_cmd` for CLI, `wiremock` for HTTP mocking
-- Test isolation: `LLM_USER_PATH` for filesystem, `OPENAI_BASE_URL` for API endpoint, `temp_env` for env vars
-- Feature flags: `llm-cli` uses optional `openai` feature (default on) for `llm-openai` dependency
+- Test isolation: `LLM_USER_PATH` for filesystem, `OPENAI_BASE_URL`/`ANTHROPIC_BASE_URL` for API endpoints, `temp_env` for env vars
+- Feature flags: `llm-cli` uses optional `openai` and `anthropic` features (both default on)

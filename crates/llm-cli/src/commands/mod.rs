@@ -16,5 +16,12 @@ pub fn providers() -> Vec<Box<dyn Provider>> {
         providers.push(Box::new(llm_openai::provider::OpenAiProvider::new(&base_url)));
     }
 
+    #[cfg(feature = "anthropic")]
+    {
+        let base_url = std::env::var("ANTHROPIC_BASE_URL")
+            .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+        providers.push(Box::new(llm_anthropic::provider::AnthropicProvider::new(&base_url)));
+    }
+
     providers
 }

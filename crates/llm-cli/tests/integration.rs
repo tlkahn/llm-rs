@@ -619,6 +619,109 @@ fn exit_code_unknown_model() {
 }
 
 // ==========================================================================
+// Anthropic provider tests
+// ==========================================================================
+
+#[test]
+fn models_list_includes_anthropic() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["models", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("claude-opus-4-6"))
+        .stdout(predicate::str::contains("claude-sonnet-4-6"))
+        .stdout(predicate::str::contains("claude-haiku-4-5"));
+}
+
+/// Returns a non-streaming Anthropic Messages API JSON body.
+fn anthropic_non_streaming_body(content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{"type": "text", "text": content}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 5
+        }
+    })
+}
+
+/// Returns SSE streaming body for Anthropic Messages API.
+fn anthropic_streaming_body(content: &str) -> String {
+    let mid = content.len() / 2;
+    let (first, second) = content.split_at(mid);
+    format!(
+        "\
+event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":0}}}}}}\n\n\
+event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{first}\"}}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{second}\"}}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+    )
+}
+
+#[tokio::test]
+async fn prompt_anthropic_non_streaming() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&anthropic_non_streaming_body("Bonjour!")),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args(["prompt", "--no-stream", "-m", "claude-sonnet-4-6", "hello"])
+        .env("ANTHROPIC_BASE_URL", server.uri())
+        .env("ANTHROPIC_API_KEY", "sk-ant-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Bonjour!"));
+}
+
+#[tokio::test]
+async fn prompt_anthropic_streaming() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(anthropic_streaming_body("Hello world")),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args(["prompt", "-m", "claude-sonnet-4-6", "hello"])
+        .env("ANTHROPIC_BASE_URL", server.uri())
+        .env("ANTHROPIC_API_KEY", "sk-ant-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Hello world"));
+}
+
+// ==========================================================================
 // Cycle 12: Logging integration
 // ==========================================================================
 
