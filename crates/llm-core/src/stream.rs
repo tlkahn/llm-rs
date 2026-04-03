@@ -14,7 +14,11 @@ pub enum Chunk {
     Done,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<Chunk, LlmError>> + Send>>;
+
+#[cfg(target_arch = "wasm32")]
+pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<Chunk, LlmError>>>>;
 
 /// Extract concatenated text from a slice of chunks.
 pub fn collect_text(chunks: &[Chunk]) -> String {

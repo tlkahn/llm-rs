@@ -4,8 +4,32 @@ use crate::error::Result;
 use crate::stream::ResponseStream;
 use crate::types::{ModelInfo, Prompt};
 
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 pub trait Provider: Send + Sync {
+    fn id(&self) -> &str;
+    fn models(&self) -> Vec<ModelInfo>;
+
+    fn needs_key(&self) -> Option<&str> {
+        None
+    }
+
+    fn key_env_var(&self) -> Option<&str> {
+        None
+    }
+
+    async fn execute(
+        &self,
+        model: &str,
+        prompt: &Prompt,
+        key: Option<&str>,
+        stream: bool,
+    ) -> Result<ResponseStream>;
+}
+
+#[cfg(target_arch = "wasm32")]
+#[async_trait(?Send)]
+pub trait Provider {
     fn id(&self) -> &str;
     fn models(&self) -> Vec<ModelInfo>;
 

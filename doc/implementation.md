@@ -6,18 +6,20 @@ Status snapshot of what has been built, what remains, and key decisions made alo
 
 ## Current state (Phase 1 complete)
 
-Phase 1 goal was: `echo "Hello" | llm` works end-to-end --- streams to stdout, logs to JSONL. All five steps are done.
+Phase 1 goal was: `echo "Hello" | llm` works end-to-end --- streams to stdout, logs to JSONL. All six steps are done, including library targets for WASM and Python.
 
 ### Crate map
 
 | Crate | Status | Lines | Tests | Purpose |
 |-------|--------|------:|------:|---------|
-| `llm-core` | Complete | 1745 | 88 | Traits, types, streaming, errors, config, keys |
-| `llm-openai` | Complete | 945 | 29 | OpenAI Chat API provider (streaming SSE + non-streaming) |
+| `llm-core` | Complete | 1773 | 88 | Traits, types, streaming, errors, config, keys |
+| `llm-openai` | Complete | 953 | 29 | OpenAI Chat API provider (streaming SSE + non-streaming) |
 | `llm-store` | Complete | 1049 | 42 | JSONL conversation file I/O and queries |
 | `llm-cli` | Complete | 1209 | 29 | Binary: prompt, keys, models, logs commands |
+| `llm-wasm` | Complete | 115 | --- | WASM library for browser/Obsidian plugin (wasm-bindgen) |
+| `llm-python` | Complete | 151 | --- | Python native module via PyO3/maturin |
 
-Total: ~4950 lines, 188 tests, all passing.
+Total: ~5250 lines, 188 tests (workspace crates), all passing. `llm-wasm` and `llm-python` are excluded from the workspace and built with their own toolchains.
 
 ### What works
 
@@ -62,9 +64,36 @@ Total: ~4950 lines, 188 tests, all passing.
 - Automatic JSONL logging on every prompt (unless `-n` flag or `config.logging = false`).
 - Provider registry via `providers()` function with `#[cfg(feature)]`-gated provider construction.
 
+**`llm-core` + `llm-openai` wasm32 compatibility** (Step 6a + 6b)
+
+- `llm-core` production code has zero tokio usage; `tokio` removed from `[dependencies]`, kept only in `[dev-dependencies]`.
+- `ResponseStream` type alias cfg-gated: `+ Send` on native, no `Send` on wasm32 (single-threaded).
+- `Provider` trait cfg-gated: `#[async_trait] trait Provider: Send + Sync` on native, `#[async_trait(?Send)] trait Provider` on wasm32.
+- `llm-openai` streaming path: replaced `tokio::sync::mpsc` with `futures::channel::mpsc` (works on all platforms). Only the spawn call is cfg-gated: `tokio::spawn` on native, `wasm_bindgen_futures::spawn_local` on wasm32. Removed `tokio-stream` dependency entirely.
+- Both crates pass `cargo check --target wasm32-unknown-unknown`.
+
+**`llm-wasm`** (Step 6c)
+
+- wasm-bindgen exports: `LlmClient` class with `new(api_key, model)`, `newWithBaseUrl(api_key, model, base_url)`.
+- `prompt(text)`, `promptWithSystem(text, system)` --- non-streaming, returns JS Promise resolving to string.
+- `promptStreaming(text, callback)`, `promptStreamingWithSystem(text, system, callback)` --- streaming, calls JS callback per text chunk, returns full text.
+- Stateless: no storage, no config, no key management. Key passed at construction time.
+- HTTP via reqwest (auto-detects wasm32, uses web-sys `fetch` under the hood).
+- Built with `wasm-pack build crates/llm-wasm --target web` (or `--target bundler` for webpack).
+- Generates TypeScript declarations (.d.ts), JS bindings, and .wasm binary.
+
+**`llm-python`** (Step 6d)
+
+- PyO3 module: `import llm_rs`.
+- `LlmClient(api_key, model, *, base_url=None, log_dir=None)` --- owns a `tokio::Runtime` for async-to-sync bridging.
+- `prompt(text, *, system=None) -> str` --- blocking, collects full response.
+- `prompt_stream(text, *, system=None) -> ChunkIterator` --- returns a Python iterator yielding text chunks. Uses `std::sync::mpsc` to bridge from async stream to sync Python iteration.
+- Optional log storage via `log_dir` parameter (passes through to `llm_store::LogStore`).
+- Built with `maturin develop` (editable install) or `maturin build --release` (wheel).
+
 ### What remains
 
-Phase 1 is the minimum viable CLI. Remaining phases from `metaplan.md`:
+Phase 1 is the minimum viable CLI plus library targets. Remaining phases from `metaplan.md`:
 
 - **Phase 2 (v0.2):** Conversations (`-c`, `--cid`, `llm chat`), Anthropic + Ollama providers, options, attachments, aliases, extract.
 - **Phase 3 (v0.3):** Tool calling, structured output, schema DSL.
@@ -173,6 +202,37 @@ Matches the design in `metaplan.md`. Errors print to stderr before exiting.
 
 `llm models default <model>` read-modify-writes `config.toml` using `toml::Table` to preserve unknown fields. This avoids adding a `Config::save()` method to `llm-core`, keeping the core crate focused on read-only config loading.
 
+### Platform abstraction for wasm32 (Step 6a + 6b)
+
+The refactoring needed to make `llm-core` and `llm-openai` compile for wasm32 was surgical. Key insight: `llm-core` had `tokio` listed as a dependency but never used it in production code (only `#[tokio::test]` in tests). The actual platform-dependent code was confined to three lines in `llm-openai/src/provider.rs`.
+
+**What was cfg-gated:**
+
+| Location | Native | wasm32 | Why |
+|----------|--------|--------|-----|
+| `ResponseStream` type alias | `+ Send` | no `Send` | wasm32 is single-threaded; web-sys types aren't `Send` |
+| `Provider` trait bounds | `Send + Sync`, `#[async_trait]` | no bounds, `#[async_trait(?Send)]` | Same reason; `async_trait(?Send)` avoids boxing with `Send` |
+| Streaming spawn | `tokio::spawn(future)` | `wasm_bindgen_futures::spawn_local(future)` | Different async runtimes |
+| Streaming channel | `futures::channel::mpsc` | `futures::channel::mpsc` | Same on both (replaced tokio's mpsc) |
+
+**Why `futures::channel::mpsc` everywhere (not just wasm32):** The switch from `tokio::sync::mpsc` to `futures::channel::mpsc` was done unconditionally rather than cfg-gated. This avoids duplicating the 30-line SSE parsing loop. `futures::channel::mpsc::Receiver` implements `Stream` directly, eliminating the `tokio_stream::wrappers::ReceiverStream` wrapper. Backpressure behavior is equivalent at the buffer size used (32).
+
+**Why `cfg_attr` instead of trait body duplication for impl blocks:** The `Provider` trait itself had to be duplicated across two cfg blocks because `#[async_trait]` and `#[async_trait(?Send)]` are different proc macro invocations that transform the trait body differently. But impl blocks (e.g. `impl Provider for OpenAiProvider`) use `#[cfg_attr(..., async_trait)]` / `#[cfg_attr(..., async_trait(?Send))]` to avoid duplicating the impl body.
+
+### WASM crate as a stateless facade (Step 6c)
+
+`llm-wasm` is deliberately minimal: it wraps `OpenAiProvider` with a wasm-bindgen API and nothing else. No config, no key storage, no log persistence. The design principle is that the host environment (Obsidian plugin, browser app) owns all state management --- the WASM module is a pure computation layer that builds HTTP requests, parses SSE responses, and returns structured data.
+
+HTTP is handled by `reqwest`, which auto-detects wasm32 and uses the browser's `fetch()` API via `web-sys`. This means CORS rules apply; the Obsidian plugin or browser app must ensure the LLM API endpoint allows cross-origin requests (OpenAI does).
+
+`wasm-pack build --target web` generates a self-initializing ES module. `--target bundler` generates a module for webpack/rollup (typical in Obsidian plugin builds). Both produce TypeScript declarations.
+
+### Python crate with tokio bridge (Step 6d)
+
+`llm-python` owns a `tokio::Runtime` to bridge async Rust to sync Python. The `prompt()` method uses `Runtime::block_on()` to run the async provider. The `prompt_stream()` method is more involved: it gets the `ResponseStream` via `block_on`, then spawns a tokio task that consumes the stream and sends chunks through a `std::sync::mpsc` channel. The Python `ChunkIterator` reads from the channel's receiving end. The `Receiver` is wrapped in `Mutex` to satisfy PyO3's `Sync` requirement on `#[pyclass]` structs.
+
+The Python virtualenv and maturin are managed via `uv` (`uv venv`, `uv run maturin develop`).
+
 ---
 
 ## Test strategy
@@ -189,12 +249,14 @@ Matches the design in `metaplan.md`. Errors print to stderr before exiting.
 
 | Crate | Key deps | Dev deps |
 |-------|----------|----------|
-| `llm-core` | `serde`, `serde_json`, `thiserror`, `tokio`, `futures`, `async-trait`, `tokio-stream`, `toml` | `temp-env`, `tempfile` |
-| `llm-openai` | `llm-core`, `reqwest` (stream + json) | `wiremock` |
+| `llm-core` | `serde`, `serde_json`, `thiserror`, `futures`, `async-trait`, `toml` | `tokio`, `temp-env`, `tempfile` |
+| `llm-openai` | `llm-core`, `reqwest` (stream + json), `futures`, `async-trait`; native: `tokio`; wasm32: `wasm-bindgen-futures` | `tokio`, `wiremock` |
 | `llm-store` | `llm-core`, `serde_json`, `ulid`, `chrono` | `tempfile` |
 | `llm-cli` | `llm-core`, `llm-openai` (optional), `llm-store`, `clap`, `tokio`, `serde_json`, `futures`, `tokio-stream`, `toml`, `ulid`, `chrono`, `rpassword` | `assert_cmd`, `predicates`, `wiremock`, `tempfile`, `temp-env` |
+| `llm-wasm` | `llm-core`, `llm-openai`, `wasm-bindgen`, `wasm-bindgen-futures`, `js-sys`, `futures` | --- |
+| `llm-python` | `llm-core`, `llm-openai`, `llm-store`, `pyo3`, `tokio`, `futures` | --- |
 
-Workspace dependencies declared in root `Cargo.toml`. `llm-openai` is an optional dependency of `llm-cli` behind the `openai` feature flag (enabled by default).
+Workspace dependencies declared in root `Cargo.toml`. `llm-openai` is an optional dependency of `llm-cli` behind the `openai` feature flag (enabled by default). `llm-wasm` and `llm-python` are excluded from the workspace (`exclude` in root `Cargo.toml`) and built separately with `wasm-pack` and `maturin`.
 
 ---
 
@@ -209,5 +271,11 @@ Each step was a self-contained TDD cycle: write failing tests, make them pass, r
 | 3 | `llm-store` | `LogStore`, JSONL file I/O, conversation listing | 42 |
 | 4 | `llm-core` | `Paths`, `Config`, `KeyStore`, `resolve_key()` | 34 |
 | 5 | `llm-cli` | `prompt`, `keys`, `models`, `logs` commands, default subcommand, exit codes, logging | 29 |
+| 6a | `llm-core` | cfg-gate `ResponseStream` Send, `Provider` Send+Sync for wasm32; remove tokio from deps | 0 (existing pass) |
+| 6b | `llm-openai` | `futures::channel::mpsc`, cfg-gate spawn, remove `tokio-stream` | 0 (existing pass) |
+| 6c | `llm-wasm` | wasm-bindgen `LlmClient`, `prompt()`, `promptStreaming()` | wasm-pack build |
+| 6d | `llm-python` | PyO3 `LlmClient`, `prompt()`, `prompt_stream()` iterator | maturin develop |
 
 Step 5 was further broken into 12 inner TDD cycles (scaffold, keys path, keys set/get/list, models list, models default, logs list, prompt non-streaming, prompt streaming, prompt flags, stdin+default-subcmd, exit codes, logging).
+
+Steps 6a-6b were refactoring steps: the "test" was that all 188 existing tests continued passing AND `cargo check --target wasm32-unknown-unknown` succeeded for both crates. Steps 6c-6d were new crates verified by their respective build toolchains (`wasm-pack build`, `maturin develop`) and smoke tests (`import llm_rs` in Python, TypeScript declarations in WASM output).

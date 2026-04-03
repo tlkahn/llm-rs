@@ -14,11 +14,15 @@ cargo test -p llm-store          # JSONL storage (42 tests)
 cargo test -p llm-cli            # CLI integration tests (29 tests)
 cargo clippy --workspace         # Lint
 cargo build --release -p llm-cli # Build optimized binary
+
+# Library targets (excluded from workspace, built separately):
+wasm-pack build crates/llm-wasm --target web      # WASM for browser/Obsidian
+cd crates/llm-python && uv run maturin develop     # Python native module
 ```
 
 ## Architecture
 
-Four crates in a Cargo workspace (Rust 2024 edition):
+Six crates in a Cargo workspace (Rust 2024 edition):
 
 ```
 crates/
@@ -26,9 +30,11 @@ crates/
   llm-openai/   # OpenAI Chat API provider (streaming SSE + non-streaming)
   llm-store/    # JSONL file-per-conversation log storage
   llm-cli/      # Binary: prompt, keys, models, logs commands
+  llm-wasm/     # WASM library for browser/Obsidian (excluded from workspace)
+  llm-python/   # Python native module via PyO3 (excluded from workspace)
 ```
 
-Dependency flow: `llm-cli` -> `llm-openai` (optional, feature-gated) + `llm-store` -> `llm-core`. No cycles. `llm-openai` and `llm-store` are siblings that both depend only on `llm-core`.
+Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry points -> `llm-openai` (optional, feature-gated) + `llm-store` -> `llm-core`. No cycles. `llm-openai` and `llm-store` are siblings that both depend only on `llm-core`. `llm-wasm` and `llm-python` are excluded from `cargo test --workspace` and built with their own toolchains (wasm-pack, maturin).
 
 ### Key types (llm-core)
 
@@ -36,7 +42,7 @@ Dependency flow: `llm-cli` -> `llm-openai` (optional, feature-gated) + `llm-stor
 - **`Prompt`** (`types.rs`): text + system + attachments + tools + tool_results + schema + options. Builder pattern with `with_*` methods.
 - **`Response`** (`types.rs`): materialized post-stream result (16 fields: id, model, prompt, system, response text, options, usage, tool_calls, tool_results, attachments, schema, schema_id, duration_ms, datetime).
 - **`Chunk`** (`stream.rs`): streaming enum (`Text`, `ToolCallStart`, `ToolCallDelta`, `Usage`, `Done`).
-- **`ResponseStream`**: `Pin<Box<dyn Stream<Item=Result<Chunk>> + Send>>`.
+- **`ResponseStream`**: `Pin<Box<dyn Stream<Item=Result<Chunk>> + Send>>` (native); without `Send` on wasm32.
 - **`LlmError`** (`error.rs`): six variants (`Model`, `NeedsKey`, `Provider`, `Config`, `Io`, `Store`).
 - Stream helpers: `collect_text()`, `collect_tool_calls()`, `collect_usage()`.
 
@@ -71,7 +77,7 @@ Binary name: `llm`. Built with `clap` derive macros.
 
 ## Implementation status
 
-Phase 1 (v0.1) complete --- `echo "Hello" | llm` works end-to-end with streaming + logging.
+Phase 1 (v0.1) complete --- `echo "Hello" | llm` works end-to-end with streaming + logging. Core crates (`llm-core`, `llm-openai`) compile for `wasm32-unknown-unknown`. WASM library (`llm-wasm`) and Python module (`llm-python`) are available.
 
 Next: Phase 2 (conversations, multi-provider, attachments). See `doc/metaplan.md` for the full roadmap.
 

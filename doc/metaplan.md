@@ -33,14 +33,16 @@ Key divergences from the Python version:
 
 | Crate | Responsibility | Key dependencies |
 |-------|---------------|-----------------|
-| `llm-core` | Traits, types, streaming contracts, error types | `serde`, `thiserror`, `tokio`, `futures` |
+| `llm-core` | Traits, types, streaming contracts, error types | `serde`, `thiserror`, `futures` |
 | `llm-store` | JSONL file persistence: conversation log writes, queries, directory management | `serde_json`, `llm-core` |
 | `llm-openai` | OpenAI provider (Chat + Completion APIs) | `reqwest`, `llm-core` |
 | `llm-anthropic` | Anthropic provider (Messages API) | `reqwest`, `llm-core` |
 | `llm-ollama` | Ollama local models (Chat API) | `reqwest`, `llm-core` |
 | `llm-cli` | Binary entry point, all clap commands | `clap`, all above via features |
+| `llm-wasm` | WASM library for browser/Obsidian plugin; JS-friendly API | `wasm-bindgen`, `llm-core`, `llm-openai` |
+| `llm-python` | Python native module via PyO3; sync + streaming API | `pyo3`, `llm-core`, `llm-openai`, `llm-store` |
 
-Dependency flow is strictly downward: `llm-cli` depends on everything. Provider crates depend only on `llm-core`. `llm-store` depends only on `llm-core`. No cycles.
+Dependency flow is strictly downward: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry points that compose the lower crates. Provider crates depend only on `llm-core`. `llm-store` depends only on `llm-core`. No cycles. `llm-wasm` and `llm-python` are excluded from default workspace builds (built with `wasm-pack` and `maturin` respectively).
 
 ---
 
@@ -362,6 +364,85 @@ ollama = ""  # no key needed, but entry exists for completeness
 | `ANTHROPIC_API_KEY` | Anthropic API key |
 | `LLM_DEFAULT_MODEL` | Override default model |
 
+### 8. Library Targets (WASM + Python)
+
+The core crates (`llm-core`, `llm-openai`) are designed to compile for multiple targets beyond the native CLI. Two additional entry-point crates provide library interfaces:
+
+**Platform abstraction strategy:**
+
+The key insight is that `llm-core` production code has zero tokio usage (only `#[tokio::test]` in tests), and `llm-openai` has exactly 3 tokio-specific lines in its streaming path. The refactoring is surgical:
+
+- **`ResponseStream` Send bound** (`llm-core/src/stream.rs`): cfg-gated for wasm32. On native, the stream requires `Send` (multi-threaded tokio runtime). On wasm32, `Send` is dropped (single-threaded).
+  ```rust
+  #[cfg(not(target_arch = "wasm32"))]
+  pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<Chunk, LlmError>> + Send>>;
+  #[cfg(target_arch = "wasm32")]
+  pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<Chunk, LlmError>>>>;
+  ```
+
+- **`Provider` trait bounds** (`llm-core/src/provider.rs`): cfg-gated. Native uses `#[async_trait] trait Provider: Send + Sync`. WASM uses `#[async_trait(?Send)] trait Provider` (no threading).
+
+- **Streaming channel** (`llm-openai/src/provider.rs`): Replace `tokio::sync::mpsc` with `futures::channel::mpsc` (works on all platforms). `futures::channel::mpsc::Receiver` already implements `Stream`, eliminating the `tokio_stream::wrappers::ReceiverStream` wrapper. Only the spawn call is cfg-gated:
+  ```rust
+  #[cfg(not(target_arch = "wasm32"))]
+  tokio::spawn(parse_future);
+  #[cfg(target_arch = "wasm32")]
+  wasm_bindgen_futures::spawn_local(parse_future);
+  ```
+
+- **Dependency gating**: `llm-core` removes `tokio` from `[dependencies]` (keep in `[dev-dependencies]`). `llm-openai` makes `tokio` a `cfg(not(wasm32))` dependency, adds `wasm-bindgen-futures` as `cfg(wasm32)` dependency, removes `tokio-stream` entirely.
+
+**WASM crate (`llm-wasm`):**
+
+Built with `wasm-pack build --target bundler` (for Obsidian/webpack) or `--target web` (direct browser use). Exports a JS-friendly API via `wasm-bindgen`:
+
+```rust
+#[wasm_bindgen]
+pub struct LlmClient { /* provider, model, api_key */ }
+
+#[wasm_bindgen]
+impl LlmClient {
+    #[wasm_bindgen(constructor)]
+    pub fn new(api_key: &str, model: &str) -> Self;
+    pub fn new_with_base_url(api_key: &str, model: &str, base_url: &str) -> Self;
+    pub async fn prompt(&self, text: &str) -> Result<String, JsError>;
+    pub async fn prompt_streaming(&self, text: &str, callback: &js_sys::Function) -> Result<String, JsError>;
+}
+```
+
+TypeScript consumer (Obsidian plugin):
+```typescript
+import init, { LlmClient } from '@llm-rs/wasm';
+await init();
+const client = new LlmClient('sk-...', 'gpt-4o');
+const response = await client.prompt('Hello');
+// Streaming:
+await client.promptStreaming('Hello', (chunk) => console.log(chunk));
+```
+
+No storage, no config, no key management --- purely stateless. The Obsidian plugin handles persistence via its own vault API. reqwest 0.12 auto-detects wasm32 and uses web-sys `fetch` under the hood.
+
+npm package: `@llm-rs/wasm`.
+
+**Python crate (`llm-python`):**
+
+Built with `maturin build`. Exports a Python-friendly API via PyO3:
+
+```python
+import llm_rs
+
+client = llm_rs.LlmClient("sk-...", "gpt-4o-mini")
+response = client.prompt("Hello, world!")
+print(response)
+
+for chunk in client.prompt_stream("Tell me a story"):
+    print(chunk, end="", flush=True)
+```
+
+The crate owns a `tokio::Runtime` for async-to-sync bridging. Streaming uses `std::sync::mpsc` to bridge from the async stream to a Python iterator (`ChunkIterator` with `__iter__`/`__next__`). Optionally includes `llm-store` for log persistence when `log_dir` is provided.
+
+PyPI package: `llm-rs`, import as `import llm_rs`.
+
 ---
 
 ## Subprocess Provider Protocol
@@ -437,13 +518,15 @@ Errors: exit code 1, human-readable message to stderr.
 
 5. **`prompt` command complexity.** The Python `prompt` command is ~580 lines with 30+ flags, complex resolution chains (schema, template, fragment, attachment), and multiple output modes. Rushing this risks a buggy CLI. Mitigate: implement flags incrementally across phases; test each flag in isolation.
 
+6. **wasm32 reqwest streaming.** reqwest 0.12 supports wasm32 via web-sys fetch, but streaming SSE via `ReadableStream` may have edge cases (chunking boundaries, backpressure) that differ from native HTTP. Mitigate: test `llm-wasm` with wasm-pack in a browser environment against a mock SSE server; verify chunk boundaries match native behavior.
+
 ---
 
 ## Phased Approach
 
 ### Phase 1 (v0.1) --- Core Loop
 
-**Goal:** `echo "Hello" | llm` works end-to-end. Streams to stdout, logs to JSONL.
+**Goal:** `echo "Hello" | llm` works end-to-end. Streams to stdout, logs to JSONL. Core library also compiles to WASM and Python native module.
 
 - `llm prompt` with `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`
 - Stdin piping (detect terminal vs pipe)
@@ -454,6 +537,8 @@ Errors: exit code 1, human-readable message to stderr.
 - `llm logs list` (basic: list recent, `--json`, `-r/--response`)
 - Config loading (`config.toml` + `keys.toml`)
 - Exit codes
+- WASM library target (`llm-wasm`) for browser/Obsidian plugin use --- self-contained HTTP via fetch, no storage, JS Promise-based API
+- Python native module (`llm-python`) via PyO3/maturin --- sync + streaming API with optional log storage
 
 ### Phase 2 (v0.2) --- Conversations and Multi-Provider
 
@@ -500,8 +585,12 @@ Each phase is a vertical slice delivering a usable tool. Within each phase, work
 | 3 | `llm-store` | Conversation JSONL file I/O, `log_response` | Tests with tmpdir log files |
 | 4 | `llm-core` | `Config`, `KeyStore`, XDG path resolution | Unit tests: key resolution order, config parsing |
 | 5 | `llm-cli` | `prompt`, `keys`, `models`, `logs list` commands | Integration tests: assert stdout/stderr/exit code |
+| 6a | `llm-core` | cfg-gate `ResponseStream` Send bound, `Provider` Send+Sync bounds for wasm32 | Existing 188 tests pass; `cargo check -p llm-core --target wasm32-unknown-unknown` |
+| 6b | `llm-openai` | Switch to `futures::channel::mpsc`, cfg-gate spawn for wasm32 | Existing streaming tests pass; `cargo check -p llm-openai --target wasm32-unknown-unknown` |
+| 6c | `llm-wasm` | wasm-bindgen exports: `LlmClient`, `prompt()`, `prompt_streaming()` | `wasm-pack build`; manual test in browser/Node.js |
+| 6d | `llm-python` | PyO3 exports: `LlmClient`, `prompt()`, `prompt_stream()` iterator | `maturin develop && python -c "import llm_rs"` |
 
-Each step is a self-contained TDD cycle: write failing tests that describe the contract, make them pass, refactor. Steps 1-4 are unit/component tests. Step 5 is integration tests that exercise the full stack.
+Each step is a self-contained TDD cycle: write failing tests that describe the contract, make them pass, refactor. Steps 1-4 are unit/component tests. Step 5 is integration tests that exercise the full stack. Steps 6a-6b are refactoring existing crates for wasm32 compatibility (all existing tests must stay green). Steps 6c-6d are new crates with their own build toolchains.
 
 The same pattern repeats for later phases --- core types first, then provider work, then storage, then CLI --- but each phase only adds what that phase needs.
 
@@ -586,6 +675,17 @@ llm-rs/
         interactive.rs              # chat REPL (rustyline)
         subprocess.rs               # subprocess provider/tool protocol
 
+    llm-wasm/
+      Cargo.toml                    # crate-type = ["cdylib"], wasm-bindgen deps
+      src/
+        lib.rs                      # wasm-bindgen exports: LlmClient, prompt, streaming
+
+    llm-python/
+      Cargo.toml                    # crate-type = ["cdylib"], pyo3 deps
+      pyproject.toml                # maturin build config
+      src/
+        lib.rs                      # PyO3 module: LlmClient, ChunkIterator
+
   tests/
     cassettes/                      # recorded HTTP responses for providers
 ```
@@ -596,6 +696,7 @@ llm-rs/
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["crates/llm-wasm", "crates/llm-python"]  # built with wasm-pack / maturin
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -607,6 +708,9 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }  # only
 thiserror = "2"
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+pyo3 = { version = "0.23", features = ["extension-module"] }
 ```
 
 **`llm-cli/Cargo.toml` feature flags:**
@@ -621,6 +725,18 @@ all = ["openai", "anthropic", "ollama"]
 ```
 
 Users compile with `--features all` for the full suite or `--no-default-features --features ollama` for a minimal local-only binary.
+
+**Library target build commands:**
+
+```bash
+# WASM (for Obsidian/browser):
+wasm-pack build crates/llm-wasm --target bundler   # npm-ready package
+wasm-pack build crates/llm-wasm --target web        # direct browser use
+
+# Python (via maturin):
+cd crates/llm-python && maturin develop             # install to current venv
+cd crates/llm-python && maturin build --release     # build wheel for distribution
+```
 
 ---
 

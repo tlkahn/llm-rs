@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["crates/llm-wasm", "crates/llm-python"]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

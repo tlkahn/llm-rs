@@ -1,0 +1,18 @@
+[package]
+name = "llm-python"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "llm_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+llm-core = { path = "../llm-core" }
+llm-openai = { path = "../llm-openai" }
+llm-store = { path = "../llm-store" }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

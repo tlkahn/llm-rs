@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use llm_core::stream::{Chunk, ResponseStream};
 use llm_core::types::{ModelInfo, Prompt, Usage};
 use llm_core::{LlmError, Provider, Result};
@@ -25,7 +25,8 @@ impl OpenAiProvider {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl Provider for OpenAiProvider {
     fn id(&self) -> &str {
         "openai"
@@ -112,9 +113,10 @@ impl Provider for OpenAiProvider {
 
         if stream {
             let byte_stream = response.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Chunk, LlmError>>(32);
+            let (mut tx, rx) =
+                futures::channel::mpsc::channel::<std::result::Result<Chunk, LlmError>>(32);
 
-            tokio::spawn(async move {
+            let parse_future = async move {
                 let mut parser = SseParser::new();
                 let mut byte_stream = std::pin::pin!(byte_stream);
                 while let Some(result) = byte_stream.next().await {
@@ -126,7 +128,8 @@ impl Provider for OpenAiProvider {
                                 for choice in &event.choices {
                                     if let Some(content) = &choice.delta.content {
                                         if !content.is_empty() {
-                                            let _ = tx.send(Ok(Chunk::Text(content.clone()))).await;
+                                            let _ =
+                                                tx.send(Ok(Chunk::Text(content.clone()))).await;
                                         }
                                     }
                                 }
@@ -151,10 +154,15 @@ impl Provider for OpenAiProvider {
                     }
                 }
                 let _ = tx.send(Ok(Chunk::Done)).await;
-            });
+            };
 
-            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-            Ok(Box::pin(stream))
+            #[cfg(not(target_arch = "wasm32"))]
+            tokio::spawn(parse_future);
+
+            #[cfg(target_arch = "wasm32")]
+            wasm_bindgen_futures::spawn_local(parse_future);
+
+            Ok(Box::pin(rx))
         } else {
             // Non-streaming: parse full JSON response
             let body = response

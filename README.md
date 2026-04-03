@@ -69,6 +69,69 @@ Log files live at `~/.local/share/llm/logs/`. Each file is a JSONL conversation:
 | 2 | Configuration error (missing key, unknown model, bad config) |
 | 3 | Provider error (API failure, network timeout) |
 
+## Library usage
+
+In addition to the CLI, llm-rs can be used as a library from JavaScript/TypeScript (via WASM) or Python (via native module).
+
+### WASM (browser / Obsidian plugin)
+
+```typescript
+import init, { LlmClient } from '@llm-rs/wasm';
+
+await init();
+const client = new LlmClient('sk-...', 'gpt-4o');
+
+// Non-streaming
+const response = await client.prompt('Hello');
+
+// With system prompt
+const answer = await client.promptWithSystem('What is 2+2?', 'Answer only with the number');
+
+// Streaming (callback per chunk)
+await client.promptStreaming('Tell me a story', (chunk) => {
+    process.stdout.write(chunk);
+});
+```
+
+Build from source:
+
+```bash
+wasm-pack build crates/llm-wasm --target web       # ES module for browsers
+wasm-pack build crates/llm-wasm --target bundler    # For webpack/rollup (Obsidian plugins)
+```
+
+The WASM module is stateless --- no config files, no log storage. HTTP goes through the browser's `fetch()` API. The host application manages API keys and persistence.
+
+### Python
+
+```python
+import llm_rs
+
+client = llm_rs.LlmClient("sk-...", "gpt-4o-mini")
+
+# Non-streaming
+response = client.prompt("Hello, world!")
+print(response)
+
+# With system prompt
+answer = client.prompt("What is 2+2?", system="Answer only with the number")
+
+# Streaming (Python iterator)
+for chunk in client.prompt_stream("Tell me a story"):
+    print(chunk, end="", flush=True)
+```
+
+Build from source (requires [uv](https://docs.astral.sh/uv/)):
+
+```bash
+cd crates/llm-python
+uv venv && uv pip install maturin
+uv run maturin develop           # Install to current venv
+uv run maturin build --release   # Build wheel for distribution
+```
+
+Optional parameters: `base_url` for OpenAI-compatible APIs, `log_dir` to enable JSONL logging.
+
 ## Installation
 
 Requires Rust 1.85+ (2024 edition).
@@ -126,7 +189,7 @@ openai = "sk-..."
 
 ## Architecture
 
-Four Rust crates in a Cargo workspace:
+Six Rust crates in a Cargo workspace:
 
 ```
 crates/
@@ -134,24 +197,27 @@ crates/
   llm-openai/    OpenAI Chat API provider (streaming SSE + non-streaming)
   llm-store/     JSONL conversation log storage and queries
   llm-cli/       CLI binary (the `llm` command)
+  llm-wasm/      WASM library for browser/Obsidian (excluded from workspace)
+  llm-python/    Python native module via PyO3 (excluded from workspace)
 ```
 
-Dependency flow: `llm-cli` -> `llm-openai` + `llm-store` -> `llm-core`. No cycles.
+Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry points -> `llm-openai` + `llm-store` -> `llm-core`. No cycles.
 
 Key design choices vs the Python original:
 
 - **No plugin system.** Providers are compiled in (feature flags) or discovered as subprocess executables on `$PATH` (planned).
 - **JSONL storage.** One file per conversation instead of SQLite. Append-only, human-readable, no migrations.
-- **Async-first.** Single `Provider` trait using tokio streams, no sync/async class duplication.
+- **Async-first.** Single `Provider` trait using futures streams, no sync/async class duplication.
 - **TOML config.** Two files (`config.toml` + `keys.toml`) instead of six scattered JSON/YAML/text files.
 - **Feature-gated providers.** Compile only the providers you need: `--features openai` (default), or `--no-default-features` for a minimal binary.
+- **Multi-target.** Core crates compile for both native and `wasm32-unknown-unknown`. The same OpenAI provider code runs in the CLI, in a browser, and in a Python module.
 
 See [`doc/metaplan.md`](doc/metaplan.md) for the full design rationale and phased roadmap.
 
 ## Testing
 
 ```bash
-cargo test --workspace    # 188 tests
+cargo test --workspace    # 188 tests (core workspace crates)
 ```
 
 | Crate | Tests | What's covered |
@@ -161,9 +227,11 @@ cargo test --workspace    # 188 tests
 | `llm-store` | 42 | JSONL round-trips, unicode, malformed recovery, listing/queries |
 | `llm-cli` | 29 | End-to-end CLI: stdout/stderr/exit codes, wiremock API, logging |
 
+Library targets are verified by their build toolchains: `wasm-pack build` for WASM, `maturin develop` for Python.
+
 ## Status
 
-Phase 1 (v0.1) is complete. Phase 2 will add conversations, Anthropic + Ollama providers, attachments, and interactive chat.
+Phase 1 (v0.1) is complete --- CLI, WASM library, and Python module all working. Phase 2 will add conversations, Anthropic + Ollama providers, attachments, and interactive chat.
 
 ## License
 
