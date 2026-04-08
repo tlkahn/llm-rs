@@ -541,7 +541,28 @@ Errors: exit code 1, human-readable message to stderr.
 - Python native module (`llm-python`) via PyO3/maturin --- sync + streaming API with optional log storage
 - Anthropic provider (streaming + non-streaming)
 
-### Phase 2 (v0.2) --- Conversations and Multi-Provider
+### Phase 2 (v0.2) --- Tools and Structured Output
+
+- OpenAI provider: tool calling in requests (`tools` field, `tool_choice`) + SSE parsing for tool call deltas
+- Anthropic provider: tool calling in requests (`tools` field) + SSE parsing for `tool_use` content blocks
+- OpenAI + Anthropic: structured output (`response_format` / schema in request)
+- Schema DSL parser (`"name str, age int"` → JSON Schema)
+- Chain loop function in `llm-core` (iterate provider → tool execution → feed results, up to `--chain-limit`)
+- Built-in tools in `llm-cli`: `llm_version`, `llm_time`
+- CLI flags: `-T/--tool`, `--chain-limit`, `--tools-debug`, `--tools-approve`
+- CLI flags: `--schema`, `--schema-multi`; schema resolution (JSON literal / file / schema ID / DSL)
+- `llm tools list`, `llm schemas list/show/dsl` commands
+- Tool/tool call/tool result persistence in JSONL response records (store layer already supports this)
+
+### Phase 3 (v0.3) --- Subprocess Extensibility
+
+- `llm-tool-*` subprocess tool protocol (discovery via `--schema`, invocation via stdin/stdout JSON)
+- `llm-provider-*` subprocess protocol (discovery + execution)
+- `llm plugins` (list compiled providers + discovered subprocess providers/tools)
+- `--verbose` flag (HTTP request logging, config resolution tracing)
+- Shell completions (`clap_complete`)
+
+### Phase 4 (v0.4) --- Conversations and Multi-Provider
 
 - `llm chat` (interactive REPL with `rustyline`)
 - `-c/--continue`, `--cid` for conversation continuation
@@ -551,26 +572,6 @@ Errors: exit code 1, human-readable message to stderr.
 - `-o/--option`, `llm options set/get/list/clear`
 - `-a/--attachment`, `--at/--attachment-type`
 - `-x/--extract`, `--xl/--extract-last`
-
-### Phase 3 (v0.3) --- Tools and Structured Output
-
-- `-T/--tool` (tool calling)
-- Built-in tools (`llm_version`, `llm_time`)
-- Chain loop with `--chain-limit`
-- `--tools-debug`, `--tools-approve`
-- `--schema` / `--schema-multi`
-- Schema DSL parser
-- `llm schemas list/show/dsl`
-- `llm tools list`
-- Tool/tool call/tool result persistence in JSONL response records
-
-### Phase 4 (v0.4) --- Subprocess Extensibility
-
-- `llm-provider-*` subprocess protocol (discovery + execution)
-- `llm-tool-*` subprocess tool protocol
-- `llm plugins` (list compiled providers + discovered subprocess providers/tools)
-- `--verbose` flag (HTTP request logging, config resolution tracing)
-- Shell completions (`clap_complete`)
 
 ### Iteration Strategy
 
@@ -592,7 +593,22 @@ Each phase is a vertical slice delivering a usable tool. Within each phase, work
 
 Each step is a self-contained TDD cycle: write failing tests that describe the contract, make them pass, refactor. Steps 1-4 are unit/component tests. Step 5 is integration tests that exercise the full stack. Steps 6a-6b are refactoring existing crates for wasm32 compatibility (all existing tests must stay green). Steps 6c-6d are new crates with their own build toolchains.
 
-The same pattern repeats for later phases --- core types first, then provider work, then storage, then CLI --- but each phase only adds what that phase needs.
+**Phase 2 inner loop:**
+
+Core types (`Tool`, `ToolCall`, `ToolResult`, `Chunk::ToolCallStart/Delta`, `collect_tool_calls()`, `Prompt` builders, `Response` fields) and store persistence already exist from Phase 1. Phase 2 builds on top of them.
+
+| Step | Crate | What to build | TDD focus |
+|------|-------|---------------|-----------|
+| 1 | `llm-core` | Schema DSL parser (`schema.rs`): `"name str, age int:desc"` → JSON Schema | Unit tests: DSL strings → JSON Schema, types (str/int/float/bool), descriptions, edge cases, parse errors |
+| 2 | `llm-openai` | Tool calling: add `tools` + `tool_choice` to request; parse `tool_calls` deltas in SSE (streaming) and full response (non-streaming) | Cassette tests: single tool call, multiple tool calls, streaming delta accumulation, non-streaming extraction |
+| 3 | `llm-anthropic` | Tool calling: add `tools` to request; parse `tool_use` content blocks in SSE (streaming) and full response (non-streaming); send `tool_result` content blocks | Cassette tests: same scenarios as step 2 but with Anthropic wire format |
+| 4 | `llm-openai` + `llm-anthropic` | Structured output: send schema in request (`response_format` for OpenAI, tool-based for Anthropic); parse structured JSON response | Cassette tests: schema request → JSON response, `--schema-multi` wrapping |
+| 5 | `llm-core` | Chain loop function: `chain(provider, prompt, tools, limit) → ResponseStream` — iterate execute → collect tool calls → run tools → feed results back, stop when no calls or limit reached | Unit tests with mock provider: single iteration, multi-iteration, chain limit, no tool calls exits immediately |
+| 6 | `llm-cli` | Built-in tools (`llm_version`, `llm_time`); tool registry (enumerate built-ins); `llm tools list` command | Integration tests: `llm tools list` output, tool schema shape |
+| 7 | `llm-cli` | `-T/--tool` flag, `--chain-limit`, `--tools-debug` (stderr diagnostics), `--tools-approve` (interactive y/n) | Integration tests with wiremock: tool flag → provider receives tools in request; chain loop executes; debug output on stderr |
+| 8 | `llm-cli` | `--schema` flag (JSON literal / file / schema ID / DSL), `--schema-multi`; schema resolution chain; `llm schemas list/show/dsl` commands | Integration tests: each resolution path, DSL → structured response, `schemas dsl` output |
+
+Each step follows strict TDD: write failing tests first (red), implement until they pass (green), then refactor. All 225+ existing tests must stay green at every step. `cargo test --workspace` and `cargo clippy --workspace` gate each commit.
 
 ---
 

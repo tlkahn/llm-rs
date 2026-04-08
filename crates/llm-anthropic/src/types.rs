@@ -13,6 +13,17 @@ pub struct MessagesRequest {
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<AnthropicTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnthropicTool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,8 +58,22 @@ pub struct MessagesResponse {
 pub struct ContentBlock {
     #[serde(rename = "type")]
     pub block_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    // tool_use fields
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    // tool_result fields
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,6 +125,8 @@ pub struct ContentDelta {
     pub delta_type: String,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub partial_json: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +173,8 @@ mod tests {
             system: None,
             stream: None,
             temperature: None,
+            tools: None,
+            tool_choice: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["model"], "claude-sonnet-4-6");
@@ -156,6 +185,7 @@ mod tests {
         assert!(json.get("system").is_none());
         assert!(json.get("stream").is_none());
         assert!(json.get("temperature").is_none());
+        assert!(json.get("tools").is_none());
     }
 
     #[test]
@@ -170,6 +200,8 @@ mod tests {
             system: Some("Be brief.".into()),
             stream: Some(true),
             temperature: Some(0.7),
+            tools: None,
+            tool_choice: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["system"], "Be brief.");
@@ -187,6 +219,8 @@ mod tests {
             system: None,
             stream: None,
             temperature: None,
+            tools: None,
+            tool_choice: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("max_tokens").is_some());
@@ -323,5 +357,94 @@ mod tests {
         let err: ErrorResponse = serde_json::from_value(json).unwrap();
         assert_eq!(err.error.message, "invalid x-api-key");
         assert_eq!(err.error.error_type, "authentication_error");
+    }
+
+    // --- Tool calling types ---
+
+    #[test]
+    fn messages_request_with_tools_serializes() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".into(),
+            max_tokens: 4096,
+            messages: vec![],
+            system: None,
+            stream: None,
+            temperature: None,
+            tools: Some(vec![AnthropicTool {
+                name: "get_weather".into(),
+                description: "Get weather".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"]
+                }),
+            }]),
+            tool_choice: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["tools"][0]["name"], "get_weather");
+        assert_eq!(json["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn content_block_tool_use_deserializes() {
+        let json = serde_json::json!({
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "get_weather",
+            "input": {"location": "Paris"}
+        });
+        let block: ContentBlock = serde_json::from_value(json).unwrap();
+        assert_eq!(block.block_type, "tool_use");
+        assert_eq!(block.id.as_deref(), Some("toolu_1"));
+        assert_eq!(block.name.as_deref(), Some("get_weather"));
+        assert_eq!(block.input.as_ref().unwrap()["location"], "Paris");
+    }
+
+    #[test]
+    fn content_delta_input_json_delta_deserializes() {
+        let json = serde_json::json!({
+            "type": "input_json_delta",
+            "partial_json": "{\"location\":"
+        });
+        let delta: ContentDelta = serde_json::from_value(json).unwrap();
+        assert_eq!(delta.delta_type, "input_json_delta");
+        assert_eq!(delta.partial_json.as_deref(), Some("{\"location\":"));
+    }
+
+    #[test]
+    fn content_block_tool_result_serializes() {
+        let block = ContentBlock {
+            block_type: "tool_result".into(),
+            text: None,
+            id: None,
+            name: None,
+            input: None,
+            tool_use_id: Some("toolu_1".into()),
+            content: Some("Sunny, 22C".into()),
+            is_error: None,
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "tool_result");
+        assert_eq!(json["tool_use_id"], "toolu_1");
+        assert_eq!(json["content"], "Sunny, 22C");
+        assert!(json.get("text").is_none());
+    }
+
+    #[test]
+    fn stream_event_content_block_start_tool_use() {
+        let json = serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}}
+        });
+        let event: StreamEvent = serde_json::from_value(json).unwrap();
+        if let StreamEvent::ContentBlockStart { content_block, .. } = event {
+            assert_eq!(content_block.block_type, "tool_use");
+            assert_eq!(content_block.name.as_deref(), Some("get_weather"));
+            assert_eq!(content_block.id.as_deref(), Some("toolu_1"));
+        } else {
+            panic!("expected ContentBlockStart");
+        }
     }
 }

@@ -1,4 +1,4 @@
-use crate::types::Message;
+use crate::types::{Message, MessageToolCall, MessageToolCallFunction};
 use llm_core::Prompt;
 
 pub fn build_messages(prompt: &Prompt) -> Vec<Message> {
@@ -21,6 +21,38 @@ pub fn build_messages(prompt: &Prompt) -> Vec<Message> {
         tool_calls: None,
         tool_call_id: None,
     });
+
+    // If there are tool calls and tool results, add assistant + tool messages
+    if !prompt.tool_calls.is_empty() && !prompt.tool_results.is_empty() {
+        let tool_calls: Vec<MessageToolCall> = prompt
+            .tool_calls
+            .iter()
+            .map(|tc| MessageToolCall {
+                id: tc.tool_call_id.clone().unwrap_or_default(),
+                call_type: "function".into(),
+                function: MessageToolCallFunction {
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.to_string(),
+                },
+            })
+            .collect();
+
+        messages.push(Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        });
+
+        for result in &prompt.tool_results {
+            messages.push(Message {
+                role: "tool".into(),
+                content: Some(result.output.clone()),
+                tool_calls: None,
+                tool_call_id: result.tool_call_id.clone(),
+            });
+        }
+    }
 
     messages
 }
@@ -52,6 +84,45 @@ mod tests {
     #[test]
     fn build_messages_empty_system_is_skipped() {
         let prompt = Prompt::new("Hello").with_system("");
+        let messages = build_messages(&prompt);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+    }
+
+    #[test]
+    fn build_messages_with_tool_results() {
+        use llm_core::{ToolCall, ToolResult};
+
+        let prompt = Prompt::new("What's the weather?")
+            .with_tool_calls(vec![ToolCall {
+                name: "get_weather".into(),
+                arguments: serde_json::json!({"location": "Paris"}),
+                tool_call_id: Some("call_1".into()),
+            }])
+            .with_tool_results(vec![ToolResult {
+                name: "get_weather".into(),
+                output: "Sunny, 22C".into(),
+                tool_call_id: Some("call_1".into()),
+                error: None,
+            }]);
+
+        let messages = build_messages(&prompt);
+        // system(0) + user(1) + assistant(2) + tool(3) = 3 messages (no system)
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+        assert!(messages[1].tool_calls.is_some());
+        let tcs = messages[1].tool_calls.as_ref().unwrap();
+        assert_eq!(tcs[0].id, "call_1");
+        assert_eq!(tcs[0].function.name, "get_weather");
+        assert_eq!(messages[2].role, "tool");
+        assert_eq!(messages[2].content.as_deref(), Some("Sunny, 22C"));
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn build_messages_without_tool_results_unchanged() {
+        let prompt = Prompt::new("Hello");
         let messages = build_messages(&prompt);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");

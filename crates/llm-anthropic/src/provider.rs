@@ -7,7 +7,9 @@ use reqwest::Client;
 
 use crate::messages::build_messages;
 use crate::sse::SseParser;
-use crate::types::{ErrorResponse, MessagesRequest, MessagesResponse, StreamEvent};
+use crate::types::{
+    AnthropicTool, ErrorResponse, MessagesRequest, MessagesResponse, StreamEvent,
+};
 
 const DEFAULT_MAX_TOKENS: u64 = 4096;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -101,6 +103,38 @@ impl Provider for AnthropicProvider {
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_MAX_TOKENS);
 
+        // Convert llm_core::Tool -> AnthropicTool
+        let mut tools: Option<Vec<AnthropicTool>> = if prompt.tools.is_empty() {
+            None
+        } else {
+            Some(
+                prompt
+                    .tools
+                    .iter()
+                    .map(|t| AnthropicTool {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        input_schema: t.input_schema.clone(),
+                    })
+                    .collect(),
+            )
+        };
+
+        // Structured output: inject synthetic _schema_output tool
+        let has_schema = prompt.schema.is_some();
+        let mut tool_choice = None;
+        if let Some(schema) = &prompt.schema {
+            let schema_tool = AnthropicTool {
+                name: "_schema_output".into(),
+                description: "Output structured data".into(),
+                input_schema: schema.clone(),
+            };
+            tools.get_or_insert_with(Vec::new).push(schema_tool);
+            tool_choice = Some(
+                serde_json::json!({"type": "tool", "name": "_schema_output"}),
+            );
+        }
+
         let request = MessagesRequest {
             model: model.to_string(),
             max_tokens,
@@ -108,6 +142,8 @@ impl Provider for AnthropicProvider {
             system,
             stream: Some(stream),
             temperature: prompt.options.get("temperature").and_then(|v| v.as_f64()),
+            tools,
+            tool_choice,
         };
 
         let response = self
@@ -142,6 +178,8 @@ impl Provider for AnthropicProvider {
                 let mut parser = SseParser::new();
                 let mut input_tokens: Option<u64> = None;
                 let mut byte_stream = std::pin::pin!(byte_stream);
+                // Track whether current block is the synthetic _schema_output tool
+                let mut is_schema_block = false;
 
                 while let Some(result) = byte_stream.next().await {
                     match result {
@@ -154,12 +192,54 @@ impl Provider for AnthropicProvider {
                                             input_tokens = Some(usage.input_tokens);
                                         }
                                     }
+                                    StreamEvent::ContentBlockStart {
+                                        content_block, ..
+                                    } => {
+                                        if content_block.block_type == "tool_use" {
+                                            let name = content_block
+                                                .name
+                                                .as_deref()
+                                                .unwrap_or_default();
+                                            if has_schema && name == "_schema_output" {
+                                                is_schema_block = true;
+                                                // Don't emit ToolCallStart for schema tool
+                                            } else {
+                                                is_schema_block = false;
+                                                let _ = tx
+                                                    .send(Ok(Chunk::ToolCallStart {
+                                                        name: name.to_string(),
+                                                        id: content_block.id.clone(),
+                                                    }))
+                                                    .await;
+                                            }
+                                        } else {
+                                            is_schema_block = false;
+                                        }
+                                    }
                                     StreamEvent::ContentBlockDelta { delta, .. } => {
-                                        if let Some(text) = &delta.text
-                                            && !text.is_empty()
+                                        if delta.delta_type == "text_delta" {
+                                            if let Some(text) = &delta.text
+                                                && !text.is_empty()
+                                            {
+                                                let _ = tx
+                                                    .send(Ok(Chunk::Text(text.clone())))
+                                                    .await;
+                                            }
+                                        } else if delta.delta_type == "input_json_delta"
+                                            && let Some(json) = &delta.partial_json
+                                            && !json.is_empty()
                                         {
-                                            let _ =
-                                                tx.send(Ok(Chunk::Text(text.clone()))).await;
+                                            if is_schema_block {
+                                                let _ = tx
+                                                    .send(Ok(Chunk::Text(json.clone())))
+                                                    .await;
+                                            } else {
+                                                let _ = tx
+                                                    .send(Ok(Chunk::ToolCallDelta {
+                                                        content: json.clone(),
+                                                    }))
+                                                    .await;
+                                            }
                                         }
                                     }
                                     StreamEvent::MessageDelta {
@@ -208,15 +288,36 @@ impl Provider for AnthropicProvider {
 
             let mut chunks: Vec<std::result::Result<Chunk, LlmError>> = Vec::new();
 
-            // Concatenate all text content blocks
-            let text: String = resp
-                .content
-                .iter()
-                .filter(|b| b.block_type == "text")
-                .filter_map(|b| b.text.as_deref())
-                .collect();
-            if !text.is_empty() {
-                chunks.push(Ok(Chunk::Text(text)));
+            for block in &resp.content {
+                match block.block_type.as_str() {
+                    "text" => {
+                        if let Some(text) = &block.text
+                            && !text.is_empty()
+                        {
+                            chunks.push(Ok(Chunk::Text(text.clone())));
+                        }
+                    }
+                    "tool_use" => {
+                        let name = block.name.as_deref().unwrap_or_default();
+                        if has_schema && name == "_schema_output" {
+                            // Schema output: emit as Text
+                            if let Some(input) = &block.input {
+                                chunks.push(Ok(Chunk::Text(input.to_string())));
+                            }
+                        } else {
+                            chunks.push(Ok(Chunk::ToolCallStart {
+                                name: name.to_string(),
+                                id: block.id.clone(),
+                            }));
+                            if let Some(input) = &block.input {
+                                chunks.push(Ok(Chunk::ToolCallDelta {
+                                    content: input.to_string(),
+                                }));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
 
             chunks.push(Ok(Chunk::Usage(Usage {
@@ -527,5 +628,270 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     #[test]
     fn default_max_tokens_is_4096() {
         assert_eq!(DEFAULT_MAX_TOKENS, 4096);
+    }
+
+    // --- Tool calling tests ---
+
+    #[tokio::test]
+    async fn streaming_tool_call() {
+        let server = MockServer::start().await;
+
+        let sse_body = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":50,\"output_tokens\":0}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\",\"input\":{}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"location\\\":\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"Paris\\\"}\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":30}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = make_provider(&server.uri());
+        let tool = llm_core::Tool {
+            name: "get_weather".into(),
+            description: "Get weather".into(),
+            input_schema: serde_json::json!({"type": "object", "properties": {"location": {"type": "string"}}}),
+        };
+        let prompt = Prompt::new("What's the weather in Paris?").with_tools(vec![tool]);
+        let stream = provider
+            .execute("claude-sonnet-4-6", &prompt, Some("sk-test"), true)
+            .await
+            .unwrap();
+
+        let chunks: Vec<_> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let tool_calls = llm_core::collect_tool_calls(&chunks);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "get_weather");
+        assert_eq!(tool_calls[0].tool_call_id.as_deref(), Some("toolu_1"));
+        assert_eq!(tool_calls[0].arguments, serde_json::json!({"location": "Paris"}));
+    }
+
+    #[tokio::test]
+    async fn non_streaming_tool_call() {
+        let server = MockServer::start().await;
+
+        let body = serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "get_weather",
+                "input": {"location": "Paris"}
+            }],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 50, "output_tokens": 30}
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = make_provider(&server.uri());
+        let prompt = Prompt::new("What's the weather?");
+        let stream = provider
+            .execute("claude-sonnet-4-6", &prompt, Some("sk-test"), false)
+            .await
+            .unwrap();
+
+        let chunks: Vec<_> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let tool_calls = llm_core::collect_tool_calls(&chunks);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "get_weather");
+        assert_eq!(tool_calls[0].tool_call_id.as_deref(), Some("toolu_1"));
+    }
+
+    #[tokio::test]
+    async fn request_includes_tools_when_prompt_has_tools() {
+        let server = MockServer::start().await;
+
+        let body = serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [{"type": "text", "text": "Hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 1}
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = make_provider(&server.uri());
+        let tool = llm_core::Tool {
+            name: "test_tool".into(),
+            description: "A test".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let prompt = Prompt::new("test").with_tools(vec![tool]);
+        let _ = provider
+            .execute("claude-sonnet-4-6", &prompt, Some("sk-test"), false)
+            .await
+            .unwrap();
+    }
+
+    // --- Structured output tests ---
+
+    #[tokio::test]
+    async fn non_streaming_schema_response() {
+        let server = MockServer::start().await;
+
+        let body = serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "_schema_output",
+                "input": {"name": "John", "age": 30}
+            }],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 20, "output_tokens": 15}
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = make_provider(&server.uri());
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+            "required": ["name", "age"]
+        });
+        let prompt = Prompt::new("Extract from: John is 30").with_schema(schema);
+        let stream = provider
+            .execute("claude-sonnet-4-6", &prompt, Some("sk-test"), false)
+            .await
+            .unwrap();
+
+        let chunks: Vec<_> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let text = llm_core::collect_text(&chunks);
+        // Should be JSON text, not tool calls
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["name"], "John");
+        assert_eq!(parsed["age"], 30);
+
+        // Should NOT have any tool calls (schema output is transparent)
+        let tool_calls = llm_core::collect_tool_calls(&chunks);
+        assert!(tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn streaming_schema_response() {
+        let server = MockServer::start().await;
+
+        let sse_body = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":20,\"output_tokens\":0}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"_schema_output\",\"input\":{}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"name\\\":\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"John\\\",\\\"age\\\":30}\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":15}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = make_provider(&server.uri());
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+            "required": ["name", "age"]
+        });
+        let prompt = Prompt::new("Extract from: John is 30").with_schema(schema);
+        let stream = provider
+            .execute("claude-sonnet-4-6", &prompt, Some("sk-test"), true)
+            .await
+            .unwrap();
+
+        let chunks: Vec<_> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let text = llm_core::collect_text(&chunks);
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["name"], "John");
+        assert_eq!(parsed["age"], 30);
+
+        // Schema output should NOT produce tool calls
+        let tool_calls = llm_core::collect_tool_calls(&chunks);
+        assert!(tool_calls.is_empty());
     }
 }

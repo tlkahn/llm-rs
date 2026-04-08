@@ -833,3 +833,328 @@ async fn prompt_logging_disabled_in_config() {
         assert!(entries.is_empty(), "no log files when config.logging=false");
     }
 }
+
+// ==========================================================================
+// Tools
+// ==========================================================================
+
+#[test]
+fn tools_list_shows_builtins() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["tools", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("llm_version"))
+        .stdout(predicate::str::contains("llm_time"));
+}
+
+#[test]
+fn prompt_with_unknown_tool_error() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["prompt", "--no-stream", "-T", "nonexistent", "hello"])
+        .env("OPENAI_BASE_URL", "http://localhost:1")
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unknown tool: nonexistent"));
+}
+
+#[tokio::test]
+async fn prompt_with_tool_flag() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    // First response: tool call
+    let tool_call_body = serde_json::json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "llm_version",
+                        "arguments": "{}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40}
+    });
+
+    // Second response: final text
+    let text_body = serde_json::json!({
+        "id": "chatcmpl-2",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "The version is 0.1.0"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 40, "completion_tokens": 8, "total_tokens": 48}
+    });
+
+    // Register second response first (default), then first with limit 1
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&text_body),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&tool_call_body),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args([
+            "prompt", "--no-stream", "-n", "-T", "llm_version", "What version?",
+        ])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("version"));
+}
+
+#[tokio::test]
+async fn prompt_chain_limit_respected() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    // Always return tool call - chain should stop at limit
+    let tool_call_body = serde_json::json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "llm_version",
+                        "arguments": "{}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40}
+    });
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&tool_call_body),
+        )
+        .mount(&server)
+        .await;
+
+    // With chain-limit 2, should stop after 2 iterations without error
+    llm_with_dir(&dir)
+        .args([
+            "prompt",
+            "--no-stream",
+            "-n",
+            "-T",
+            "llm_version",
+            "--chain-limit",
+            "2",
+            "Loop test",
+        ])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success();
+}
+
+// ==========================================================================
+// Schemas
+// ==========================================================================
+
+#[test]
+fn schemas_dsl_command() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["schemas", "dsl", "name str, age int"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"type\": \"object\""))
+        .stdout(predicate::str::contains("\"name\""))
+        .stdout(predicate::str::contains("\"string\""))
+        .stdout(predicate::str::contains("\"integer\""));
+}
+
+#[test]
+fn schemas_list_empty() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["schemas", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No schemas"));
+}
+
+#[tokio::test]
+async fn prompt_with_schema_dsl() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    let body = serde_json::json!({
+        "id": "chatcmpl-123",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "{\"name\":\"John\",\"age\":30}"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
+    });
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&body),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args([
+            "prompt",
+            "--no-stream",
+            "--schema",
+            "name str, age int",
+            "Extract from: John is 30",
+        ])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("John"));
+}
+
+#[tokio::test]
+async fn prompt_with_schema_json_literal() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    let body = serde_json::json!({
+        "id": "chatcmpl-123",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "{\"name\":\"Jane\"}"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
+    });
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&body),
+        )
+        .mount(&server)
+        .await;
+
+    let schema_json = r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"#;
+    llm_with_dir(&dir)
+        .args([
+            "prompt",
+            "--no-stream",
+            "-n",
+            "--schema",
+            schema_json,
+            "Extract name",
+        ])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Jane"));
+}
+
+#[tokio::test]
+async fn prompt_with_schema_multi() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    let body = serde_json::json!({
+        "id": "chatcmpl-123",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "{\"items\":[{\"name\":\"A\"},{\"name\":\"B\"}]}"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
+    });
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&body),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args([
+            "prompt",
+            "--no-stream",
+            "-n",
+            "--schema",
+            "name str",
+            "--schema-multi",
+            "List names",
+        ])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("items"));
+}

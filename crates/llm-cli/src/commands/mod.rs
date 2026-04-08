@@ -2,6 +2,8 @@ pub mod keys;
 pub mod logs;
 pub mod models;
 pub mod prompt;
+pub mod schemas;
+pub mod tools;
 
 use llm_core::Provider;
 

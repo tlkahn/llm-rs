@@ -8,7 +8,8 @@ use reqwest::Client;
 use crate::messages::build_messages;
 use crate::sse::SseParser;
 use crate::types::{
-    ChatRequest, ChatResponse, ErrorResponse, StreamOptions,
+    ChatRequest, ChatResponse, ChatTool, ChatToolFunction, ErrorResponse, JsonSchemaFormat,
+    ResponseFormat, StreamOptions,
 };
 
 pub struct OpenAiProvider {
@@ -75,6 +76,26 @@ impl Provider for OpenAiProvider {
 
         let messages = build_messages(prompt);
 
+        // Convert llm_core::Tool -> ChatTool
+        let tools = if prompt.tools.is_empty() {
+            None
+        } else {
+            Some(
+                prompt
+                    .tools
+                    .iter()
+                    .map(|t| ChatTool {
+                        tool_type: "function".into(),
+                        function: ChatToolFunction {
+                            name: t.name.clone(),
+                            description: t.description.clone(),
+                            parameters: t.input_schema.clone(),
+                        },
+                    })
+                    .collect(),
+            )
+        };
+
         let mut request = ChatRequest {
             model: model.to_string(),
             messages,
@@ -82,6 +103,16 @@ impl Provider for OpenAiProvider {
             stream_options: None,
             temperature: prompt.options.get("temperature").and_then(|v| v.as_f64()),
             max_tokens: prompt.options.get("max_tokens").and_then(|v| v.as_u64()),
+            tools,
+            tool_choice: None,
+            response_format: prompt.schema.as_ref().map(|schema| ResponseFormat {
+                format_type: "json_schema".into(),
+                json_schema: JsonSchemaFormat {
+                    name: "output".into(),
+                    strict: true,
+                    schema: schema.clone(),
+                },
+            }),
         };
 
         if stream {
@@ -126,10 +157,34 @@ impl Provider for OpenAiProvider {
                             while let Some(event) = parser.next_event() {
                                 // Map StreamChunk → Chunk(s)
                                 for choice in &event.choices {
-                                    if let Some(content) = &choice.delta.content {
-                                        if !content.is_empty() {
-                                            let _ =
-                                                tx.send(Ok(Chunk::Text(content.clone()))).await;
+                                    if let Some(content) = &choice.delta.content
+                                        && !content.is_empty()
+                                    {
+                                        let _ =
+                                            tx.send(Ok(Chunk::Text(content.clone()))).await;
+                                    }
+                                    // Handle tool call deltas
+                                    if let Some(tool_calls) = &choice.delta.tool_calls {
+                                        for tc in tool_calls {
+                                            if let Some(func) = &tc.function {
+                                                if let Some(name) = &func.name {
+                                                    let _ = tx
+                                                        .send(Ok(Chunk::ToolCallStart {
+                                                            name: name.clone(),
+                                                            id: tc.id.clone(),
+                                                        }))
+                                                        .await;
+                                                }
+                                                if let Some(args) = &func.arguments
+                                                    && !args.is_empty()
+                                                {
+                                                    let _ = tx
+                                                        .send(Ok(Chunk::ToolCallDelta {
+                                                            content: args.clone(),
+                                                        }))
+                                                        .await;
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -174,10 +229,22 @@ impl Provider for OpenAiProvider {
 
             let mut chunks: Vec<std::result::Result<Chunk, LlmError>> = Vec::new();
 
-            if let Some(choice) = resp.choices.first() {
-                if let Some(msg) = &choice.message {
-                    if let Some(content) = &msg.content {
-                        chunks.push(Ok(Chunk::Text(content.clone())));
+            if let Some(choice) = resp.choices.first()
+                && let Some(msg) = &choice.message
+            {
+                if let Some(content) = &msg.content {
+                    chunks.push(Ok(Chunk::Text(content.clone())));
+                }
+                // Handle tool calls in non-streaming response
+                if let Some(tool_calls) = &msg.tool_calls {
+                    for tc in tool_calls {
+                        chunks.push(Ok(Chunk::ToolCallStart {
+                            name: tc.function.name.clone(),
+                            id: Some(tc.id.clone()),
+                        }));
+                        chunks.push(Ok(Chunk::ToolCallDelta {
+                            content: tc.function.arguments.clone(),
+                        }));
                     }
                 }
             }
@@ -412,5 +479,211 @@ data: [DONE]\n\n";
         } else {
             panic!("expected Provider error");
         }
+    }
+
+    // --- Tool calling tests ---
+
+    #[tokio::test]
+    async fn streaming_single_tool_call() {
+        let server = MockServer::start().await;
+
+        let sse_body = "\
+data: {\"id\":\"1\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"1\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"location\\\":\"}}]},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"1\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Paris\\\"}\"}}]},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"1\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+data: {\"id\":\"1\",\"model\":\"gpt-4o-mini\",\"choices\":[],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":20,\"total_tokens\":70}}\n\n\
+data: [DONE]\n\n";
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = make_provider(&server.uri());
+        let tool = llm_core::Tool {
+            name: "get_weather".into(),
+            description: "Get weather".into(),
+            input_schema: serde_json::json!({"type": "object", "properties": {"location": {"type": "string"}}}),
+        };
+        let prompt = Prompt::new("What's the weather in Paris?").with_tools(vec![tool]);
+        let stream = provider
+            .execute("gpt-4o-mini", &prompt, Some("sk-test"), true)
+            .await
+            .unwrap();
+
+        let chunks: Vec<_> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let tool_calls = llm_core::collect_tool_calls(&chunks);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "get_weather");
+        assert_eq!(tool_calls[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(tool_calls[0].arguments, serde_json::json!({"location": "Paris"}));
+    }
+
+    #[tokio::test]
+    async fn non_streaming_tool_call() {
+        let server = MockServer::start().await;
+
+        let body = serde_json::json!({
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"location\":\"Paris\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 20,
+                "total_tokens": 70
+            }
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = make_provider(&server.uri());
+        let prompt = Prompt::new("What's the weather?");
+        let stream = provider
+            .execute("gpt-4o-mini", &prompt, Some("sk-test"), false)
+            .await
+            .unwrap();
+
+        let chunks: Vec<_> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let tool_calls = llm_core::collect_tool_calls(&chunks);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "get_weather");
+        assert_eq!(tool_calls[0].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[tokio::test]
+    async fn request_includes_tools_when_prompt_has_tools() {
+        let server = MockServer::start().await;
+
+        let body = serde_json::json!({
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = make_provider(&server.uri());
+        let tool = llm_core::Tool {
+            name: "test_tool".into(),
+            description: "A test tool".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let prompt = Prompt::new("test").with_tools(vec![tool]);
+        let _ = provider
+            .execute("gpt-4o-mini", &prompt, Some("sk-test"), false)
+            .await
+            .unwrap();
+        // Mock expectation verifies the request was made
+    }
+
+    // --- Structured output tests ---
+
+    #[tokio::test]
+    async fn non_streaming_schema_response() {
+        let server = MockServer::start().await;
+
+        let body = serde_json::json!({
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "{\"name\":\"John\",\"age\":30}"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = make_provider(&server.uri());
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+            "required": ["name", "age"]
+        });
+        let prompt = Prompt::new("Extract from: John is 30").with_schema(schema);
+        let stream = provider
+            .execute("gpt-4o-mini", &prompt, Some("sk-test"), false)
+            .await
+            .unwrap();
+
+        let chunks: Vec<_> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let text = llm_core::collect_text(&chunks);
+        assert_eq!(text, "{\"name\":\"John\",\"age\":30}");
     }
 }

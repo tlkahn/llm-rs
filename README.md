@@ -27,6 +27,57 @@ llm "Hello" -u
 llm "Hello" -n
 ```
 
+### Tool calling
+
+Built-in tools let the model call functions during a conversation. The CLI manages the chain loop automatically --- it sends tool calls to the executor, feeds results back, and repeats until the model responds with text.
+
+```bash
+# Enable a built-in tool
+llm "What time is it?" -T llm_time
+
+# Multiple tools
+llm "What version are you and what time is it?" -T llm_version -T llm_time
+
+# Limit chain iterations (default: 5)
+llm "Do something" -T llm_version --chain-limit 3
+
+# Debug mode: show tool calls/results on stderr
+llm "What version?" -T llm_version --tools-debug
+
+# List available built-in tools
+llm tools list
+```
+
+Available built-in tools:
+- `llm_version` --- returns the CLI version
+- `llm_time` --- returns current UTC and local time with timezone
+
+### Structured output
+
+Force the model to return JSON conforming to a schema. Works with both OpenAI (native `response_format`) and Anthropic (transparent tool wrapping).
+
+```bash
+# Schema DSL: simple field definitions
+llm "Extract: John is 30" --schema "name str, age int"
+
+# With field descriptions
+llm "Extract: John is 30" --schema "name str:The person's name, age int:Their age"
+
+# JSON Schema literal
+llm "Extract name" --schema '{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}'
+
+# Schema from a file
+llm "Extract data" --schema schema.json
+
+# Multiple items: wrap in array
+llm "List the planets" --schema "name str, diameter_km int" --schema-multi
+
+# Preview DSL output
+llm schemas dsl "name str, age int"
+```
+
+Schema DSL types: `str` (default), `int`, `float`, `bool`.
+
 ### Key management
 
 ```bash
@@ -66,6 +117,14 @@ Log files live at `~/.local/share/llm/logs/`. Each file is a JSONL conversation:
 ```jsonl
 {"type":"conversation","v":1,"id":"01j5a...","model":"gpt-4o","name":"Hello","created":"2026-04-03T12:00:00Z"}
 {"type":"response","id":"01j5b...","model":"gpt-4o","prompt":"Hello","response":"Hi!","usage":{"input":5,"output":3},"duration_ms":230,...}
+```
+
+### Schema management
+
+```bash
+llm schemas dsl "name str, age int"   # Preview DSL -> JSON Schema
+llm schemas list                      # List schemas used in logs
+llm schemas show <id>                 # Show schema by ID
 ```
 
 ### Exit codes
@@ -223,9 +282,9 @@ Seven Rust crates in a Cargo workspace:
 
 ```
 crates/
-  llm-core/      Traits, types, streaming, errors, config, keys
-  llm-openai/    OpenAI Chat API provider (streaming SSE + non-streaming)
-  llm-anthropic/ Anthropic Messages API provider (streaming SSE + non-streaming)
+  llm-core/      Traits, types, streaming, errors, config, keys, schema DSL, chain loop
+  llm-openai/    OpenAI Chat API provider (streaming + tools + structured output)
+  llm-anthropic/ Anthropic Messages API provider (streaming + tools + structured output)
   llm-store/     JSONL conversation log storage and queries
   llm-cli/       CLI binary (the `llm` command)
   llm-wasm/      WASM library for browser/Obsidian (excluded from workspace)
@@ -248,22 +307,26 @@ See [`doc/metaplan.md`](doc/metaplan.md) for the full design rationale and phase
 ## Testing
 
 ```bash
-cargo test --workspace    # 225 tests (core workspace crates)
+cargo test --workspace    # 283 tests (core workspace crates)
 ```
 
 | Crate | Tests | What's covered |
 |-------|------:|----------------|
-| `llm-core` | 88 | Type contracts, config parsing, key resolution, stream collection |
-| `llm-openai` | 29 | HTTP mocking (wiremock), SSE parsing, error handling |
-| `llm-anthropic` | 34 | HTTP mocking (wiremock), typed SSE parsing, Anthropic auth headers |
+| `llm-core` | 105 | Types, config, keys, streams, schema DSL, chain loop (mock provider) |
+| `llm-openai` | 40 | HTTP mocking (wiremock), SSE parsing, tool calls, structured output |
+| `llm-anthropic` | 46 | HTTP mocking (wiremock), typed SSE, tool_use blocks, transparent schema wrapping |
 | `llm-store` | 42 | JSONL round-trips, unicode, malformed recovery, listing/queries |
-| `llm-cli` | 32 | End-to-end CLI: stdout/stderr/exit codes, wiremock API, logging |
+| `llm-cli` | 50 | End-to-end CLI: tools, schemas, chain loop, stdout/stderr/exit codes |
 
 Library targets are verified by their build toolchains: `wasm-pack build` for WASM, `maturin develop` for Python.
 
 ## Status
 
-Phase 1 (v0.1) is complete --- CLI, WASM library, and Python module all working with both OpenAI and Anthropic providers. Phase 2 will add conversations, Ollama provider, attachments, and interactive chat.
+Phase 1 (v0.1) complete --- CLI, WASM library, and Python module working with both OpenAI and Anthropic providers.
+
+Phase 2 complete --- tool calling, chain loop, built-in tools, structured output (both providers), schema DSL, CLI commands for tools and schemas.
+
+Next: Phase 3 (conversations, Ollama provider, attachments).
 
 ## License
 

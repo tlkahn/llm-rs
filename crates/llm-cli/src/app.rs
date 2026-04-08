@@ -28,4 +28,14 @@ pub enum Commands {
         #[command(subcommand)]
         command: commands::logs::LogsCommand,
     },
+    /// List and manage tools
+    Tools {
+        #[command(subcommand)]
+        command: commands::tools::ToolsCommand,
+    },
+    /// Manage schemas for structured output
+    Schemas {
+        #[command(subcommand)]
+        command: commands::schemas::SchemasCommand,
+    },
 }

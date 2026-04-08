@@ -93,6 +93,9 @@ pub struct Prompt {
     pub system: Option<String>,
     pub attachments: Vec<Attachment>,
     pub tools: Vec<Tool>,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default)]
     pub tool_results: Vec<ToolResult>,
     pub schema: Option<serde_json::Value>,
     pub options: Options,
@@ -106,6 +109,7 @@ impl Prompt {
             system: None,
             attachments: Vec::new(),
             tools: Vec::new(),
+            tool_calls: Vec::new(),
             tool_results: Vec::new(),
             schema: None,
             options: Options::new(),
@@ -127,6 +131,12 @@ impl Prompt {
     #[must_use]
     pub fn with_tools(mut self, tools: Vec<Tool>) -> Self {
         self.tools = tools;
+        self
+    }
+
+    #[must_use]
+    pub fn with_tool_calls(mut self, tool_calls: Vec<ToolCall>) -> Self {
+        self.tool_calls = tool_calls;
         self
     }
 
@@ -345,6 +355,7 @@ mod tests {
         assert_eq!(prompt.system, None);
         assert!(prompt.attachments.is_empty());
         assert!(prompt.tools.is_empty());
+        assert!(prompt.tool_calls.is_empty());
         assert!(prompt.tool_results.is_empty());
         assert_eq!(prompt.schema, None);
         assert!(prompt.options.is_empty());
