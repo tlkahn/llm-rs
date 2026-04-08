@@ -66,6 +66,66 @@ pub struct ToolResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Message {
+    pub role: Role,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_results: Vec<ToolResult>,
+}
+
+impl Message {
+    #[must_use]
+    pub fn user(text: &str) -> Self {
+        Self {
+            role: Role::User,
+            content: text.to_string(),
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn assistant(text: &str) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: text.to_string(),
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn assistant_with_tool_calls(text: &str, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: text.to_string(),
+            tool_calls,
+            tool_results: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn tool_results(results: Vec<ToolResult>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: String::new(),
+            tool_calls: Vec::new(),
+            tool_results: results,
+        }
+    }
+}
+
 pub type Options = std::collections::HashMap<String, serde_json::Value>;
 
 /// A materialized response after stream collection.
@@ -97,6 +157,8 @@ pub struct Prompt {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default)]
     pub tool_results: Vec<ToolResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<Message>,
     pub schema: Option<serde_json::Value>,
     pub options: Options,
 }
@@ -111,6 +173,7 @@ impl Prompt {
             tools: Vec::new(),
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
+            messages: Vec::new(),
             schema: None,
             options: Options::new(),
         }
@@ -155,6 +218,12 @@ impl Prompt {
     #[must_use]
     pub fn with_attachments(mut self, attachments: Vec<Attachment>) -> Self {
         self.attachments = attachments;
+        self
+    }
+
+    #[must_use]
+    pub fn with_messages(mut self, messages: Vec<Message>) -> Self {
+        self.messages = messages;
         self
     }
 }
@@ -536,5 +605,124 @@ mod tests {
         assert_eq!(json["input"], 10);
         assert_eq!(json["output"], 20);
         assert_eq!(json["details"], serde_json::Value::Null);
+    }
+
+    // --- Role tests ---
+
+    #[test]
+    fn role_serde_roundtrip() {
+        for (role, expected) in [
+            (Role::User, "\"user\""),
+            (Role::Assistant, "\"assistant\""),
+            (Role::Tool, "\"tool\""),
+        ] {
+            let json = serde_json::to_string(&role).unwrap();
+            assert_eq!(json, expected);
+            let restored: Role = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, role);
+        }
+    }
+
+    // --- Message tests ---
+
+    #[test]
+    fn message_user_construction() {
+        let msg = Message::user("Hello");
+        assert_eq!(msg.role, Role::User);
+        assert_eq!(msg.content, "Hello");
+        assert!(msg.tool_calls.is_empty());
+        assert!(msg.tool_results.is_empty());
+    }
+
+    #[test]
+    fn message_assistant_construction() {
+        let msg = Message::assistant("Hi there");
+        assert_eq!(msg.role, Role::Assistant);
+        assert_eq!(msg.content, "Hi there");
+        assert!(msg.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn message_assistant_with_tool_calls_construction() {
+        let calls = vec![ToolCall {
+            name: "search".into(),
+            arguments: serde_json::json!({"q": "rust"}),
+            tool_call_id: Some("tc_1".into()),
+        }];
+        let msg = Message::assistant_with_tool_calls("Let me search", calls.clone());
+        assert_eq!(msg.role, Role::Assistant);
+        assert_eq!(msg.content, "Let me search");
+        assert_eq!(msg.tool_calls, calls);
+    }
+
+    #[test]
+    fn message_tool_results_construction() {
+        let results = vec![ToolResult {
+            name: "search".into(),
+            output: "found it".into(),
+            tool_call_id: Some("tc_1".into()),
+            error: None,
+        }];
+        let msg = Message::tool_results(results.clone());
+        assert_eq!(msg.role, Role::Tool);
+        assert!(msg.content.is_empty());
+        assert_eq!(msg.tool_results, results);
+    }
+
+    #[test]
+    fn message_serde_roundtrip() {
+        let msg = Message::user("Hello");
+        let json = serde_json::to_string(&msg).unwrap();
+        let restored: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, restored);
+    }
+
+    #[test]
+    fn message_serde_skips_empty_vecs() {
+        let msg = Message::user("Hello");
+        let json = serde_json::to_value(&msg).unwrap();
+        assert!(json.get("tool_calls").is_none());
+        assert!(json.get("tool_results").is_none());
+    }
+
+    #[test]
+    fn message_serde_includes_nonempty_tool_calls() {
+        let msg = Message::assistant_with_tool_calls(
+            "",
+            vec![ToolCall {
+                name: "t".into(),
+                arguments: serde_json::json!({}),
+                tool_call_id: None,
+            }],
+        );
+        let json = serde_json::to_value(&msg).unwrap();
+        assert!(json.get("tool_calls").is_some());
+    }
+
+    // --- Prompt with messages ---
+
+    #[test]
+    fn prompt_with_messages() {
+        let messages = vec![
+            Message::user("Hello"),
+            Message::assistant("Hi!"),
+            Message::user("Follow up"),
+        ];
+        let prompt = Prompt::new("Follow up").with_messages(messages.clone());
+        assert_eq!(prompt.messages.len(), 3);
+        assert_eq!(prompt.messages, messages);
+    }
+
+    #[test]
+    fn prompt_default_has_empty_messages() {
+        let prompt = Prompt::new("Hello");
+        assert!(prompt.messages.is_empty());
+    }
+
+    #[test]
+    fn prompt_messages_serde_skips_when_empty() {
+        let prompt = Prompt::new("Hello");
+        let json = serde_json::to_value(&prompt).unwrap();
+        assert!(json.get("messages").is_none());
     }
 }

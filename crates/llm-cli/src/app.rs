@@ -13,6 +13,8 @@ pub struct Cli {
 pub enum Commands {
     /// Send a prompt to a language model
     Prompt(commands::prompt::PromptArgs),
+    /// Start an interactive chat session
+    Chat(commands::chat::ChatArgs),
     /// Manage API keys
     Keys {
         #[command(subcommand)]

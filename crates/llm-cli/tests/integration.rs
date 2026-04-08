@@ -1158,3 +1158,279 @@ async fn prompt_with_schema_multi() {
         .success()
         .stdout(predicate::str::contains("items"));
 }
+
+// ==========================================================================
+// Phase 3: Conversation continuation
+// ==========================================================================
+
+#[tokio::test]
+async fn continue_conversation_appends_to_same_file() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_non_streaming_body("First answer")),
+        )
+        .mount(&server)
+        .await;
+
+    // First prompt: creates a new conversation
+    llm_with_dir(&dir)
+        .args(["prompt", "--no-stream", "Hello"])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success();
+
+    let logs_dir = dir.path().join("logs");
+    let entries: Vec<_> = fs::read_dir(&logs_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let log_path = entries[0].path();
+    let lines_before = fs::read_to_string(&log_path).unwrap().lines().count();
+    assert_eq!(lines_before, 2); // header + response
+
+    // Continue with -c
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_non_streaming_body("Second answer")),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args(["prompt", "--no-stream", "-c", "Follow up"])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Second answer"));
+
+    // Should still be one file, now with 3 lines
+    let entries_after: Vec<_> = fs::read_dir(&logs_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+        .collect();
+    assert_eq!(entries_after.len(), 1);
+    let content = fs::read_to_string(&log_path).unwrap();
+    assert_eq!(content.lines().count(), 3); // header + 2 responses
+}
+
+#[tokio::test]
+async fn cid_continues_specific_conversation() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_non_streaming_body("Reply")),
+        )
+        .mount(&server)
+        .await;
+
+    // First conversation
+    llm_with_dir(&dir)
+        .args(["prompt", "--no-stream", "First conv"])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success();
+
+    // Find the conversation ID
+    let logs_dir = dir.path().join("logs");
+    let entries: Vec<_> = fs::read_dir(&logs_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+        .collect();
+    let conv_id = entries[0]
+        .path()
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Continue by --cid
+    llm_with_dir(&dir)
+        .args(["prompt", "--no-stream", "--cid", &conv_id, "Continue"])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success();
+
+    // Original file should now have 3 lines
+    let content = fs::read_to_string(entries[0].path()).unwrap();
+    assert_eq!(content.lines().count(), 3);
+}
+
+// ==========================================================================
+// Phase 3: --messages & --json
+// ==========================================================================
+
+#[tokio::test]
+async fn messages_from_file() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_non_streaming_body("Continued")),
+        )
+        .mount(&server)
+        .await;
+
+    // Write messages file
+    let messages_file = dir.path().join("msgs.json");
+    fs::write(
+        &messages_file,
+        r#"[{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi!"},{"role":"user","content":"Follow up"}]"#,
+    ).unwrap();
+
+    llm_with_dir(&dir)
+        .args([
+            "prompt",
+            "--no-stream",
+            "-n",
+            "--messages",
+            messages_file.to_str().unwrap(),
+        ])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Continued"));
+}
+
+#[tokio::test]
+async fn json_output_envelope() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_non_streaming_body("The answer is 42")),
+        )
+        .mount(&server)
+        .await;
+
+    let output = llm_with_dir(&dir)
+        .args(["prompt", "--no-stream", "-n", "--json", "What is 6x7?"])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .output()
+        .expect("failed to run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["content"], "The answer is 42");
+    assert_eq!(json["model"], "gpt-4o-mini");
+    assert!(json.get("duration_ms").is_some());
+}
+
+#[tokio::test]
+async fn messages_stdin_with_json_output() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_non_streaming_body("Roundtrip")),
+        )
+        .mount(&server)
+        .await;
+
+    let output = llm_with_dir(&dir)
+        .args(["prompt", "--no-stream", "-n", "--messages", "-", "--json"])
+        .write_stdin(r#"[{"role":"user","content":"hi"}]"#)
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .output()
+        .expect("failed to run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["content"], "Roundtrip");
+}
+
+// ==========================================================================
+// Phase 3: llm logs subcommands
+// ==========================================================================
+
+#[test]
+fn logs_path() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["logs", "path"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("logs"));
+}
+
+#[test]
+fn logs_status_default() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["logs", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("enabled"));
+}
+
+#[test]
+fn logs_on_off_toggle() {
+    let dir = TempDir::new().unwrap();
+
+    // Turn off
+    llm_with_dir(&dir)
+        .args(["logs", "off"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("disabled"));
+
+    // Status should show disabled
+    llm_with_dir(&dir)
+        .args(["logs", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("disabled"));
+
+    // Turn back on
+    llm_with_dir(&dir)
+        .args(["logs", "on"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("enabled"));
+
+    llm_with_dir(&dir)
+        .args(["logs", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("enabled"));
+}

@@ -26,11 +26,27 @@ impl From<ConversationRecord> for ConversationSummary {
     }
 }
 
+/// Options for filtering conversation listings.
+#[derive(Debug, Default)]
+pub struct ListOptions<'a> {
+    pub model: Option<&'a str>,
+    pub query: Option<&'a str>,
+}
+
 /// List recent conversations sorted by file modification time (newest first).
 ///
 /// Reads only the first line of each `.jsonl` file to extract metadata.
 /// Files with malformed headers or non-`.jsonl` extensions are silently skipped.
 pub fn list_conversations(logs_dir: &Path, limit: usize) -> Result<Vec<ConversationSummary>> {
+    list_conversations_filtered(logs_dir, limit, &ListOptions::default())
+}
+
+/// List conversations with optional model and text search filters.
+pub fn list_conversations_filtered(
+    logs_dir: &Path,
+    limit: usize,
+    options: &ListOptions,
+) -> Result<Vec<ConversationSummary>> {
     if !logs_dir.exists() {
         return Ok(Vec::new());
     }
@@ -59,11 +75,33 @@ pub fn list_conversations(logs_dir: &Path, limit: usize) -> Result<Vec<Conversat
             break;
         }
         if let Some(summary) = read_first_line_summary(&path) {
+            // Model filter
+            if let Some(model_filter) = options.model
+                && summary.model != model_filter
+            {
+                continue;
+            }
+            // Text search: scan entire file for query
+            if let Some(query) = options.query
+                && !file_contains_text(&path, query)
+            {
+                continue;
+            }
             summaries.push(summary);
         }
     }
 
     Ok(summaries)
+}
+
+/// Scan a JSONL file for a text query (case-insensitive).
+fn file_contains_text(path: &Path, query: &str) -> bool {
+    let query_lower = query.to_lowercase();
+    if let Ok(content) = fs::read_to_string(path) {
+        content.to_lowercase().contains(&query_lower)
+    } else {
+        false
+    }
 }
 
 /// Get the most recently modified conversation ID, if any.
@@ -240,5 +278,53 @@ mod tests {
 
         let latest = latest_conversation_id(dir.path()).unwrap();
         assert_eq!(latest, Some(id2));
+    }
+
+    // --- Filtered listing ---
+
+    #[test]
+    fn filter_by_model() {
+        let dir = TempDir::new().unwrap();
+        let store = LogStore::open(dir.path()).unwrap();
+
+        store.log_response(None, "gpt-4o", &sample_response("A")).unwrap();
+        store.log_response(None, "claude-sonnet-4-6", &sample_response("B")).unwrap();
+
+        let options = ListOptions { model: Some("gpt-4o"), query: None };
+        let summaries = list_conversations_filtered(dir.path(), 10, &options).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].model, "gpt-4o");
+    }
+
+    #[test]
+    fn filter_by_text_query() {
+        let dir = TempDir::new().unwrap();
+        let store = LogStore::open(dir.path()).unwrap();
+
+        let mut resp_a = sample_response("What is Rust?");
+        resp_a.response = "Rust is a programming language.".into();
+        store.log_response(None, "gpt-4o", &resp_a).unwrap();
+
+        let resp_b = sample_response("Hello world");
+        store.log_response(None, "gpt-4o", &resp_b).unwrap();
+
+        let options = ListOptions { model: None, query: Some("programming") };
+        let summaries = list_conversations_filtered(dir.path(), 10, &options).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].name.as_deref().unwrap().contains("Rust"));
+    }
+
+    #[test]
+    fn filter_query_is_case_insensitive() {
+        let dir = TempDir::new().unwrap();
+        let store = LogStore::open(dir.path()).unwrap();
+
+        let mut resp = sample_response("Hello");
+        resp.response = "Hello WORLD".into();
+        store.log_response(None, "gpt-4o", &resp).unwrap();
+
+        let options = ListOptions { model: None, query: Some("world") };
+        let summaries = list_conversations_filtered(dir.path(), 10, &options).unwrap();
+        assert_eq!(summaries.len(), 1);
     }
 }

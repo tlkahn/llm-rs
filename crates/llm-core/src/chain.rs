@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 
 use crate::provider::Provider;
-use crate::stream::{Chunk, collect_tool_calls};
-use crate::types::{Prompt, ToolCall, ToolResult};
+use crate::stream::{Chunk, collect_text, collect_tool_calls};
+use crate::types::{Message, Prompt, ToolCall, ToolResult};
 
 /// Trait for executing tool calls. Implement this to provide tool execution logic.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -27,6 +27,10 @@ pub struct ChainResult {
 /// - `chain_limit` iterations are reached
 ///
 /// `on_chunk` is called for every chunk from every iteration.
+///
+/// The chain accumulates a `Vec<Message>` across iterations so that each
+/// provider call sees the full conversation history (user, assistant+tools,
+/// tool results, ...).
 #[allow(clippy::too_many_arguments)]
 pub async fn chain(
     provider: &dyn Provider,
@@ -40,12 +44,27 @@ pub async fn chain(
 ) -> crate::Result<ChainResult> {
     let mut all_chunks = Vec::new();
     let mut all_tool_results = Vec::new();
-    let mut current_prompt = initial_prompt;
+
+    // Seed messages from initial prompt
+    let mut messages: Vec<Message> = if initial_prompt.messages.is_empty() {
+        vec![Message::user(&initial_prompt.text)]
+    } else {
+        initial_prompt.messages.clone()
+    };
 
     for _ in 0..chain_limit {
-        let response_stream = provider
-            .execute(model, &current_prompt, key, stream)
-            .await?;
+        // Build prompt with accumulated messages + preserved metadata
+        let mut prompt = Prompt::new(&initial_prompt.text)
+            .with_tools(initial_prompt.tools.clone())
+            .with_messages(messages.clone());
+        if let Some(system) = &initial_prompt.system {
+            prompt = prompt.with_system(system);
+        }
+        if let Some(schema) = &initial_prompt.schema {
+            prompt = prompt.with_schema(schema.clone());
+        }
+
+        let response_stream = provider.execute(model, &prompt, key, stream).await?;
 
         let mut iteration_chunks = Vec::new();
         let mut pinned = std::pin::pin!(response_stream);
@@ -57,7 +76,11 @@ pub async fn chain(
         }
 
         let tool_calls = collect_tool_calls(&iteration_chunks);
+        let text = collect_text(&iteration_chunks);
         all_chunks.extend(iteration_chunks);
+
+        // Append assistant message to history
+        messages.push(Message::assistant_with_tool_calls(&text, tool_calls.clone()));
 
         if tool_calls.is_empty() {
             break;
@@ -72,15 +95,8 @@ pub async fn chain(
 
         all_tool_results.extend(tool_results.clone());
 
-        // Build next prompt with tool context, preserving system and tools
-        let mut next_prompt = Prompt::new(&current_prompt.text)
-            .with_tools(current_prompt.tools.clone())
-            .with_tool_calls(tool_calls)
-            .with_tool_results(tool_results);
-        if let Some(system) = &current_prompt.system {
-            next_prompt = next_prompt.with_system(system);
-        }
-        current_prompt = next_prompt;
+        // Append tool results to history
+        messages.push(Message::tool_results(tool_results));
     }
 
     Ok(ChainResult {
@@ -96,12 +112,13 @@ mod tests {
     use crate::stream::ResponseStream;
     use crate::types::{ModelInfo, Tool};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
-    // Mock provider that returns pre-configured responses
+    // Mock provider that returns pre-configured responses and captures prompts
     struct MockProvider {
         responses: Vec<Vec<Chunk>>,
         call_count: AtomicUsize,
+        captured_prompts: Arc<Mutex<Vec<Prompt>>>,
     }
 
     impl MockProvider {
@@ -109,6 +126,7 @@ mod tests {
             Self {
                 responses,
                 call_count: AtomicUsize::new(0),
+                captured_prompts: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -125,10 +143,11 @@ mod tests {
         async fn execute(
             &self,
             _model: &str,
-            _prompt: &Prompt,
+            prompt: &Prompt,
             _key: Option<&str>,
             _stream: bool,
         ) -> crate::Result<ResponseStream> {
+            self.captured_prompts.lock().unwrap().push(prompt.clone());
             let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
             let chunks = if idx < self.responses.len() {
                 self.responses[idx].clone()
@@ -368,5 +387,88 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert!(matches!(&chunks[0], Chunk::Text(t) if t == "Hi"));
         assert!(matches!(&chunks[1], Chunk::Done));
+    }
+
+    #[tokio::test]
+    async fn chain_accumulates_messages_across_turns() {
+        // 3-iteration test: tool call → tool call → text
+        let provider = MockProvider::new(vec![
+            tool_call_response("test_tool", "tc_1", "{}"),
+            tool_call_response("test_tool", "tc_2", "{}"),
+            text_response("Done!"),
+        ]);
+        let prompt = Prompt::new("Do it").with_tools(vec![make_tool()]);
+
+        let _ = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {},
+        ).await.unwrap();
+
+        let prompts = provider.captured_prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 3);
+
+        // Iteration 1: [user]
+        assert_eq!(prompts[0].messages.len(), 1);
+        assert_eq!(prompts[0].messages[0].role, crate::Role::User);
+
+        // Iteration 2: [user, assistant+tools, tool_results]
+        assert_eq!(prompts[1].messages.len(), 3);
+        assert_eq!(prompts[1].messages[0].role, crate::Role::User);
+        assert_eq!(prompts[1].messages[1].role, crate::Role::Assistant);
+        assert!(!prompts[1].messages[1].tool_calls.is_empty());
+        assert_eq!(prompts[1].messages[2].role, crate::Role::Tool);
+
+        // Iteration 3: [user, assistant+tools, tool_results, assistant+tools, tool_results]
+        assert_eq!(prompts[2].messages.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn chain_preserves_initial_messages() {
+        let initial = vec![
+            Message::user("Earlier question"),
+            Message::assistant("Earlier answer"),
+        ];
+        let provider = MockProvider::new(vec![text_response("Follow up done")]);
+        let prompt = Prompt::new("Follow up")
+            .with_tools(vec![make_tool()])
+            .with_messages(initial);
+
+        let _ = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {},
+        ).await.unwrap();
+
+        let prompts = provider.captured_prompts.lock().unwrap();
+        // Should see initial 2 messages preserved
+        assert_eq!(prompts[0].messages.len(), 2);
+        assert_eq!(prompts[0].messages[0].content, "Earlier question");
+        assert_eq!(prompts[0].messages[1].content, "Earlier answer");
+    }
+
+    #[tokio::test]
+    async fn chain_captures_assistant_text_in_history() {
+        // Provider returns text + tool call in first response
+        let response1 = vec![
+            Chunk::Text("Let me check. ".into()),
+            Chunk::ToolCallStart { name: "test_tool".into(), id: Some("tc_1".into()) },
+            Chunk::ToolCallDelta { content: "{}".into() },
+            Chunk::Done,
+        ];
+        let provider = MockProvider::new(vec![response1, text_response("All done")]);
+        let prompt = Prompt::new("Do it").with_tools(vec![make_tool()]);
+
+        let _ = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {},
+        ).await.unwrap();
+
+        let prompts = provider.captured_prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        // Second prompt should have assistant message with both text and tool_calls
+        let assistant = &prompts[1].messages[1];
+        assert_eq!(assistant.role, crate::Role::Assistant);
+        assert_eq!(assistant.content, "Let me check. ");
+        assert_eq!(assistant.tool_calls.len(), 1);
+        assert_eq!(assistant.tool_calls[0].name, "test_tool");
     }
 }

@@ -23,6 +23,7 @@ toml = { workspace = true }
 ulid = { workspace = true }
 chrono = { workspace = true }
 rpassword = "7"
+rustyline = "15"
 
 [dev-dependencies]
 assert_cmd = "2"

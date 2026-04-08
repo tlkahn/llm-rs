@@ -52,6 +52,43 @@ Available built-in tools:
 - `llm_version` --- returns the CLI version
 - `llm_time` --- returns current UTC and local time with timezone
 
+### Conversations
+
+Continue previous conversations, use multi-turn message input, and chat interactively.
+
+```bash
+# Continue the most recent conversation
+llm -c "And what about 3+3?"
+
+# Continue a specific conversation by ID
+llm --cid 01j5a... "Follow up question"
+
+# Load messages from a JSON file
+llm --messages conversation.json "What next?"
+
+# Load messages from stdin
+echo '[{"role":"user","content":"hi"},{"role":"assistant","content":"hello!"}]' | llm --messages - "Follow up"
+
+# Get JSON output instead of streaming text
+llm --json "What is 2+2?"
+
+# Combine: messages input with JSON output
+llm --messages history.json --json "Summarize"
+```
+
+### Interactive chat
+
+```bash
+# Start an interactive chat session
+llm chat
+
+# Chat with a specific model and system prompt
+llm chat -m claude-sonnet-4-6 -s "You are a helpful assistant"
+
+# Chat with tools enabled
+llm chat -T llm_time -T llm_version
+```
+
 ### Structured output
 
 Force the model to return JSON conforming to a schema. Works with both OpenAI (native `response_format`) and Anthropic (transparent tool wrapping).
@@ -110,6 +147,13 @@ Every prompt is logged to a JSONL file (one per conversation). Logs are plain te
 llm logs list                # List recent conversations
 llm logs list --json         # JSON output (pipe to jq)
 llm logs list -r             # Print the most recent response text
+llm logs list -m gpt-4o      # Filter by model
+llm logs list -q "rust"      # Full-text search
+llm logs list -u             # Show token usage
+llm logs path                # Print logs directory path
+llm logs status              # Show logging on/off state
+llm logs on                  # Enable logging
+llm logs off                 # Disable logging
 ```
 
 Log files live at `~/.local/share/llm/logs/`. Each file is a JSONL conversation:
@@ -307,16 +351,16 @@ See [`doc/metaplan.md`](doc/metaplan.md) for the full design rationale and phase
 ## Testing
 
 ```bash
-cargo test --workspace    # 283 tests (core workspace crates)
+cargo test --workspace    # 316 tests (core workspace crates)
 ```
 
 | Crate | Tests | What's covered |
 |-------|------:|----------------|
-| `llm-core` | 105 | Types, config, keys, streams, schema DSL, chain loop (mock provider) |
-| `llm-openai` | 40 | HTTP mocking (wiremock), SSE parsing, tool calls, structured output |
-| `llm-anthropic` | 46 | HTTP mocking (wiremock), typed SSE, tool_use blocks, transparent schema wrapping |
-| `llm-store` | 42 | JSONL round-trips, unicode, malformed recovery, listing/queries |
-| `llm-cli` | 50 | End-to-end CLI: tools, schemas, chain loop, stdout/stderr/exit codes |
+| `llm-core` | 119 | Types, config, keys, streams, schema DSL, chain loop, messages (mock provider) |
+| `llm-openai` | 42 | HTTP mocking (wiremock), SSE parsing, tool calls, structured output, multi-turn |
+| `llm-anthropic` | 48 | HTTP mocking (wiremock), typed SSE, tool_use blocks, transparent schema wrapping, multi-turn |
+| `llm-store` | 49 | JSONL round-trips, unicode, malformed recovery, listing/queries, message reconstruction |
+| `llm-cli` | 58 | End-to-end CLI: tools, schemas, chain loop, conversations, stdout/stderr/exit codes |
 
 Library targets are verified by their build toolchains: `wasm-pack build` for WASM, `maturin develop` for Python.
 
@@ -326,7 +370,9 @@ Phase 1 (v0.1) complete --- CLI, WASM library, and Python module working with bo
 
 Phase 2 complete --- tool calling, chain loop, built-in tools, structured output (both providers), schema DSL, CLI commands for tools and schemas.
 
-Next: Phase 3 (conversations, Ollama provider, attachments).
+Phase 3 complete --- multi-turn conversations with full history accumulation, conversation continuation (`-c`/`--cid`), `--messages`/`--json` flags, interactive `llm chat` REPL, expanded `llm logs` (path/status/on/off, model filter, text search, usage).
+
+Next: Phase 4 (subprocess extensibility, Ollama provider, aliases, options, attachments).
 
 ## License
 

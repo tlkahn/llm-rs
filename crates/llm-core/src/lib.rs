@@ -14,6 +14,6 @@ pub use provider::Provider;
 pub use schema::{multi_schema, parse_schema_dsl};
 pub use stream::{Chunk, ResponseStream, collect_text, collect_tool_calls, collect_usage};
 pub use types::{
-    Attachment, AttachmentSource, ModelInfo, Options, Prompt, Response, Tool, ToolCall, ToolResult,
-    Usage,
+    Attachment, AttachmentSource, Message, ModelInfo, Options, Prompt, Response, Role, Tool,
+    ToolCall, ToolResult, Usage,
 };

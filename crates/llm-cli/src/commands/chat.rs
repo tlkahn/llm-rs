@@ -1,0 +1,221 @@
+use std::io::Write;
+
+use clap::{ArgAction, Args};
+use futures::StreamExt;
+use llm_core::{
+    Chunk, Config, KeyStore, Message, Paths, Prompt, Provider, Response,
+    collect_text, collect_tool_calls, collect_usage, resolve_key,
+};
+
+use super::providers;
+use super::tools::{BuiltinToolRegistry, CliToolExecutor};
+
+#[derive(Args)]
+pub struct ChatArgs {
+    /// Model to use
+    #[arg(short, long)]
+    pub model: Option<String>,
+
+    /// System prompt
+    #[arg(short, long)]
+    pub system: Option<String>,
+
+    /// Enable a built-in tool (repeatable)
+    #[arg(short = 'T', long = "tool", action = ArgAction::Append)]
+    pub tool: Vec<String>,
+
+    /// Maximum number of tool call chain iterations per turn
+    #[arg(long, default_value = "5")]
+    pub chain_limit: usize,
+}
+
+pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
+    let paths = Paths::resolve()?;
+    let config = Config::load(&paths.config_file())?;
+    let key_store = KeyStore::load(&paths.keys_file())?;
+
+    // Resolve model
+    let effective_default = config.effective_default_model();
+    let model_input = args.model.as_deref().unwrap_or(&effective_default);
+    let model_id = config.resolve_model(model_input).to_string();
+
+    // Find the provider for this model
+    let all_providers = providers();
+    let (provider, _model_info) = find_provider(&all_providers, &model_id)?;
+
+    // Resolve key
+    let key = resolve_key(
+        None,
+        &key_store,
+        provider.needs_key().unwrap_or(""),
+        provider.key_env_var(),
+    )?;
+
+    // Resolve tools if specified
+    let mut tools = Vec::new();
+    if !args.tool.is_empty() {
+        let registry = BuiltinToolRegistry::new();
+        for name in &args.tool {
+            match registry.get(name) {
+                Some(tool) => tools.push(tool.clone()),
+                None => {
+                    return Err(llm_core::LlmError::Config(format!(
+                        "unknown tool: {name}"
+                    )));
+                }
+            }
+        }
+    }
+
+    eprintln!("Chatting with {model_id} (Ctrl-D to exit)");
+
+    let mut editor = rustyline::DefaultEditor::new()
+        .map_err(|e| llm_core::LlmError::Io(std::io::Error::other(e)))?;
+    let mut messages: Vec<Message> = Vec::new();
+
+    // Create log store and conversation ID
+    let store = if config.logging {
+        Some(llm_store::LogStore::open(&paths.logs_dir())?)
+    } else {
+        None
+    };
+    let mut conversation_id: Option<String> = None;
+
+    loop {
+        let input = match editor.readline("> ") {
+            Ok(line) => line,
+            Err(rustyline::error::ReadlineError::Eof) => break,
+            Err(rustyline::error::ReadlineError::Interrupted) => break,
+            Err(e) => {
+                return Err(llm_core::LlmError::Io(std::io::Error::other(e)));
+            }
+        };
+
+        let input = input.trim().to_string();
+        if input.is_empty() {
+            continue;
+        }
+        if input == "/exit" {
+            break;
+        }
+
+        let _ = editor.add_history_entry(&input);
+
+        // Add user message to history
+        messages.push(Message::user(&input));
+
+        // Build prompt
+        let mut prompt = Prompt::new(&input).with_messages(messages.clone());
+        if let Some(system) = &args.system {
+            prompt = prompt.with_system(system);
+        }
+        if !tools.is_empty() {
+            prompt = prompt.with_tools(tools.clone());
+        }
+
+        let start = std::time::Instant::now();
+
+        let (chunks, chain_tool_results) = if !tools.is_empty() {
+            let executor = CliToolExecutor::new(false, false);
+            let mut stdout = std::io::stdout().lock();
+
+            let result = llm_core::chain(
+                provider,
+                &model_id,
+                prompt,
+                Some(&key),
+                true,
+                &executor,
+                args.chain_limit,
+                &mut |chunk| {
+                    if let Chunk::Text(t) = chunk {
+                        write!(stdout, "{t}").ok();
+                        stdout.flush().ok();
+                    }
+                },
+            )
+            .await?;
+            (result.chunks, result.tool_results)
+        } else {
+            let response_stream = provider
+                .execute(&model_id, &prompt, Some(&key), true)
+                .await?;
+
+            let mut chunks = Vec::new();
+            let mut stream = std::pin::pin!(response_stream);
+            let mut stdout = std::io::stdout().lock();
+
+            while let Some(result) = stream.next().await {
+                let chunk = result?;
+                if let Chunk::Text(t) = &chunk {
+                    write!(stdout, "{t}").ok();
+                    stdout.flush().ok();
+                }
+                chunks.push(chunk);
+            }
+            (chunks, Vec::new())
+        };
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let response_text = collect_text(&chunks);
+
+        // Print newline after response
+        println!();
+
+        // Add assistant message to history
+        let assistant_tool_calls = collect_tool_calls(&chunks);
+        if assistant_tool_calls.is_empty() {
+            messages.push(Message::assistant(&response_text));
+        } else {
+            messages.push(Message::assistant_with_tool_calls(
+                &response_text,
+                assistant_tool_calls.clone(),
+            ));
+            if !chain_tool_results.is_empty() {
+                messages.push(Message::tool_results(chain_tool_results.clone()));
+            }
+        }
+
+        // Log turn
+        if let Some(store) = &store {
+            let response = Response {
+                id: ulid::Ulid::new().to_string().to_lowercase(),
+                model: model_id.clone(),
+                prompt: input.clone(),
+                system: args.system.clone(),
+                response: response_text,
+                options: Default::default(),
+                usage: collect_usage(&chunks),
+                tool_calls: assistant_tool_calls,
+                tool_results: chain_tool_results,
+                attachments: Vec::new(),
+                schema: None,
+                schema_id: None,
+                duration_ms,
+                datetime: chrono::Utc::now().to_rfc3339(),
+            };
+            match store.log_response(conversation_id.as_deref(), &model_id, &response) {
+                Ok(cid) => conversation_id = Some(cid),
+                Err(e) => eprintln!("Warning: failed to log: {e}"),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn find_provider<'a>(
+    providers: &'a [Box<dyn Provider>],
+    model_id: &str,
+) -> llm_core::Result<(&'a dyn Provider, llm_core::ModelInfo)> {
+    for provider in providers {
+        for model in provider.models() {
+            if model.id == model_id {
+                return Ok((provider.as_ref(), model));
+            }
+        }
+    }
+    Err(llm_core::LlmError::Model(format!(
+        "unknown model: {model_id}"
+    )))
+}

@@ -4,7 +4,7 @@ Status snapshot of what has been built, what remains, and key decisions made alo
 
 ---
 
-## Current state (Phase 2 complete)
+## Current state (Phase 3 complete)
 
 Phase 1 goal was: `echo "Hello" | llm` works end-to-end --- streams to stdout, logs to JSONL. Phase 2 goal was: tool calling, structured output, and the chain loop --- the core "agentic" capability.
 
@@ -12,15 +12,15 @@ Phase 1 goal was: `echo "Hello" | llm` works end-to-end --- streams to stdout, l
 
 | Crate | Status | Tests | Purpose |
 |-------|--------|------:|---------|
-| `llm-core` | Complete | 105 | Traits, types, streaming, errors, config, keys, schema DSL, chain loop |
-| `llm-openai` | Complete | 40 | OpenAI Chat API provider (streaming SSE + non-streaming + tool calling + structured output) |
-| `llm-anthropic` | Complete | 46 | Anthropic Messages API provider (streaming SSE + non-streaming + tool calling + structured output) |
-| `llm-store` | Complete | 42 | JSONL conversation file I/O and queries |
-| `llm-cli` | Complete | 50 | Binary: prompt, keys, models, logs, tools, schemas commands |
+| `llm-core` | Complete | 119 | Traits, types, streaming, errors, config, keys, schema DSL, chain loop |
+| `llm-openai` | Complete | 42 | OpenAI Chat API provider (streaming SSE + non-streaming + tool calling + structured output) |
+| `llm-anthropic` | Complete | 48 | Anthropic Messages API provider (streaming SSE + non-streaming + tool calling + structured output) |
+| `llm-store` | Complete | 49 | JSONL conversation file I/O and queries |
+| `llm-cli` | Complete | 58 | Binary: prompt, keys, models, logs, tools, schemas commands |
 | `llm-wasm` | Complete | --- | WASM library for browser/Obsidian plugin (wasm-bindgen) |
 | `llm-python` | Complete | --- | Python native module via PyO3/maturin |
 
-Total: 283 tests (workspace crates), all passing. `llm-wasm` and `llm-python` are excluded from the workspace and built with their own toolchains.
+Total: 316 tests (workspace crates), all passing. `llm-wasm` and `llm-python` are excluded from the workspace and built with their own toolchains.
 
 ### What works
 
@@ -153,12 +153,48 @@ Total: 283 tests (workspace crates), all passing. `llm-wasm` and `llm-python` ar
 - `llm schemas show <id>`: find and pretty-print schema by ID (prefix match).
 - Known subcommands list updated: `tools` and `schemas` added so `llm tools` doesn't trigger default subcommand insertion.
 
+**Phase 3 additions (conversations and multi-turn):**
+
+**`llm-core` — Message types and chain rewrite** (Steps 1, 3)
+
+- `Role` enum (`User`, `Assistant`, `Tool`) with `#[serde(rename_all = "lowercase")]`.
+- `Message` struct with `role`, `content`, `tool_calls`, `tool_results`. Convenience constructors: `user()`, `assistant()`, `assistant_with_tool_calls()`, `tool_results()`. Tool fields use `#[serde(default, skip_serializing_if = "Vec::is_empty")]`.
+- `Prompt.messages: Vec<Message>` with `#[serde(default, skip_serializing_if = "Vec::is_empty")]` and `with_messages()` builder.
+- `chain()` rewritten: seeds `Vec<Message>` from `prompt.messages` (or creates `[Message::user(text)]`), accumulates assistant and tool result messages each iteration. Preserves schema and system prompt from `initial_prompt`.
+
+**`llm-openai` + `llm-anthropic` — conversation message builders** (Step 2)
+
+- Both `build_messages()` dispatch: `prompt.messages.is_empty()` → `build_single_turn()` (existing logic extracted), else `build_from_conversation()` (new multi-turn path).
+- OpenAI conversation path: maps `Role::User` → `{"role":"user"}`, `Role::Assistant` → `{"role":"assistant"}` with optional `tool_calls` array, `Role::Tool` → per-result `{"role":"tool","tool_call_id":"..."}`.
+- Anthropic conversation path: maps `Role::User` → `{"role":"user"}`, `Role::Assistant` → text + `tool_use` content blocks, `Role::Tool` → `{"role":"user"}` with `tool_result` content blocks (Anthropic requires tool results in user role).
+- Shared helper functions extracted: `map_tool_calls()`, `map_tool_use()`, `map_tool_result()`, `append_tool_exchange()`.
+
+**`llm-store` — conversation reconstruction and filtered queries** (Steps 4, 8)
+
+- `reconstruct_messages(&[Response]) -> Vec<Message>`: rebuilds conversation history from stored responses. Each `Response` becomes user + assistant (or user + assistant_with_tools + tool_results).
+- `list_conversations_filtered()`: accepts `ListOptions { model, query }` for model filter and case-insensitive full-text search.
+- `Config::save()`: TOML serialization with parent directory creation.
+
+**`llm-cli` — conversation continuation, messages/json, chat, logs expansion** (Steps 5-8)
+
+- `-c/--continue`: loads `latest_conversation_id()` → `read_conversation()` → `reconstruct_messages()`, appends current prompt as user message, logs to same conversation file.
+- `--cid <id>`: same as `-c` but targets a specific conversation ID.
+- `--messages <file|->`: loads JSON array of `Message` objects. Mutually exclusive with `-c`/`--cid`. When `-`, reads stdin (with `skip_stdin` preventing `resolve_prompt_text` from also reading stdin).
+- `--json`: buffers response, emits JSON envelope with `model`, `content`, `conversation_id`, `tool_calls`, `usage`, `duration_ms`.
+- `llm chat`: interactive REPL using `rustyline::DefaultEditor`. Accumulates `Vec<Message>`, streams responses, logs each turn to same JSONL conversation. Exits on Ctrl-D, Ctrl-C, or `/exit`.
+- `llm logs path`: prints `paths.logs_dir()`.
+- `llm logs status`: prints whether logging is enabled/disabled.
+- `llm logs on/off`: updates `config.toml` via `Config::save()`.
+- `llm logs list -m <model>`: filter by model name.
+- `llm logs list -q <text>`: case-insensitive full-text search across JSONL files.
+- `llm logs list -u`: include token usage totals per conversation.
+- Known subcommands updated: `chat` added to `should_insert_prompt()`.
+
 ### What remains
 
 Remaining phases from `metaplan.md`:
 
-- **Phase 3 (v0.3):** Conversations (`-c`, `--cid`, `llm chat`), Ollama provider, attachments, aliases, extract.
-- **Phase 4 (v0.4):** Subprocess provider/tool protocol, `--verbose`, shell completions.
+- **Phase 4 (v0.4):** Subprocess provider/tool protocol, Ollama provider, aliases, options, attachments, `--verbose`, shell completions.
 
 ---
 
@@ -357,11 +393,11 @@ The Python virtualenv and maturin are managed via `uv` (`uv venv`, `uv run matur
 
 ## Test strategy
 
-- **`llm-core`** (105 tests): Inline `#[cfg(test)]` modules. `tempfile::TempDir` for filesystem isolation, `temp_env` for safe env var scoping. Schema DSL tests cover all type mappings, descriptions, whitespace tolerance, newline separation, error cases. Chain loop tests use a `MockProvider` that returns pre-configured responses and an `AtomicUsize` call counter to verify iteration counts.
-- **`llm-openai`** (40 tests): Inline modules. `wiremock::MockServer` for HTTP mocking (SSE streaming + non-streaming + error responses + tool calls + structured output). Tool calling tests use SSE cassettes with `delta.tool_calls` array chunks for streaming and `message.tool_calls` for non-streaming.
-- **`llm-anthropic`** (46 tests): Inline modules. Same pattern as `llm-openai`: serde round-trip tests for Anthropic-specific types (including `ContentBlock` with tool_use/tool_result fields, `ContentDelta` with `partial_json`), SSE parser tests, wiremock integration tests. Structured output tests verify `_schema_output` transparent wrapping: the response should contain `Chunk::Text` (not `ToolCallStart/Delta`) and `collect_tool_calls()` should return empty.
-- **`llm-store`** (42 tests): Inline modules. `tempfile::TempDir` for isolated filesystem state. JSONL round-trip tests, unicode handling, malformed-line recovery.
-- **`llm-cli`** (50 tests): 9 unit tests (tools registry, schemas) + 41 integration tests in `tests/integration.rs` using `assert_cmd` + `predicates`. Tests run the compiled binary as a subprocess, asserting on stdout/stderr/exit code. API-dependent tests use `wiremock` with `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` pointing to the local mock server. All tests use `LLM_USER_PATH` for filesystem isolation. Tool chain tests use wiremock sequential responses (`up_to_n_times(1)` for first response, default for subsequent).
+- **`llm-core`** (119 tests): Inline `#[cfg(test)]` modules. `tempfile::TempDir` for filesystem isolation, `temp_env` for safe env var scoping. Schema DSL tests cover all type mappings, descriptions, whitespace tolerance, newline separation, error cases. Chain loop tests use a `MockProvider` that returns pre-configured responses and an `AtomicUsize` call counter to verify iteration counts.
+- **`llm-openai`** (42 tests): Inline modules. `wiremock::MockServer` for HTTP mocking (SSE streaming + non-streaming + error responses + tool calls + structured output). Tool calling tests use SSE cassettes with `delta.tool_calls` array chunks for streaming and `message.tool_calls` for non-streaming.
+- **`llm-anthropic`** (48 tests): Inline modules. Same pattern as `llm-openai`: serde round-trip tests for Anthropic-specific types (including `ContentBlock` with tool_use/tool_result fields, `ContentDelta` with `partial_json`), SSE parser tests, wiremock integration tests. Structured output tests verify `_schema_output` transparent wrapping: the response should contain `Chunk::Text` (not `ToolCallStart/Delta`) and `collect_tool_calls()` should return empty.
+- **`llm-store`** (49 tests): Inline modules. `tempfile::TempDir` for isolated filesystem state. JSONL round-trip tests, unicode handling, malformed-line recovery.
+- **`llm-cli`** (58 tests): 9 unit tests (tools registry, schemas) + 49 integration tests in `tests/integration.rs` using `assert_cmd` + `predicates`. Tests run the compiled binary as a subprocess, asserting on stdout/stderr/exit code. API-dependent tests use `wiremock` with `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` pointing to the local mock server. All tests use `LLM_USER_PATH` for filesystem isolation. Tool chain tests use wiremock sequential responses (`up_to_n_times(1)` for first response, default for subsequent).
 - TDD was used throughout: tests written before implementation in each cycle.
 
 ---
@@ -420,6 +456,36 @@ Steps 1, 2, 3 are independent and were implemented in parallel. Step 4 depends o
 | 6 | `llm-cli` | `BuiltinToolRegistry`, `CliToolExecutor`, `llm tools list` command | 6 |
 | 7 | `llm-cli` | `-T/--tool`, `--chain-limit`, `--tools-debug`, `--tools-approve` flags, chain integration | 4 |
 | 8 | `llm-cli` | `--schema`, `--schema-multi` flags, `llm schemas dsl/list/show` commands, schema resolution chain | 7 |
+
+## Phase 3 build order
+
+| Step | Crate | What was built | Tests added |
+|------|-------|----------------|------------:|
+| 1 | `llm-core` | `Role` enum, `Message` struct with constructors, `Prompt.messages` field, `with_messages()` builder | 11 |
+| 2 | `llm-openai`, `llm-anthropic` | `build_from_conversation()` multi-turn message builders, `build_single_turn()` extraction | 4 |
+| 3 | `llm-core` | Chain loop rewrite: accumulate `Vec<Message>` across iterations, `MockProvider` captures prompts | 3 |
+| 4 | `llm-store` | `reconstruct_messages()` from stored `Vec<Response>` | 4 |
+| 5 | `llm-cli` | `-c/--continue`, `--cid` flags, conversation loading/continuation, `rewrite_args` update | 2 |
+| 6 | `llm-cli` | `--messages` flag (file or stdin), `--json` output envelope, `skip_stdin` for `--messages -` | 3 |
+| 7 | `llm-cli` | `llm chat` command with `rustyline` REPL, conversation accumulation, per-turn logging | 0 (interactive) |
+| 8 | `llm-cli`, `llm-store` | `llm logs path/status/on/off`, `ListOptions` with model filter and text search, `Config::save()` | 6 |
+| 9 | docs | Updated `metaplan.md` (swap Phase 3/4), `CLAUDE.md`, `implementation.md` | 0 |
+
+### Phase 3 learnings
+
+**Chain loop history accumulation was the critical fix.** The Phase 2 chain loop rebuilt the prompt each iteration using only the latest tool_calls/tool_results, so iteration 3 had no memory of iteration 1. The fix was to maintain a `Vec<Message>` that grows across iterations: user → assistant+tools → tool_results → assistant+tools → tool_results → ... Each provider call now sees the full conversation history via `prompt.messages`. The `MockProvider` was enhanced with `Arc<Mutex<Vec<Prompt>>>` to capture prompts for assertion, enabling tests that verify message accumulation (1 → 3 → 5 messages across 3 iterations).
+
+**Provider conversation paths dispatch on `prompt.messages.is_empty()`.** Rather than breaking existing single-turn behavior, both OpenAI and Anthropic `build_messages()` functions dispatch: empty messages → existing `build_single_turn()` path (unchanged), non-empty → new `build_from_conversation()` path. This ensured all 283 existing tests stayed green throughout the refactor.
+
+**Anthropic tool results go in user role.** A subtlety in the conversation builder: Anthropic requires tool results in a `"role": "user"` message with `tool_result` content blocks, unlike OpenAI which uses `"role": "tool"`. The `Message::tool_results()` constructor uses `Role::Tool` abstractly; the Anthropic conversation builder maps this to `role: "user"` with `MessageContent::Blocks`. The assistant message with tool calls uses `MessageContent::Blocks` containing both a text block (if non-empty) and `tool_use` blocks.
+
+**`--messages -` conflicts with stdin prompt text.** When `--messages -` reads from stdin, `resolve_prompt_text()` also tries to read stdin (because `is_terminal()` returns false for pipes). Both would consume the same input. The fix was a `skip_stdin` parameter: when `--messages -` is specified, `resolve_prompt_text` skips stdin reading entirely. This was caught by integration test `messages_stdin_with_json_output`.
+
+**`--json` disables streaming to buffer output.** When `--json` is set, `stream_mode` is forced false and the chunk callback is suppressed. The full response is collected, then a JSON envelope is emitted at the end. The envelope includes `model`, `content`, `conversation_id` (if logged), `tool_calls` (if any), `usage` (if available), and `duration_ms`.
+
+**`Config::save()` was needed for `logs on/off`.** Phase 2 avoided a `save()` method on `Config` (using `toml::Table` read-modify-write for `models default`). Phase 3 added `Config::save()` because `logs on/off` modifies `config.logging` — a typed boolean field that benefits from going through the serde roundtrip rather than raw TOML table manipulation.
+
+**`rustyline` version 15 compiles cleanly on macOS.** No platform-specific workarounds needed. The editor handles Ctrl-D (EOF) and Ctrl-C (interrupt) via `ReadlineError` variants, both mapped to clean REPL exit. History is per-session only (no `.history` file persistence, keeping the chat command stateless beyond JSONL logging).
 
 ### Phase 2 learnings
 

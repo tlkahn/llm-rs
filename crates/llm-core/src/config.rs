@@ -144,6 +144,17 @@ impl Config {
     pub fn resolve_model<'a>(&'a self, input: &'a str) -> &'a str {
         self.aliases.get(input).map(|s| s.as_str()).unwrap_or(input)
     }
+
+    /// Save config to a TOML file, creating parent directories if needed.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| LlmError::Config(e.to_string()))?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

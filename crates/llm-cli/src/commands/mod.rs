@@ -1,3 +1,4 @@
+pub mod chat;
 pub mod keys;
 pub mod logs;
 pub mod models;

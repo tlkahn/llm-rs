@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use ulid::Ulid;
 
-use llm_core::{LlmError, Response, Result};
+use llm_core::{LlmError, Message, Response, Result};
 
 use crate::records::{ConversationRecord, LineRecord, ResponseRecord};
 
@@ -148,6 +148,35 @@ impl LogStore {
 
         Ok((meta, responses))
     }
+}
+
+/// Reconstruct a `Vec<Message>` from stored responses for conversation continuation.
+///
+/// Each Response becomes:
+/// 1. `Message::user(response.prompt)` — the user's original prompt
+/// 2. If the response has tool_calls:
+///    - `Message::assistant_with_tool_calls(text, tool_calls)` + `Message::tool_results(results)`
+/// 3. Else: `Message::assistant(text)`
+pub fn reconstruct_messages(responses: &[Response]) -> Vec<Message> {
+    let mut messages = Vec::new();
+
+    for response in responses {
+        messages.push(Message::user(&response.prompt));
+
+        if response.tool_calls.is_empty() {
+            messages.push(Message::assistant(&response.response));
+        } else {
+            messages.push(Message::assistant_with_tool_calls(
+                &response.response,
+                response.tool_calls.clone(),
+            ));
+            if !response.tool_results.is_empty() {
+                messages.push(Message::tool_results(response.tool_results.clone()));
+            }
+        }
+    }
+
+    messages
 }
 
 /// Generate a human-readable conversation name from prompt text.
@@ -617,5 +646,75 @@ mod tests {
         assert!(name.ends_with("..."));
         // Verify it's valid UTF-8 (would panic if char boundary is wrong)
         assert!(name.is_char_boundary(name.len()));
+    }
+
+    // --- reconstruct_messages tests ---
+
+    #[test]
+    fn reconstruct_single_response_gives_two_messages() {
+        let resp = sample_response("Hello", "Hi there!");
+        let messages = reconstruct_messages(&[resp]);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, llm_core::Role::User);
+        assert_eq!(messages[0].content, "Hello");
+        assert_eq!(messages[1].role, llm_core::Role::Assistant);
+        assert_eq!(messages[1].content, "Hi there!");
+    }
+
+    #[test]
+    fn reconstruct_multi_response_gives_correct_sequence() {
+        let resp1 = sample_response("Hello", "Hi!");
+        let resp2 = sample_response("Follow up", "Sure!");
+        let messages = reconstruct_messages(&[resp1, resp2]);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].content, "Hello");
+        assert_eq!(messages[1].content, "Hi!");
+        assert_eq!(messages[2].content, "Follow up");
+        assert_eq!(messages[3].content, "Sure!");
+    }
+
+    #[test]
+    fn reconstruct_response_with_tools_includes_tool_turn() {
+        use llm_core::{ToolCall, ToolResult};
+
+        let resp = Response {
+            id: Ulid::new().to_string().to_lowercase(),
+            model: "gpt-4o".into(),
+            prompt: "What time is it?".into(),
+            system: None,
+            response: "It's noon.".into(),
+            options: Options::new(),
+            usage: None,
+            tool_calls: vec![ToolCall {
+                name: "get_time".into(),
+                arguments: serde_json::json!({}),
+                tool_call_id: Some("tc_1".into()),
+            }],
+            tool_results: vec![ToolResult {
+                name: "get_time".into(),
+                output: "12:00 PM".into(),
+                tool_call_id: Some("tc_1".into()),
+                error: None,
+            }],
+            attachments: Vec::new(),
+            schema: None,
+            schema_id: None,
+            duration_ms: 100,
+            datetime: "2026-04-03T12:00:00Z".into(),
+        };
+
+        let messages = reconstruct_messages(&[resp]);
+        assert_eq!(messages.len(), 3); // user + assistant_with_tools + tool_results
+        assert_eq!(messages[0].role, llm_core::Role::User);
+        assert_eq!(messages[1].role, llm_core::Role::Assistant);
+        assert!(!messages[1].tool_calls.is_empty());
+        assert_eq!(messages[2].role, llm_core::Role::Tool);
+        assert_eq!(messages[2].tool_results[0].output, "12:00 PM");
+    }
+
+    #[test]
+    fn reconstruct_empty_responses_gives_empty() {
+        let messages = reconstruct_messages(&[]);
+        assert!(messages.is_empty());
     }
 }

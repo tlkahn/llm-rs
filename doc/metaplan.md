@@ -554,19 +554,23 @@ Errors: exit code 1, human-readable message to stderr.
 - `llm tools list`, `llm schemas list/show/dsl` commands
 - Tool/tool call/tool result persistence in JSONL response records (store layer already supports this)
 
-### Phase 3 (v0.3) --- Subprocess Extensibility
+### Phase 3 (v0.3) --- Conversations & Multi-turn (COMPLETE)
+
+- `Message`/`Role` core types with conversation history accumulation in chain loop
+- Provider conversation paths (OpenAI + Anthropic multi-turn message building)
+- `-c/--continue`, `--cid` for conversation continuation from JSONL logs
+- `--messages` flag for JSON message input, `--json` for structured output envelope
+- `llm chat` (interactive REPL with `rustyline`)
+- `llm logs` full feature set (path, status, on/off, `-m` model filter, `-q` text search, `-u` usage)
+- Store: `reconstruct_messages()` for conversation reconstruction from stored responses
+
+### Phase 4 (v0.4) --- Subprocess Extensibility & More
 
 - `llm-tool-*` subprocess tool protocol (discovery via `--schema`, invocation via stdin/stdout JSON)
 - `llm-provider-*` subprocess protocol (discovery + execution)
 - `llm plugins` (list compiled providers + discovered subprocess providers/tools)
 - `--verbose` flag (HTTP request logging, config resolution tracing)
 - Shell completions (`clap_complete`)
-
-### Phase 4 (v0.4) --- Conversations and Multi-Provider
-
-- `llm chat` (interactive REPL with `rustyline`)
-- `-c/--continue`, `--cid` for conversation continuation
-- `llm logs` full feature set (search, filter, status, backup, on/off)
 - Ollama provider
 - `llm aliases set/list/remove/path`
 - `-o/--option`, `llm options set/get/list/clear`

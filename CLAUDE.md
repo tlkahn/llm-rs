@@ -7,12 +7,12 @@ LLM-RS: Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) (v0
 ## Commands
 
 ```bash
-cargo test --workspace           # Run all 283 tests
-cargo test -p llm-core           # Core types/traits/config/schema/chain (105 tests)
-cargo test -p llm-openai         # OpenAI provider (40 tests)
-cargo test -p llm-anthropic      # Anthropic provider (46 tests)
-cargo test -p llm-store          # JSONL storage (42 tests)
-cargo test -p llm-cli            # CLI integration tests (50 tests)
+cargo test --workspace           # Run all 316 tests
+cargo test -p llm-core           # Core types/traits/config/schema/chain/messages (119 tests)
+cargo test -p llm-openai         # OpenAI provider (42 tests)
+cargo test -p llm-anthropic      # Anthropic provider (48 tests)
+cargo test -p llm-store          # JSONL storage (49 tests)
+cargo test -p llm-cli            # CLI integration tests (58 tests)
 cargo clippy --workspace         # Lint
 cargo build --release -p llm-cli # Build optimized binary
 
@@ -41,14 +41,16 @@ Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry poi
 ### Key types (llm-core)
 
 - **`Provider` trait** (`provider.rs`): async streaming interface. Methods: `id()`, `models()`, `needs_key()`, `key_env_var()`, `execute() -> Result<ResponseStream>`.
-- **`Prompt`** (`types.rs`): text + system + attachments + tools + tool_calls + tool_results + schema + options. Builder pattern with `with_*` methods.
+- **`Role`** (`types.rs`): enum `User`, `Assistant`, `Tool`. Serde as lowercase strings.
+- **`Message`** (`types.rs`): role + content + tool_calls + tool_results. Constructors: `user()`, `assistant()`, `assistant_with_tool_calls()`, `tool_results()`.
+- **`Prompt`** (`types.rs`): text + system + attachments + tools + tool_calls + tool_results + messages + schema + options. Builder pattern with `with_*` methods.
 - **`Response`** (`types.rs`): materialized post-stream result (16 fields: id, model, prompt, system, response text, options, usage, tool_calls, tool_results, attachments, schema, schema_id, duration_ms, datetime).
 - **`Chunk`** (`stream.rs`): streaming enum (`Text`, `ToolCallStart`, `ToolCallDelta`, `Usage`, `Done`).
 - **`ResponseStream`**: `Pin<Box<dyn Stream<Item=Result<Chunk>> + Send>>` (native); without `Send` on wasm32.
 - **`LlmError`** (`error.rs`): six variants (`Model`, `NeedsKey`, `Provider`, `Config`, `Io`, `Store`).
 - Stream helpers: `collect_text()`, `collect_tool_calls()`, `collect_usage()`.
 - **`ToolExecutor` trait** (`chain.rs`): async interface for executing tool calls. `execute(&ToolCall) -> ToolResult`.
-- **`chain()`** (`chain.rs`): chain loop that executes provider → collects tool calls → executes tools → repeats until no tool calls or limit reached.
+- **`chain()`** (`chain.rs`): chain loop that accumulates `Vec<Message>` across iterations — each provider call sees full conversation history. Executes provider → collects tool calls → executes tools → repeats until no tool calls or limit reached.
 - **`parse_schema_dsl()`** (`schema.rs`): parses "name str, age int" DSL into JSON Schema. Types: str, int, float, bool.
 - **`multi_schema()`** (`schema.rs`): wraps a schema in `{"items":{"type":"array","items":<schema>}}` for `--schema-multi`.
 
@@ -69,7 +71,7 @@ Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry poi
 
 JSONL files, one per conversation, at `$XDG_DATA_HOME/llm/logs/{conversation_id}.jsonl`. Line 1: `ConversationRecord` header (`"type":"conversation"`, `"v":1`). Lines 2+: `ResponseRecord`s (`"type":"response"`) with all data denormalized inline. `LineRecord` is the `#[serde(tag = "type")]` dispatch enum.
 
-Key API: `LogStore::open()`, `log_response(conversation_id, model, &response)`, `read_conversation(id)`, `list_conversations(logs_dir, limit)`, `latest_conversation_id(logs_dir)`.
+Key API: `LogStore::open()`, `log_response(conversation_id, model, &response)`, `read_conversation(id)`, `list_conversations(logs_dir, limit)`, `list_conversations_filtered(logs_dir, limit, &ListOptions)`, `latest_conversation_id(logs_dir)`, `reconstruct_messages(&[Response]) -> Vec<Message>`.
 
 ### CLI (llm-cli)
 
@@ -80,10 +82,11 @@ Binary name: `llm`. Built with `clap` derive macros.
 **Provider registry:** `commands/mod.rs::providers()` returns `Vec<Box<dyn Provider>>` with `#[cfg(feature)]`-gated providers. `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` env vars override API endpoints. Both `openai` and `anthropic` features are default-on.
 
 **Commands:**
-- `llm prompt <text>` --- flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-T/--tool`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--schema`, `--schema-multi`
+- `llm prompt <text>` --- flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-T/--tool`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--schema`, `--schema-multi`, `-c/--continue`, `--cid`, `--messages`, `--json`
+- `llm chat` --- interactive REPL with `rustyline`. Flags: `-m`, `-s`, `-T/--tool`, `--chain-limit`
 - `llm keys set/get/list/path` --- `set` uses rpassword for hidden terminal input
 - `llm models list` / `llm models default [model]`
-- `llm logs list [--json] [-r] [-n count]`
+- `llm logs list [--json] [-r] [-n count] [-m model] [-q query] [-u]` / `llm logs path` / `llm logs status` / `llm logs on` / `llm logs off`
 - `llm tools list` --- list built-in tools (`llm_version`, `llm_time`)
 - `llm schemas dsl <input>` --- parse DSL to JSON Schema
 - `llm schemas list` --- scan logs for used schemas
@@ -101,7 +104,9 @@ Phase 1 (v0.1) complete --- `echo "Hello" | llm` works end-to-end with streaming
 
 Phase 2 tools & structured output complete --- Tool calling (both providers), chain loop, built-in tools (`llm_version`, `llm_time`), structured output (OpenAI `response_format`, Anthropic transparent tool wrapping), schema DSL, `--schema`/`--schema-multi` flags, `llm tools list`, `llm schemas dsl/list/show` commands.
 
-Next: Phase 3 (conversations, Ollama provider, attachments). See `doc/metaplan.md` for the full roadmap.
+Phase 3 conversations & multi-turn complete --- `Message`/`Role` core types, provider multi-turn message building, chain loop accumulates full conversation history, conversation continuation (`-c`/`--cid`), `--messages`/`--json` flags, `llm chat` REPL, `llm logs` full feature set (path/status/on/off, model filter, text search, usage display), `reconstruct_messages()` for conversation reconstruction.
+
+Next: Phase 4 (subprocess extensibility, Ollama provider, aliases, options, attachments). See `doc/metaplan.md` for the full roadmap.
 
 ## Conventions
 
