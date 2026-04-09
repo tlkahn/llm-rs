@@ -2,14 +2,37 @@ use async_trait::async_trait;
 use futures::StreamExt;
 
 use crate::provider::Provider;
-use crate::stream::{Chunk, collect_text, collect_tool_calls};
-use crate::types::{Message, Prompt, ToolCall, ToolResult};
+use crate::stream::{Chunk, collect_text, collect_tool_calls, collect_usage};
+use crate::types::{Message, Prompt, ToolCall, ToolResult, Usage};
 
 /// Trait for executing tool calls. Implement this to provide tool execution logic.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, call: &ToolCall) -> ToolResult;
+}
+
+/// Event emitted during chain loop execution for observability.
+#[derive(Debug, Clone)]
+pub enum ChainEvent {
+    /// Emitted before the provider is called for an iteration.
+    IterationStart {
+        /// 1-based iteration number.
+        iteration: usize,
+        /// The chain limit.
+        limit: usize,
+        /// Current message history being sent to the provider.
+        messages: Vec<Message>,
+    },
+    /// Emitted after an iteration completes (chunks collected, tool calls extracted).
+    IterationEnd {
+        /// 1-based iteration number.
+        iteration: usize,
+        /// Per-iteration token usage, if the provider reported it.
+        usage: Option<Usage>,
+        /// Tool calls extracted from this iteration's response.
+        tool_calls: Vec<ToolCall>,
+    },
 }
 
 /// Result of a chain loop execution.
@@ -41,9 +64,11 @@ pub async fn chain(
     executor: &dyn ToolExecutor,
     chain_limit: usize,
     on_chunk: &mut dyn FnMut(&Chunk),
+    on_event: Option<&mut dyn FnMut(&ChainEvent)>,
 ) -> crate::Result<ChainResult> {
     let mut all_chunks = Vec::new();
     let mut all_tool_results = Vec::new();
+    let mut on_event = on_event;
 
     // Seed messages from initial prompt
     let mut messages: Vec<Message> = if initial_prompt.messages.is_empty() {
@@ -52,7 +77,15 @@ pub async fn chain(
         initial_prompt.messages.clone()
     };
 
-    for _ in 0..chain_limit {
+    for iteration in 1..=chain_limit {
+        if let Some(cb) = &mut on_event {
+            cb(&ChainEvent::IterationStart {
+                iteration,
+                limit: chain_limit,
+                messages: messages.clone(),
+            });
+        }
+
         // Build prompt with accumulated messages + preserved metadata
         let mut prompt = Prompt::new(&initial_prompt.text)
             .with_tools(initial_prompt.tools.clone())
@@ -76,7 +109,17 @@ pub async fn chain(
         }
 
         let tool_calls = collect_tool_calls(&iteration_chunks);
+        let usage = collect_usage(&iteration_chunks);
         let text = collect_text(&iteration_chunks);
+
+        if let Some(cb) = &mut on_event {
+            cb(&ChainEvent::IterationEnd {
+                iteration,
+                usage: usage.clone(),
+                tool_calls: tool_calls.clone(),
+            });
+        }
+
         all_chunks.extend(iteration_chunks);
 
         // Append assistant message to history
@@ -231,6 +274,7 @@ mod tests {
             &MockExecutor,
             5,
             &mut |_| callback_count += 1,
+            None,
         )
         .await
         .unwrap();
@@ -258,6 +302,7 @@ mod tests {
             &MockExecutor,
             5,
             &mut |_| {},
+            None,
         )
         .await
         .unwrap();
@@ -285,6 +330,7 @@ mod tests {
             &MockExecutor,
             3,
             &mut |_| {},
+            None,
         )
         .await
         .unwrap();
@@ -325,6 +371,7 @@ mod tests {
             &MockExecutor,
             5,
             &mut |_| {},
+            None,
         )
         .await
         .unwrap();
@@ -353,6 +400,7 @@ mod tests {
             &ErrorExecutor,
             5,
             &mut |_| {},
+            None,
         )
         .await
         .unwrap();
@@ -379,6 +427,7 @@ mod tests {
             &MockExecutor,
             5,
             &mut |chunk| received_clone.lock().unwrap().push(chunk.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -401,7 +450,7 @@ mod tests {
 
         let _ = chain(
             &provider, "mock-model", prompt, None, false,
-            &MockExecutor, 5, &mut |_| {},
+            &MockExecutor, 5, &mut |_| {}, None,
         ).await.unwrap();
 
         let prompts = provider.captured_prompts.lock().unwrap();
@@ -435,7 +484,7 @@ mod tests {
 
         let _ = chain(
             &provider, "mock-model", prompt, None, false,
-            &MockExecutor, 5, &mut |_| {},
+            &MockExecutor, 5, &mut |_| {}, None,
         ).await.unwrap();
 
         let prompts = provider.captured_prompts.lock().unwrap();
@@ -459,7 +508,7 @@ mod tests {
 
         let _ = chain(
             &provider, "mock-model", prompt, None, false,
-            &MockExecutor, 5, &mut |_| {},
+            &MockExecutor, 5, &mut |_| {}, None,
         ).await.unwrap();
 
         let prompts = provider.captured_prompts.lock().unwrap();
@@ -470,5 +519,146 @@ mod tests {
         assert_eq!(assistant.content, "Let me check. ");
         assert_eq!(assistant.tool_calls.len(), 1);
         assert_eq!(assistant.tool_calls[0].name, "test_tool");
+    }
+
+    #[tokio::test]
+    async fn chain_emits_iteration_start_event() {
+        let provider = MockProvider::new(vec![text_response("Hello!")]);
+        let prompt = Prompt::new("Hi").with_tools(vec![make_tool()]);
+        let mut events = Vec::new();
+
+        let _ = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {},
+            Some(&mut |e: &ChainEvent| events.push(e.clone())),
+        ).await.unwrap();
+
+        assert_eq!(events.len(), 2); // IterationStart + IterationEnd
+        match &events[0] {
+            ChainEvent::IterationStart { iteration, limit, messages } => {
+                assert_eq!(*iteration, 1);
+                assert_eq!(*limit, 5);
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].role, crate::Role::User);
+            }
+            _ => panic!("expected IterationStart"),
+        }
+        match &events[1] {
+            ChainEvent::IterationEnd { iteration, usage, tool_calls } => {
+                assert_eq!(*iteration, 1);
+                assert!(usage.is_none());
+                assert!(tool_calls.is_empty());
+            }
+            _ => panic!("expected IterationEnd"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_emits_per_iteration_usage() {
+        let response1 = vec![
+            Chunk::ToolCallStart { name: "test_tool".into(), id: Some("tc_1".into()) },
+            Chunk::ToolCallDelta { content: "{}".into() },
+            Chunk::Usage(Usage { input: Some(10), output: Some(5), details: None }),
+            Chunk::Done,
+        ];
+        let response2 = vec![
+            Chunk::Text("Done".into()),
+            Chunk::Usage(Usage { input: Some(20), output: Some(10), details: None }),
+            Chunk::Done,
+        ];
+        let provider = MockProvider::new(vec![response1, response2]);
+        let prompt = Prompt::new("Go").with_tools(vec![make_tool()]);
+        let mut events = Vec::new();
+
+        let _ = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {},
+            Some(&mut |e: &ChainEvent| events.push(e.clone())),
+        ).await.unwrap();
+
+        // 2 iterations -> 4 events (start, end, start, end)
+        assert_eq!(events.len(), 4);
+        match &events[1] {
+            ChainEvent::IterationEnd { iteration, usage, tool_calls } => {
+                assert_eq!(*iteration, 1);
+                let u = usage.as_ref().unwrap();
+                assert_eq!(u.input, Some(10));
+                assert_eq!(u.output, Some(5));
+                assert_eq!(tool_calls.len(), 1);
+            }
+            _ => panic!("expected IterationEnd"),
+        }
+        match &events[3] {
+            ChainEvent::IterationEnd { iteration, usage, tool_calls } => {
+                assert_eq!(*iteration, 2);
+                let u = usage.as_ref().unwrap();
+                assert_eq!(u.input, Some(20));
+                assert_eq!(u.output, Some(10));
+                assert!(tool_calls.is_empty());
+            }
+            _ => panic!("expected IterationEnd"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_events_correct_sequence() {
+        // 3-iteration chain: tool -> tool -> text
+        let provider = MockProvider::new(vec![
+            tool_call_response("test_tool", "tc_1", "{}"),
+            tool_call_response("test_tool", "tc_2", "{}"),
+            text_response("Done!"),
+        ]);
+        let prompt = Prompt::new("Go").with_tools(vec![make_tool()]);
+        let mut events = Vec::new();
+
+        let _ = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {},
+            Some(&mut |e: &ChainEvent| events.push(e.clone())),
+        ).await.unwrap();
+
+        assert_eq!(events.len(), 6);
+        assert!(matches!(&events[0], ChainEvent::IterationStart { iteration: 1, .. }));
+        assert!(matches!(&events[1], ChainEvent::IterationEnd { iteration: 1, .. }));
+        assert!(matches!(&events[2], ChainEvent::IterationStart { iteration: 2, .. }));
+        assert!(matches!(&events[3], ChainEvent::IterationEnd { iteration: 2, .. }));
+        assert!(matches!(&events[4], ChainEvent::IterationStart { iteration: 3, .. }));
+        assert!(matches!(&events[5], ChainEvent::IterationEnd { iteration: 3, .. }));
+
+        // Verify tool calls in end events
+        if let ChainEvent::IterationEnd { tool_calls, .. } = &events[1] {
+            assert_eq!(tool_calls.len(), 1);
+        }
+        if let ChainEvent::IterationEnd { tool_calls, .. } = &events[5] {
+            assert!(tool_calls.is_empty());
+        }
+
+        // Verify message growth in start events
+        if let ChainEvent::IterationStart { messages, .. } = &events[0] {
+            assert_eq!(messages.len(), 1); // [user]
+        }
+        if let ChainEvent::IterationStart { messages, .. } = &events[2] {
+            assert_eq!(messages.len(), 3); // [user, assistant+tools, tool]
+        }
+        if let ChainEvent::IterationStart { messages, .. } = &events[4] {
+            assert_eq!(messages.len(), 5); // [user, a+t, tool, a+t, tool]
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_none_on_event_works() {
+        let provider = MockProvider::new(vec![
+            tool_call_response("test_tool", "tc_1", "{}"),
+            text_response("Done!"),
+        ]);
+        let prompt = Prompt::new("Go").with_tools(vec![make_tool()]);
+
+        let result = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {}, None,
+        ).await.unwrap();
+
+        assert_eq!(crate::collect_text(&result.chunks), "Done!");
+        assert_eq!(result.tool_results.len(), 1);
     }
 }

@@ -1629,3 +1629,192 @@ fn help_shows_plugins_subcommand() {
         .success()
         .stdout(predicate::str::contains("plugins"));
 }
+
+// ==========================================================================
+// Verbose chain loop observability (-v / -vv)
+// ==========================================================================
+
+/// Helper: build OpenAI-style JSON responses for tool chain wiremock tests.
+fn openai_tool_call_response(tool_name: &str, tool_id: &str, args: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "chatcmpl-v1",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": tool_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": args
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    })
+}
+
+fn openai_text_response(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "chatcmpl-v2",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": text
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
+    })
+}
+
+#[tokio::test]
+async fn verbose_shows_chain_iteration_summary() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_tool_call_response("upper", "call_1", r#"{"text":"hello"}"#)),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_text_response("HELLO")),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args([
+            "prompt", "--no-stream", "--no-log",
+            "-m", "gpt-4o-mini",
+            "-T", "upper",
+            "--verbose",
+            "make this loud: hello",
+        ])
+        .env("PATH", path_with_fixtures())
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("[chain] Iteration 1/"))
+        .stderr(predicate::str::contains("[chain] Iteration 2/"))
+        .stderr(predicate::str::contains("[chain] Iteration 1 complete"))
+        .stderr(predicate::str::contains("tool call(s)"));
+}
+
+#[tokio::test]
+async fn verbose_vv_shows_messages_json() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_tool_call_response("upper", "call_1", r#"{"text":"hello"}"#)),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_text_response("HELLO")),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args([
+            "prompt", "--no-stream", "--no-log",
+            "-m", "gpt-4o-mini",
+            "-T", "upper",
+            "-vv",
+            "make this loud: hello",
+        ])
+        .env("PATH", path_with_fixtures())
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("[chain] Messages:"))
+        .stderr(predicate::str::contains("\"role\": \"user\""));
+}
+
+#[tokio::test]
+async fn verbose_implies_tools_debug() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_tool_call_response("upper", "call_1", r#"{"text":"hello"}"#)),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_text_response("HELLO")),
+        )
+        .mount(&server)
+        .await;
+
+    // Use --verbose without --tools-debug; should still see tool debug output
+    llm_with_dir(&dir)
+        .args([
+            "prompt", "--no-stream", "--no-log",
+            "-m", "gpt-4o-mini",
+            "-T", "upper",
+            "--verbose",
+            "make this loud: hello",
+        ])
+        .env("PATH", path_with_fixtures())
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Tool call:"))
+        .stderr(predicate::str::contains("Tool result:"));
+}
+
+#[test]
+fn verbose_flag_parsing() {
+    // -v should be parsed (help text is sufficient validation since clap validates)
+    llm()
+        .args(["prompt", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--verbose"));
+}

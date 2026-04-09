@@ -4,23 +4,23 @@ Status snapshot of what has been built, what remains, and key decisions made alo
 
 ---
 
-## Current state (Phase 4 core complete)
+## Current state (Phase 4 core + verbose observability complete)
 
-Phase 1 goal was: `echo "Hello" | llm` works end-to-end --- streams to stdout, logs to JSONL. Phase 2 goal was: tool calling, structured output, and the chain loop --- the core "agentic" capability. Phase 3 goal was: multi-turn conversations, interactive chat, conversation continuation. Phase 4 core goal was: subprocess extensibility --- any executable on `$PATH` matching `llm-tool-*` or `llm-provider-*` can extend the system with new tools or model providers without recompilation.
+Phase 1 goal was: `echo "Hello" | llm` works end-to-end --- streams to stdout, logs to JSONL. Phase 2 goal was: tool calling, structured output, and the chain loop --- the core "agentic" capability. Phase 3 goal was: multi-turn conversations, interactive chat, conversation continuation. Phase 4 core goal was: subprocess extensibility --- any executable on `$PATH` matching `llm-tool-*` or `llm-provider-*` can extend the system with new tools or model providers without recompilation. Phase 4 continued: `--verbose` flag for chain loop observability.
 
 ### Crate map
 
 | Crate | Status | Tests | Purpose |
 |-------|--------|------:|---------|
-| `llm-core` | Complete | 119 | Traits, types, streaming, errors, config, keys, schema DSL, chain loop |
+| `llm-core` | Complete | 123 | Traits, types, streaming, errors, config, keys, schema DSL, chain loop, ChainEvent |
 | `llm-openai` | Complete | 42 | OpenAI Chat API provider (streaming SSE + non-streaming + tool calling + structured output) |
 | `llm-anthropic` | Complete | 48 | Anthropic Messages API provider (streaming SSE + non-streaming + tool calling + structured output) |
 | `llm-store` | Complete | 49 | JSONL conversation file I/O and queries |
-| `llm-cli` | Complete | 103 | Binary: prompt, keys, models, logs, tools, schemas, plugins commands; subprocess tool/provider extensibility |
+| `llm-cli` | Complete | 111 | Binary: prompt, keys, models, logs, tools, schemas, plugins commands; subprocess tool/provider extensibility; verbose chain observability |
 | `llm-wasm` | Complete | --- | WASM library for browser/Obsidian plugin (wasm-bindgen) |
 | `llm-python` | Complete | --- | Python native module via PyO3/maturin |
 
-Total: 361 tests (workspace crates), all passing. `llm-wasm` and `llm-python` are excluded from the workspace and built with their own toolchains.
+Total: 369 tests (workspace crates), all passing. `llm-wasm` and `llm-python` are excluded from the workspace and built with their own toolchains.
 
 ### What works
 
@@ -261,7 +261,7 @@ Total: 361 tests (workspace crates), all passing. `llm-wasm` and `llm-python` ar
 
 Remaining items from Phase 4 and beyond (`metaplan.md`):
 
-- **Phase 4 continued:** Ollama provider (as `llm-provider-ollama` subprocess binary or compiled-in crate), aliases, options passthrough, attachments (image/audio), `--verbose`, shell completions.
+- **Phase 4 continued:** Ollama provider (as `llm-provider-ollama` subprocess binary or compiled-in crate), aliases, options passthrough, attachments (image/audio), shell completions, config resolution tracing (extending `--verbose` beyond chain scope).
 - **Phase 5+:** MCP client protocol, embedding support, template system, fragment pipelines.
 
 ---
@@ -558,6 +558,36 @@ In practice, steps 1-4 and 7-8 were implemented in a single pass (all new files 
 | 9 | `llm-cli` | Async `providers()` combining compiled + discovered providers | 0 (integration tests in step 11) |
 | 10 | `llm-cli` | `llm plugins list` command, `Commands::Plugins`, known subcommand registration | 0 (integration tests in step 11) |
 | 11 | `llm-cli` | E2E integration tests with fixture shell scripts | 9 |
+
+## Verbose chain observability build order
+
+Single implementation pass — the chain event system, CLI flag, formatting, and tests were all implemented together since the scope was small and self-contained.
+
+| Step | Crate | What was built | Tests added |
+|------|-------|----------------|------------:|
+| 1 | `llm-core` | `ChainEvent` enum (`IterationStart`, `IterationEnd`), `on_event` param on `chain()`, event emission with per-iteration `collect_usage()` | 4 |
+| 2 | `llm-core` | Updated all 8 existing `chain()` test call sites to pass `None` for `on_event` | 0 |
+| 3 | `llm-core` | Re-export `ChainEvent` from `lib.rs` | 0 |
+| 4 | `llm-cli` | `-v`/`--verbose` flag on `PromptArgs` (`ArgAction::Count`), `format_chain_event()`, `format_message_summary()` | 0 |
+| 5 | `llm-cli` | `verbose > 0` implies `tools_debug` in `CliToolExecutor`, wired `on_event` callback in `prompt.rs` | 0 |
+| 6 | `llm-cli` | `-v`/`--verbose` on `ChatArgs`, wired through to `chain()` + executor, reuses `prompt::format_chain_event` | 0 |
+| 7 | `llm-cli` | Integration tests: verbose summary, `-vv` message dump, verbose-implies-tools-debug, flag parsing | 4 |
+
+### Verbose observability learnings
+
+**`on_event` as `Option<&mut dyn FnMut>` avoids allocation.** The callback is optional — `None` means no overhead (just an `if let` check each iteration). Using `&mut dyn FnMut` rather than `Box<dyn Fn>` avoids heap allocation and allows the closure to mutate captured state (e.g. collecting events into a `Vec` in tests). The `let mut on_event = on_event;` rebinding at the top of `chain()` is needed because `Option<&mut dyn FnMut>` requires the outer binding to be mutable for the `if let Some(cb) = &mut on_event` pattern.
+
+**`for iteration in 1..=chain_limit` replaces `for _ in 0..chain_limit`.** The 1-based iteration counter is both more natural for human-facing output (`Iteration 1/5`) and lets us remove the implicit counter that would otherwise be needed. The `..=` inclusive range means the loop body runs exactly `chain_limit` times, same as before.
+
+**Per-iteration `collect_usage()` required moving the call before `all_chunks.extend()`.** Previously, `collect_usage()` was only called at the end on the full `all_chunks`. Adding it inside the loop on `iteration_chunks` means we call it before moving chunks into `all_chunks`. The clone in `IterationEnd { usage: usage.clone() }` is necessary because `usage` is also used later (it's an `Option<Usage>`, cheap to clone).
+
+**`format_chain_event` shared between `prompt.rs` and `chat.rs`.** Rather than duplicating the formatting logic, the function was made `pub` on the `prompt` module and called from `chat` via `super::prompt::format_chain_event()`. This works because both modules are `pub mod` children of `commands/mod.rs`. An alternative would be a shared `verbose.rs` module, but that's premature — if more commands need it, the function can be moved then.
+
+**`--verbose` implies `--tools-debug` simplifies the UX.** Instead of requiring `--verbose --tools-debug`, verbose mode automatically enables tool debug output. The implementation passes `args.tools_debug || args.verbose > 0` as the `debug` parameter to `CliToolExecutor::new()`. This means `-v` shows both chain iteration summaries and individual tool call/result lines, which is almost always what you want when debugging tool chains.
+
+**Wiremock `up_to_n_times(1)` ordering for multi-response tests.** The integration tests follow the same pattern established in Phase 2: register the default (final) response first, then register the tool-call response with `up_to_n_times(1)` so it's consumed on the first request. The helper functions `openai_tool_call_response()` and `openai_text_response()` were extracted to avoid duplicating the OpenAI response JSON structure across three new integration tests.
+
+**Message summary format balances compactness with informativeness.** The `format_message_summary()` output looks like `user, assistant+tools(1), tool(1)` — each message is summarized by its role plus a count suffix for tool-bearing messages. This shows at a glance how many tool calls the assistant made and how many results were returned, without overwhelming the user with full message content (which `-vv` provides).
 
 ### Phase 4 learnings
 

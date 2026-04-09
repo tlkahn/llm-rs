@@ -7,7 +7,7 @@ pub mod stream;
 pub mod types;
 
 // Re-export key types at crate root for convenience
-pub use chain::{ChainResult, ToolExecutor, chain};
+pub use chain::{ChainEvent, ChainResult, ToolExecutor, chain};
 pub use config::{Config, KeyStore, Paths, resolve_key};
 pub use error::{LlmError, Result};
 pub use provider::Provider;

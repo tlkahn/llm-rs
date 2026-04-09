@@ -3,7 +3,7 @@ use std::io::{IsTerminal, Write};
 use clap::{ArgAction, Args};
 use futures::StreamExt;
 use llm_core::{
-    Chunk, Config, KeyStore, Paths, Prompt, Provider, Response,
+    ChainEvent, Chunk, Config, KeyStore, Message, Paths, Prompt, Provider, Response, Role,
     collect_text, collect_tool_calls, collect_usage, resolve_key,
 };
 
@@ -80,6 +80,10 @@ pub struct PromptArgs {
     /// Output response as a JSON envelope
     #[arg(long)]
     pub json: bool,
+
+    /// Verbose chain loop output (-v summary, -vv full messages). Implies --tools-debug.
+    #[arg(short, long, action = ArgAction::Count)]
+    pub verbose: u8,
 }
 
 pub async fn run(args: &PromptArgs) -> llm_core::Result<()> {
@@ -221,13 +225,25 @@ pub async fn run(args: &PromptArgs) -> llm_core::Result<()> {
     let json_output = args.json;
 
     let (chunks, chain_tool_results) = if !args.tool.is_empty() {
-        // Tool chain mode
-        let mut executor = CliToolExecutor::new(args.tools_debug, args.tools_approve);
+        // Tool chain mode — verbose > 0 implies tools-debug
+        let debug = args.tools_debug || args.verbose > 0;
+        let mut executor = CliToolExecutor::new(debug, args.tools_approve);
         if let Some(ext) = external_executor {
             executor = executor.with_external(ext);
         }
         let executor = executor;
         let mut stdout = std::io::stdout().lock();
+
+        let verbose = args.verbose;
+        let chain_limit = args.chain_limit;
+        let mut on_event_fn = move |event: &ChainEvent| {
+            format_chain_event(event, verbose, chain_limit);
+        };
+        let on_event: Option<&mut dyn FnMut(&ChainEvent)> = if verbose > 0 {
+            Some(&mut on_event_fn)
+        } else {
+            None
+        };
 
         let result = llm_core::chain(
             provider,
@@ -245,6 +261,7 @@ pub async fn run(args: &PromptArgs) -> llm_core::Result<()> {
                     stdout.flush().ok();
                 }
             },
+            on_event,
         )
         .await?;
         (result.chunks, result.tool_results)
@@ -380,6 +397,59 @@ fn resolve_schema(input: &str) -> llm_core::Result<serde_json::Value> {
     }
     // 3. Try DSL
     llm_core::parse_schema_dsl(input)
+}
+
+/// Format a ChainEvent for stderr output.
+pub fn format_chain_event(event: &ChainEvent, verbose: u8, _chain_limit: usize) {
+    match event {
+        ChainEvent::IterationStart { iteration, limit, messages } => {
+            let summary = format_message_summary(messages);
+            eprintln!(
+                "[chain] Iteration {iteration}/{limit} | {} message{} [{summary}]",
+                messages.len(),
+                if messages.len() == 1 { "" } else { "s" },
+            );
+            if verbose >= 2 {
+                eprintln!("[chain] Messages:");
+                let json = serde_json::to_string_pretty(messages).unwrap_or_default();
+                eprintln!("{json}");
+            }
+        }
+        ChainEvent::IterationEnd { iteration, usage, tool_calls } => {
+            let usage_str = if let Some(u) = usage {
+                format!(
+                    "usage: {} input, {} output",
+                    u.input.unwrap_or(0),
+                    u.output.unwrap_or(0),
+                )
+            } else {
+                "no usage data".into()
+            };
+            eprintln!(
+                "[chain] Iteration {iteration} complete | {usage_str} | {} tool call(s)",
+                tool_calls.len(),
+            );
+        }
+    }
+}
+
+/// Summarize a message list as e.g. "user, assistant+tools(1), tool(1)"
+fn format_message_summary(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .map(|m| match m.role {
+            Role::User => "user".to_string(),
+            Role::Assistant => {
+                if m.tool_calls.is_empty() {
+                    "assistant".to_string()
+                } else {
+                    format!("assistant+tools({})", m.tool_calls.len())
+                }
+            }
+            Role::Tool => format!("tool({})", m.tool_results.len()),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn find_provider<'a>(

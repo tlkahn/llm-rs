@@ -3,7 +3,7 @@ use std::io::Write;
 use clap::{ArgAction, Args};
 use futures::StreamExt;
 use llm_core::{
-    Chunk, Config, KeyStore, Message, Paths, Prompt, Provider, Response,
+    ChainEvent, Chunk, Config, KeyStore, Message, Paths, Prompt, Provider, Response,
     collect_text, collect_tool_calls, collect_usage, resolve_key,
 };
 
@@ -28,6 +28,10 @@ pub struct ChatArgs {
     /// Maximum number of tool call chain iterations per turn
     #[arg(long, default_value = "5")]
     pub chain_limit: usize,
+
+    /// Verbose chain loop output (-v summary, -vv full messages). Implies --tools-debug.
+    #[arg(short, long, action = ArgAction::Count)]
+    pub verbose: u8,
 }
 
 pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
@@ -86,9 +90,10 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
         None
     };
 
-    // Create executor once, reuse across all turns
+    // Create executor once, reuse across all turns (verbose implies debug)
+    let debug = args.verbose > 0;
     let executor = {
-        let e = CliToolExecutor::new(false, false);
+        let e = CliToolExecutor::new(debug, false);
         match external_executor {
             Some(ext) => e.with_external(ext),
             None => e,
@@ -146,6 +151,17 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
         let (chunks, chain_tool_results) = if !tools.is_empty() {
             let mut stdout = std::io::stdout().lock();
 
+            let verbose = args.verbose;
+            let chain_limit = args.chain_limit;
+            let mut on_event_fn = move |event: &ChainEvent| {
+                super::prompt::format_chain_event(event, verbose, chain_limit);
+            };
+            let on_event: Option<&mut dyn FnMut(&ChainEvent)> = if verbose > 0 {
+                Some(&mut on_event_fn)
+            } else {
+                None
+            };
+
             let result = llm_core::chain(
                 provider,
                 &model_id,
@@ -160,6 +176,7 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
                         stdout.flush().ok();
                     }
                 },
+                on_event,
             )
             .await?;
             (result.chunks, result.tool_results)

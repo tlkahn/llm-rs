@@ -7,12 +7,12 @@ LLM-RS: Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) (v0
 ## Commands
 
 ```bash
-cargo test --workspace           # Run all 361 tests
-cargo test -p llm-core           # Core types/traits/config/schema/chain/messages (119 tests)
+cargo test --workspace           # Run all 369 tests
+cargo test -p llm-core           # Core types/traits/config/schema/chain/messages (123 tests)
 cargo test -p llm-openai         # OpenAI provider (42 tests)
 cargo test -p llm-anthropic      # Anthropic provider (48 tests)
 cargo test -p llm-store          # JSONL storage (49 tests)
-cargo test -p llm-cli            # CLI unit (45) + integration (58) tests
+cargo test -p llm-cli            # CLI unit (45) + integration (62) tests
 cargo clippy --workspace         # Lint
 cargo build --release -p llm-cli # Build optimized binary
 
@@ -50,7 +50,8 @@ Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry poi
 - **`LlmError`** (`error.rs`): six variants (`Model`, `NeedsKey`, `Provider`, `Config`, `Io`, `Store`).
 - Stream helpers: `collect_text()`, `collect_tool_calls()`, `collect_usage()`.
 - **`ToolExecutor` trait** (`chain.rs`): async interface for executing tool calls. `execute(&ToolCall) -> ToolResult`.
-- **`chain()`** (`chain.rs`): chain loop that accumulates `Vec<Message>` across iterations — each provider call sees full conversation history. Executes provider → collects tool calls → executes tools → repeats until no tool calls or limit reached.
+- **`ChainEvent`** (`chain.rs`): enum for chain loop observability. `IterationStart { iteration, limit, messages }` emitted before provider call, `IterationEnd { iteration, usage, tool_calls }` after.
+- **`chain()`** (`chain.rs`): chain loop that accumulates `Vec<Message>` across iterations — each provider call sees full conversation history. Executes provider → collects tool calls → executes tools → repeats until no tool calls or limit reached. Optional `on_event` callback for observability.
 - **`parse_schema_dsl()`** (`schema.rs`): parses "name str, age int" DSL into JSON Schema. Types: str, int, float, bool.
 - **`multi_schema()`** (`schema.rs`): wraps a schema in `{"items":{"type":"array","items":<schema>}}` for `--schema-multi`.
 
@@ -82,8 +83,8 @@ Binary name: `llm`. Built with `clap` derive macros.
 **Provider registry:** `commands/mod.rs::providers()` returns `Vec<Box<dyn Provider>>` with `#[cfg(feature)]`-gated providers. `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` env vars override API endpoints. Both `openai` and `anthropic` features are default-on.
 
 **Commands:**
-- `llm prompt <text>` --- flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-T/--tool`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--schema`, `--schema-multi`, `-c/--continue`, `--cid`, `--messages`, `--json`
-- `llm chat` --- interactive REPL with `rustyline`. Flags: `-m`, `-s`, `-T/--tool`, `--chain-limit`
+- `llm prompt <text>` --- flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-T/--tool`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--schema`, `--schema-multi`, `-c/--continue`, `--cid`, `--messages`, `--json`, `-v/--verbose` (count: `-v` summary, `-vv` full messages)
+- `llm chat` --- interactive REPL with `rustyline`. Flags: `-m`, `-s`, `-T/--tool`, `--chain-limit`, `-v/--verbose`
 - `llm keys set/get/list/path` --- `set` uses rpassword for hidden terminal input
 - `llm models list` / `llm models default [model]`
 - `llm logs list [--json] [-r] [-n count] [-m model] [-q query] [-u]` / `llm logs path` / `llm logs status` / `llm logs on` / `llm logs off`
@@ -117,7 +118,9 @@ Phase 3 conversations & multi-turn complete --- `Message`/`Role` core types, pro
 
 Phase 4 subprocess extensibility complete --- External tool protocol (`llm-tool-*` on PATH with `--schema` discovery, stdin/stdout invocation), external provider protocol (`llm-provider-*` with `--id`/`--models`/`--needs-key` metadata, JSON stdin/JSONL stdout streaming), PATH scanning/dedup, `ExternalToolExecutor` implementing `ToolExecutor`, `SubprocessProvider` implementing `Provider`, composite `CliToolExecutor` (builtin + external), `-T` flag resolves external tools in both `prompt` and `chat`, `llm plugins list` command, `providers()` is now async and includes discovered subprocess providers.
 
-Next: Phase 4 continued (Ollama provider via subprocess, aliases, options, attachments). See `doc/metaplan.md` for the full roadmap.
+Phase 4 verbose observability complete --- `-v`/`--verbose` flag (count) on `prompt` and `chat` commands. `ChainEvent` enum in llm-core with `IterationStart`/`IterationEnd` variants. `chain()` accepts optional `on_event` callback. `-v` shows iteration summary (number, message count, role summary, per-iteration usage, tool call count). `-vv` additionally dumps full message JSON per iteration. `--verbose` implies `--tools-debug`. `format_chain_event()` and `format_message_summary()` in `prompt.rs`, shared by `chat.rs`.
+
+Next: Phase 4 continued (Ollama provider via subprocess, aliases, options, attachments, config resolution tracing). See `doc/metaplan.md` for the full roadmap.
 
 ## Conventions
 

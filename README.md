@@ -44,6 +44,10 @@ llm "Do something" -T llm_version --chain-limit 3
 # Debug mode: show tool calls/results on stderr
 llm "What version?" -T llm_version --tools-debug
 
+# Verbose mode: see chain loop iterations (-v summary, -vv full messages)
+llm "What time is it?" -T llm_time --verbose
+llm "What time is it?" -T llm_time -vv
+
 # List available built-in tools
 llm tools list
 ```
@@ -51,6 +55,33 @@ llm tools list
 Available built-in tools:
 - `llm_version` --- returns the CLI version
 - `llm_time` --- returns current UTC and local time with timezone
+
+### Verbose chain observability
+
+When using tools, the `-v`/`--verbose` flag reveals what happens inside the chain loop --- which iteration you're on, what messages are being sent, per-iteration token usage, and tool call/result details.
+
+```bash
+# Level 1 (-v): iteration summary + tool debug
+llm "What time is it?" -T llm_time -v
+# stderr output:
+#   [chain] Iteration 1/5 | 1 message [user]
+#   [chain] Iteration 1 complete | usage: 10 input, 5 output | 1 tool call(s)
+#   Tool call: llm_time (id: call_1)
+#   Arguments: {}
+#   Tool result: {"utc_time":"...","local_time":"...","timezone":"..."}
+#   [chain] Iteration 2/5 | 3 messages [user, assistant+tools(1), tool(1)]
+#   [chain] Iteration 2 complete | usage: 20 input, 10 output | 0 tool call(s)
+
+# Level 2 (-vv): also dumps full message JSON per iteration
+llm "What time is it?" -T llm_time -vv
+# stderr additionally includes:
+#   [chain] Messages:
+#   [
+#     {"role": "user", "content": "What time is it?"}
+#   ]
+```
+
+`--verbose` implies `--tools-debug` --- no need for both flags. Works on both `prompt` and `chat` commands.
 
 ### External tools
 
@@ -141,6 +172,9 @@ llm chat -m claude-sonnet-4-6 -s "You are a helpful assistant"
 
 # Chat with tools enabled
 llm chat -T llm_time -T llm_version
+
+# Chat with verbose tool chain output
+llm chat -T llm_time -v
 ```
 
 ### Structured output
@@ -425,16 +459,16 @@ See [`doc/metaplan.md`](doc/metaplan.md) for the full design rationale and phase
 ## Testing
 
 ```bash
-cargo test --workspace    # 361 tests (core workspace crates)
+cargo test --workspace    # 369 tests (core workspace crates)
 ```
 
 | Crate | Tests | What's covered |
 |-------|------:|----------------|
-| `llm-core` | 119 | Types, config, keys, streams, schema DSL, chain loop, messages (mock provider) |
+| `llm-core` | 123 | Types, config, keys, streams, schema DSL, chain loop, ChainEvent, messages (mock provider) |
 | `llm-openai` | 42 | HTTP mocking (wiremock), SSE parsing, tool calls, structured output, multi-turn |
 | `llm-anthropic` | 48 | HTTP mocking (wiremock), typed SSE, tool_use blocks, transparent schema wrapping, multi-turn |
 | `llm-store` | 49 | JSONL round-trips, unicode, malformed recovery, listing/queries, message reconstruction |
-| `llm-cli` | 103 | Subprocess protocol/discovery/execution (45 unit), CLI integration (58 e2e with assert_cmd) |
+| `llm-cli` | 107 | Subprocess protocol/discovery/execution (45 unit), CLI integration (62 e2e with assert_cmd) |
 
 Library targets are verified by their build toolchains: `wasm-pack build` for WASM, `maturin develop` for Python.
 
@@ -448,7 +482,9 @@ Phase 3 complete --- multi-turn conversations with full history accumulation, co
 
 Phase 4 core complete --- subprocess extensibility via `llm-tool-*` and `llm-provider-*` protocols. PATH-based discovery, JSON stdin/stdout invocation, streaming JSONL for providers, composite tool executor (builtin + external), `llm plugins list`, async provider registry.
 
-Next: Phase 4 continued (Ollama provider, aliases, options, attachments).
+Phase 4 verbose observability complete --- `-v`/`--verbose` flag on `prompt` and `chat` with two levels (`-v` summary, `-vv` full message dump). `ChainEvent` callback system in the core chain loop. Per-iteration usage tracking. `--verbose` implies `--tools-debug`.
+
+Next: Phase 4 continued (Ollama provider, aliases, options, attachments, config resolution tracing).
 
 ## License
 
