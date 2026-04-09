@@ -1,7 +1,7 @@
 # LLM-RS Metaplan
 
 > **Stack:** Rust 2024 edition + Cargo workspace | tokio + reqwest + clap + serde_json
-> **Scope:** Reimplementation of [simonw/llm](https://github.com/simonw/llm) (v0.30) in Rust --- core prompting, conversations, tool calling, structured output, JSONL file logging, multi-provider. Embeddings, templates, and fragments deferred to future work.
+> **Scope:** Unix-philosophy agentic CLI for LLMs, inspired by [simonw/llm](https://github.com/simonw/llm). Core prompting, conversations, tool calling with chain loops, structured output, subprocess-based extensibility, JSONL file logging, multi-provider. Embeddings, templates, and fragments deferred to future work.
 
 ---
 

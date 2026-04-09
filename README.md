@@ -1,6 +1,6 @@
 # llm-rs
 
-A Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) --- a CLI tool for interacting with Large Language Models from the terminal.
+A Unix-philosophy agentic CLI for Large Language Models. Inspired by [simonw/llm](https://github.com/simonw/llm), built for composability --- stdin/stdout pipelines, subprocess-based tool and provider extensibility (`llm-tool-*`, `llm-provider-*`), and multi-target output (native CLI, WASM, Python).
 
 ## Usage
 
@@ -452,4 +452,4 @@ Next: Phase 4 continued (Ollama provider, aliases, options, attachments).
 
 ## License
 
-TBD
+GPLv3
