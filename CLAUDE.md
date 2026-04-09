@@ -7,12 +7,12 @@ LLM-RS: Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) (v0
 ## Commands
 
 ```bash
-cargo test --workspace           # Run all 316 tests
+cargo test --workspace           # Run all 361 tests
 cargo test -p llm-core           # Core types/traits/config/schema/chain/messages (119 tests)
 cargo test -p llm-openai         # OpenAI provider (42 tests)
 cargo test -p llm-anthropic      # Anthropic provider (48 tests)
 cargo test -p llm-store          # JSONL storage (49 tests)
-cargo test -p llm-cli            # CLI integration tests (58 tests)
+cargo test -p llm-cli            # CLI unit (45) + integration (58) tests
 cargo clippy --workspace         # Lint
 cargo build --release -p llm-cli # Build optimized binary
 
@@ -91,8 +91,17 @@ Binary name: `llm`. Built with `clap` derive macros.
 - `llm schemas dsl <input>` --- parse DSL to JSON Schema
 - `llm schemas list` --- scan logs for used schemas
 - `llm schemas show <id>` --- show schema by ID
+- `llm plugins list` --- show compiled providers, external providers, and external tools
 
 **Exit codes:** 0 success, 1 runtime, 2 config/key/model, 3 provider/network.
+
+### Subprocess Extensibility (`llm-cli/src/subprocess/`)
+
+**Tool protocol** (`llm-tool-*`): Any executable on `$PATH` matching `llm-tool-*` can extend LLM-RS with new tools. Discovery via `--schema` flag (returns JSON matching `Tool` struct). Invocation: arguments JSON on stdin, result on stdout. Exit 0 = success, non-zero = error (stderr).
+
+**Provider protocol** (`llm-provider-*`): Any executable on `$PATH` matching `llm-provider-*` can add model providers. Metadata flags: `--id`, `--models` (JSON array of `ModelInfo`), `--needs-key` (JSON `{"needed":bool,"env_var":?}`). Invocation: `ProviderRequest` JSON on stdin. Streaming: JSONL `ProtocolChunk` lines. Non-streaming: single `ProviderResponse` JSON.
+
+**Module structure**: `protocol.rs` (wire types + Chunk conversion), `discovery.rs` (PATH scanning + schema/metadata fetching), `tool.rs` (`ExternalToolExecutor` impl `ToolExecutor`), `provider.rs` (`SubprocessProvider` impl `Provider`).
 
 ### WASM + Python multi-provider
 
@@ -106,7 +115,9 @@ Phase 2 tools & structured output complete --- Tool calling (both providers), ch
 
 Phase 3 conversations & multi-turn complete --- `Message`/`Role` core types, provider multi-turn message building, chain loop accumulates full conversation history, conversation continuation (`-c`/`--cid`), `--messages`/`--json` flags, `llm chat` REPL, `llm logs` full feature set (path/status/on/off, model filter, text search, usage display), `reconstruct_messages()` for conversation reconstruction.
 
-Next: Phase 4 (subprocess extensibility, Ollama provider, aliases, options, attachments). See `doc/metaplan.md` for the full roadmap.
+Phase 4 subprocess extensibility complete --- External tool protocol (`llm-tool-*` on PATH with `--schema` discovery, stdin/stdout invocation), external provider protocol (`llm-provider-*` with `--id`/`--models`/`--needs-key` metadata, JSON stdin/JSONL stdout streaming), PATH scanning/dedup, `ExternalToolExecutor` implementing `ToolExecutor`, `SubprocessProvider` implementing `Provider`, composite `CliToolExecutor` (builtin + external), `-T` flag resolves external tools in both `prompt` and `chat`, `llm plugins list` command, `providers()` is now async and includes discovered subprocess providers.
+
+Next: Phase 4 continued (Ollama provider via subprocess, aliases, options, attachments). See `doc/metaplan.md` for the full roadmap.
 
 ## Conventions
 

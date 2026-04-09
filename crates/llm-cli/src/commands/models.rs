@@ -16,12 +16,12 @@ pub enum ModelsCommand {
     },
 }
 
-pub fn run(cmd: &ModelsCommand) -> Result<()> {
+pub async fn run(cmd: &ModelsCommand) -> Result<()> {
     let paths = Paths::resolve()?;
 
     match cmd {
         ModelsCommand::List => {
-            let providers = providers();
+            let providers = providers().await;
             for provider in &providers {
                 for model in provider.models() {
                     println!("{} ({})", model.id, provider.id());

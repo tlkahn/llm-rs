@@ -9,6 +9,7 @@ use llm_core::{
 
 use super::providers;
 use super::tools::{BuiltinToolRegistry, CliToolExecutor};
+use crate::subprocess::tool::ExternalToolExecutor;
 
 #[derive(Args)]
 pub struct ChatArgs {
@@ -20,7 +21,7 @@ pub struct ChatArgs {
     #[arg(short, long)]
     pub system: Option<String>,
 
-    /// Enable a built-in tool (repeatable)
+    /// Enable a tool (repeatable, built-in or external)
     #[arg(short = 'T', long = "tool", action = ArgAction::Append)]
     pub tool: Vec<String>,
 
@@ -40,24 +41,39 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
     let model_id = config.resolve_model(model_input).to_string();
 
     // Find the provider for this model
-    let all_providers = providers();
+    let all_providers = providers().await;
     let (provider, _model_info) = find_provider(&all_providers, &model_id)?;
 
-    // Resolve key
-    let key = resolve_key(
-        None,
-        &key_store,
-        provider.needs_key().unwrap_or(""),
-        provider.key_env_var(),
-    )?;
+    // Resolve key (skip if provider doesn't need one)
+    let key = if provider.needs_key().is_some() {
+        Some(resolve_key(
+            None,
+            &key_store,
+            provider.needs_key().unwrap_or(""),
+            provider.key_env_var(),
+        )?)
+    } else {
+        None
+    };
 
-    // Resolve tools if specified
+    // Resolve tools if specified (check builtins first, then external)
     let mut tools = Vec::new();
+    let mut need_external: Vec<String> = Vec::new();
     if !args.tool.is_empty() {
         let registry = BuiltinToolRegistry::new();
         for name in &args.tool {
             match registry.get(name) {
                 Some(tool) => tools.push(tool.clone()),
+                None => need_external.push(name.clone()),
+            }
+        }
+    }
+
+    let external_executor = if !need_external.is_empty() || !args.tool.is_empty() {
+        let ext = ExternalToolExecutor::discover().await?;
+        for name in &need_external {
+            match ext.get_tool(name) {
+                Some((_, tool)) => tools.push(tool.clone()),
                 None => {
                     return Err(llm_core::LlmError::Config(format!(
                         "unknown tool: {name}"
@@ -65,7 +81,19 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
                 }
             }
         }
-    }
+        Some(ext)
+    } else {
+        None
+    };
+
+    // Create executor once, reuse across all turns
+    let executor = {
+        let e = CliToolExecutor::new(false, false);
+        match external_executor {
+            Some(ext) => e.with_external(ext),
+            None => e,
+        }
+    };
 
     eprintln!("Chatting with {model_id} (Ctrl-D to exit)");
 
@@ -116,14 +144,13 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
         let start = std::time::Instant::now();
 
         let (chunks, chain_tool_results) = if !tools.is_empty() {
-            let executor = CliToolExecutor::new(false, false);
             let mut stdout = std::io::stdout().lock();
 
             let result = llm_core::chain(
                 provider,
                 &model_id,
                 prompt,
-                Some(&key),
+                key.as_deref(),
                 true,
                 &executor,
                 args.chain_limit,
@@ -138,7 +165,7 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
             (result.chunks, result.tool_results)
         } else {
             let response_stream = provider
-                .execute(&model_id, &prompt, Some(&key), true)
+                .execute(&model_id, &prompt, key.as_deref(), true)
                 .await?;
 
             let mut chunks = Vec::new();

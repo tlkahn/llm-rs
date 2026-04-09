@@ -1,5 +1,6 @@
 mod app;
 mod commands;
+mod subprocess;
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -18,10 +19,11 @@ async fn main() {
         Some(Commands::Prompt(args)) => commands::prompt::run(&args).await,
         Some(Commands::Chat(args)) => commands::chat::run(&args).await,
         Some(Commands::Keys { command }) => commands::keys::run(&command),
-        Some(Commands::Models { command }) => commands::models::run(&command),
+        Some(Commands::Models { command }) => commands::models::run(&command).await,
         Some(Commands::Logs { command }) => commands::logs::run(&command),
-        Some(Commands::Tools { command }) => commands::tools::run(&command),
+        Some(Commands::Tools { command }) => commands::tools::run(&command).await,
         Some(Commands::Schemas { command }) => commands::schemas::run(&command),
+        Some(Commands::Plugins { command }) => commands::plugins::run(&command).await,
         None => Ok(()),
     };
 
@@ -57,8 +59,8 @@ fn rewrite_args() -> Vec<OsString> {
 
 fn should_insert_prompt(first_arg: &str) -> bool {
     let known = [
-        "prompt", "keys", "models", "logs", "tools", "schemas", "chat", "help",
-        "--help", "-h", "--version", "-V",
+        "prompt", "keys", "models", "logs", "tools", "schemas", "chat", "plugins",
+        "help", "--help", "-h", "--version", "-V",
     ];
     !known.contains(&first_arg)
 }

@@ -52,6 +52,60 @@ Available built-in tools:
 - `llm_version` --- returns the CLI version
 - `llm_time` --- returns current UTC and local time with timezone
 
+### External tools
+
+Any executable on `$PATH` named `llm-tool-*` is automatically discovered and usable with `-T`. External tools can be written in any language.
+
+```bash
+# List all tools (built-in + external)
+llm tools list
+
+# Use an external tool
+llm "Make this loud: hello" -T upper -m gpt-4o
+
+# Mix built-in and external tools
+llm "What time is it, and shout it" -T llm_time -T shout
+```
+
+Writing an external tool requires two things:
+
+1. **Schema**: respond to `--schema` with JSON describing the tool:
+   ```bash
+   $ llm-tool-upper --schema
+   {"name":"upper","description":"Uppercase text","input_schema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}
+   ```
+
+2. **Execution**: read arguments JSON from stdin, write result to stdout:
+   ```bash
+   $ echo '{"text":"hello"}' | llm-tool-upper
+   HELLO
+   ```
+
+Exit 0 means success (stdout = output). Non-zero means error (stderr = error message). Default timeout: 30 seconds.
+
+### External providers
+
+Any executable on `$PATH` named `llm-provider-*` extends llm-rs with new model providers. External providers can serve models from Ollama, llama.cpp, or any custom backend.
+
+```bash
+# Models from external providers appear alongside built-in ones
+llm models list
+
+# Use a model from an external provider
+llm "Hello" -m llama3
+
+# See all providers and tools
+llm plugins list
+```
+
+Writing an external provider requires metadata flags and a JSON stdin/stdout protocol:
+
+- `--id` --- print the provider name (e.g. `ollama`)
+- `--models` --- print JSON array of model metadata
+- `--needs-key` --- print `{"needed":false}` or `{"needed":true,"env_var":"MY_KEY"}`
+
+On invocation, the provider reads a JSON request from stdin and writes either streaming JSONL lines or a single JSON response to stdout. See `doc/implementation.md` for the full protocol specification.
+
 ### Conversations
 
 Continue previous conversations, use multi-turn message input, and chat interactively.
@@ -169,6 +223,26 @@ Log files live at `~/.local/share/llm/logs/`. Each file is a JSONL conversation:
 llm schemas dsl "name str, age int"   # Preview DSL -> JSON Schema
 llm schemas list                      # List schemas used in logs
 llm schemas show <id>                 # Show schema by ID
+```
+
+### Plugins
+
+```bash
+llm plugins list    # Show all providers (compiled + external) and external tools
+```
+
+Example output:
+```
+Compiled providers:
+  openai (2 models: gpt-4o, gpt-4o-mini)
+  anthropic (3 models: claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5)
+
+External providers:
+  ollama (/usr/local/bin/llm-provider-ollama) (3 models: llama3, mistral, phi3)
+
+External tools:
+  web_search (/usr/local/bin/llm-tool-web-search) — Search the web
+  upper (/usr/local/bin/llm-tool-upper) — Uppercase text
 ```
 
 ### Exit codes
@@ -339,7 +413,7 @@ Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry poi
 
 Key design choices vs the Python original:
 
-- **No plugin system.** Providers are compiled in (feature flags) or discovered as subprocess executables on `$PATH` (planned).
+- **Subprocess extensibility, not in-process plugins.** Instead of Python's pluggy-based plugin system, external tools (`llm-tool-*`) and providers (`llm-provider-*`) are standalone executables discovered on `$PATH`. Any language can implement the JSON stdin/stdout protocol. Compiled-in providers (OpenAI, Anthropic) are feature-gated for a minimal core binary.
 - **JSONL storage.** One file per conversation instead of SQLite. Append-only, human-readable, no migrations.
 - **Async-first.** Single `Provider` trait using futures streams, no sync/async class duplication.
 - **TOML config.** Two files (`config.toml` + `keys.toml`) instead of six scattered JSON/YAML/text files.
@@ -351,7 +425,7 @@ See [`doc/metaplan.md`](doc/metaplan.md) for the full design rationale and phase
 ## Testing
 
 ```bash
-cargo test --workspace    # 316 tests (core workspace crates)
+cargo test --workspace    # 361 tests (core workspace crates)
 ```
 
 | Crate | Tests | What's covered |
@@ -360,7 +434,7 @@ cargo test --workspace    # 316 tests (core workspace crates)
 | `llm-openai` | 42 | HTTP mocking (wiremock), SSE parsing, tool calls, structured output, multi-turn |
 | `llm-anthropic` | 48 | HTTP mocking (wiremock), typed SSE, tool_use blocks, transparent schema wrapping, multi-turn |
 | `llm-store` | 49 | JSONL round-trips, unicode, malformed recovery, listing/queries, message reconstruction |
-| `llm-cli` | 58 | End-to-end CLI: tools, schemas, chain loop, conversations, stdout/stderr/exit codes |
+| `llm-cli` | 103 | Subprocess protocol/discovery/execution (45 unit), CLI integration (58 e2e with assert_cmd) |
 
 Library targets are verified by their build toolchains: `wasm-pack build` for WASM, `maturin develop` for Python.
 
@@ -372,7 +446,9 @@ Phase 2 complete --- tool calling, chain loop, built-in tools, structured output
 
 Phase 3 complete --- multi-turn conversations with full history accumulation, conversation continuation (`-c`/`--cid`), `--messages`/`--json` flags, interactive `llm chat` REPL, expanded `llm logs` (path/status/on/off, model filter, text search, usage).
 
-Next: Phase 4 (subprocess extensibility, Ollama provider, aliases, options, attachments).
+Phase 4 core complete --- subprocess extensibility via `llm-tool-*` and `llm-provider-*` protocols. PATH-based discovery, JSON stdin/stdout invocation, streaming JSONL for providers, composite tool executor (builtin + external), `llm plugins list`, async provider registry.
+
+Next: Phase 4 continued (Ollama provider, aliases, options, attachments).
 
 ## License
 

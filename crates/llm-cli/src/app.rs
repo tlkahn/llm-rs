@@ -40,4 +40,9 @@ pub enum Commands {
         #[command(subcommand)]
         command: commands::schemas::SchemasCommand,
     },
+    /// List providers and tools (compiled and external)
+    Plugins {
+        #[command(subcommand)]
+        command: commands::plugins::PluginsCommand,
+    },
 }

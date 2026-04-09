@@ -1434,3 +1434,198 @@ fn logs_on_off_toggle() {
         .success()
         .stdout(predicate::str::contains("enabled"));
 }
+
+// ==========================================================================
+// Phase 4: Subprocess extensibility — external tools and providers
+// ==========================================================================
+
+/// Return the absolute path to tests/fixtures/bin/ so we can prepend it to PATH.
+fn fixtures_bin() -> String {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .join("tests/fixtures/bin")
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Build a PATH that has our fixtures dir first, then the system PATH.
+fn path_with_fixtures() -> String {
+    let sys_path = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{sys_path}", fixtures_bin())
+}
+
+#[test]
+fn tools_list_shows_external_tool() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["tools", "list"])
+        .env("PATH", path_with_fixtures())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("upper"))
+        .stdout(predicate::str::contains("Uppercase text"));
+}
+
+#[test]
+fn tools_list_shows_builtin_and_external() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["tools", "list"])
+        .env("PATH", path_with_fixtures())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("llm_version"))
+        .stdout(predicate::str::contains("upper"));
+}
+
+#[test]
+fn plugins_list_shows_compiled_providers() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["plugins", "list"])
+        .env("PATH", path_with_fixtures())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Compiled providers:"))
+        .stdout(predicate::str::contains("openai"))
+        .stdout(predicate::str::contains("anthropic"));
+}
+
+#[test]
+fn plugins_list_shows_external_provider() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["plugins", "list"])
+        .env("PATH", path_with_fixtures())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("External providers:"))
+        .stdout(predicate::str::contains("echo"))
+        .stdout(predicate::str::contains("echo-model"));
+}
+
+#[test]
+fn plugins_list_shows_external_tool() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["plugins", "list"])
+        .env("PATH", path_with_fixtures())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("External tools:"))
+        .stdout(predicate::str::contains("upper"))
+        .stdout(predicate::str::contains("Uppercase text"));
+}
+
+#[test]
+fn models_list_includes_subprocess_provider_models() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["models", "list"])
+        .env("PATH", path_with_fixtures())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("echo-model (echo)"));
+}
+
+#[test]
+fn prompt_with_subprocess_provider() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["prompt", "--no-stream", "-m", "echo-model", "-n", "hello world"])
+        .env("PATH", path_with_fixtures())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("echo: hello world"));
+}
+
+#[tokio::test]
+async fn prompt_with_external_tool_in_chain() {
+    // Set up wiremock to simulate an LLM that calls the "upper" tool
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    // First call: LLM returns a tool call to "upper"
+    let tool_call_response = serde_json::json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "upper",
+                        "arguments": "{\"text\":\"hello\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    });
+
+    // Second call: LLM returns final text
+    let final_response = serde_json::json!({
+        "id": "chatcmpl-2",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "The uppercased version is: HELLO"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
+    });
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&tool_call_response),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&final_response),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args([
+            "prompt", "--no-stream", "--no-log",
+            "-m", "gpt-4o-mini",
+            "-T", "upper",
+            "make this loud: hello",
+        ])
+        .env("PATH", path_with_fixtures())
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("HELLO"));
+}
+
+#[test]
+fn help_shows_plugins_subcommand() {
+    llm()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("plugins"));
+}

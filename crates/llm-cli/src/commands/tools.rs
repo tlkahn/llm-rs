@@ -2,19 +2,30 @@ use async_trait::async_trait;
 use clap::Subcommand;
 use llm_core::{Tool, ToolCall, ToolExecutor, ToolResult};
 
+use crate::subprocess::tool::ExternalToolExecutor;
+
 #[derive(Subcommand)]
 pub enum ToolsCommand {
-    /// List available built-in tools
+    /// List available tools (built-in and external)
     List,
 }
 
-pub fn run(command: &ToolsCommand) -> llm_core::Result<()> {
+pub async fn run(command: &ToolsCommand) -> llm_core::Result<()> {
     match command {
         ToolsCommand::List => {
             let registry = BuiltinToolRegistry::new();
             for tool in registry.list() {
                 println!("{}: {}", tool.name, tool.description);
             }
+
+            // Show external tools from PATH
+            let external = ExternalToolExecutor::discover().await?;
+            let mut ext_tools = external.list_tools();
+            ext_tools.sort_by_key(|(name, _, _)| name.to_string());
+            for (name, path, tool) in &ext_tools {
+                println!("{name}: {} ({})", tool.description, path.display());
+            }
+
             Ok(())
         }
     }
@@ -89,15 +100,26 @@ impl BuiltinToolRegistry {
     }
 }
 
-/// CLI tool executor that wraps BuiltinToolRegistry.
+/// CLI tool executor that wraps BuiltinToolRegistry and optionally delegates
+/// to external subprocess tools.
 pub struct CliToolExecutor {
     pub debug: bool,
     pub approve: bool,
+    pub external: Option<ExternalToolExecutor>,
 }
 
 impl CliToolExecutor {
     pub fn new(debug: bool, approve: bool) -> Self {
-        Self { debug, approve }
+        Self {
+            debug,
+            approve,
+            external: None,
+        }
+    }
+
+    pub fn with_external(mut self, external: ExternalToolExecutor) -> Self {
+        self.external = Some(external);
+        self
     }
 }
 
@@ -129,7 +151,18 @@ impl ToolExecutor for CliToolExecutor {
             }
         }
 
+        // Try builtin first
         let result = BuiltinToolRegistry::execute_tool(call);
+        let result = if result.error.as_ref().is_some_and(|e| e.contains("unknown tool")) {
+            // Not a builtin — try external
+            if let Some(ext) = &self.external {
+                ext.execute(call).await
+            } else {
+                result
+            }
+        } else {
+            result
+        };
 
         if self.debug {
             if let Some(err) = &result.error {

@@ -4,9 +4,9 @@ Status snapshot of what has been built, what remains, and key decisions made alo
 
 ---
 
-## Current state (Phase 3 complete)
+## Current state (Phase 4 core complete)
 
-Phase 1 goal was: `echo "Hello" | llm` works end-to-end --- streams to stdout, logs to JSONL. Phase 2 goal was: tool calling, structured output, and the chain loop --- the core "agentic" capability.
+Phase 1 goal was: `echo "Hello" | llm` works end-to-end --- streams to stdout, logs to JSONL. Phase 2 goal was: tool calling, structured output, and the chain loop --- the core "agentic" capability. Phase 3 goal was: multi-turn conversations, interactive chat, conversation continuation. Phase 4 core goal was: subprocess extensibility --- any executable on `$PATH` matching `llm-tool-*` or `llm-provider-*` can extend the system with new tools or model providers without recompilation.
 
 ### Crate map
 
@@ -16,11 +16,11 @@ Phase 1 goal was: `echo "Hello" | llm` works end-to-end --- streams to stdout, l
 | `llm-openai` | Complete | 42 | OpenAI Chat API provider (streaming SSE + non-streaming + tool calling + structured output) |
 | `llm-anthropic` | Complete | 48 | Anthropic Messages API provider (streaming SSE + non-streaming + tool calling + structured output) |
 | `llm-store` | Complete | 49 | JSONL conversation file I/O and queries |
-| `llm-cli` | Complete | 58 | Binary: prompt, keys, models, logs, tools, schemas commands |
+| `llm-cli` | Complete | 103 | Binary: prompt, keys, models, logs, tools, schemas, plugins commands; subprocess tool/provider extensibility |
 | `llm-wasm` | Complete | --- | WASM library for browser/Obsidian plugin (wasm-bindgen) |
 | `llm-python` | Complete | --- | Python native module via PyO3/maturin |
 
-Total: 316 tests (workspace crates), all passing. `llm-wasm` and `llm-python` are excluded from the workspace and built with their own toolchains.
+Total: 361 tests (workspace crates), all passing. `llm-wasm` and `llm-python` are excluded from the workspace and built with their own toolchains.
 
 ### What works
 
@@ -190,11 +190,79 @@ Total: 316 tests (workspace crates), all passing. `llm-wasm` and `llm-python` ar
 - `llm logs list -u`: include token usage totals per conversation.
 - Known subcommands updated: `chat` added to `should_insert_prompt()`.
 
+**Phase 4 additions (subprocess extensibility):**
+
+**`llm-cli/src/subprocess/protocol.rs` — wire protocol types** (Step 1)
+
+- `ProtocolChunk`: serde-tagged enum (`#[serde(tag = "type", rename_all = "snake_case")]`) with variants `Text`, `ToolCallStart`, `ToolCallDelta`, `Usage`, `Done`. Maps 1:1 to `llm_core::Chunk` but has its own serde implementation since `Chunk` intentionally has no serde.
+- `From<ProtocolChunk> for Chunk` and `From<&Chunk> for ProtocolChunk` conversions.
+- `ProviderRequest`: serializable struct sent to subprocess providers on stdin (`model`, `prompt`, `key`, `stream`). `Prompt` is directly serializable since it already has serde derives.
+- `ProviderResponse`: non-streaming response from subprocess providers (`text`, `tool_calls`, `usage`).
+- `ResponseUsage`: concrete `{input: u64, output: u64}` (unlike core `Usage` which has `Option` fields).
+
+**`llm-cli/src/subprocess/discovery.rs` — PATH scanning and metadata fetching** (Steps 2, 3, 7)
+
+- `scan_path(prefix)`: scans all directories in `$PATH` for executables matching the prefix. Skips directories, non-executable files (checked via `mode() & 0o111` on Unix), and deduplicates by filename (first occurrence in PATH wins).
+- `discover_tools()` / `discover_providers()`: thin wrappers calling `scan_path("llm-tool-")` / `scan_path("llm-provider-")`.
+- `fetch_tool_schema(binary, timeout)`: runs `binary --schema`, parses stdout as `Tool` JSON. Timeout via `tokio::time::timeout`.
+- `fetch_all_tool_schemas(binaries, timeout)`: batch fetch with warning on failure (skips broken tools).
+- `fetch_provider_id(binary, timeout)`: runs `binary --id`, returns trimmed string.
+- `fetch_provider_models(binary, timeout)`: runs `binary --models`, parses `Vec<ModelInfo>` JSON.
+- `fetch_provider_key_info(binary, timeout)`: runs `binary --needs-key`, parses `KeyRequirement { needed, env_var }`.
+- All subprocess calls use `tokio::process::Command` + `tokio::time::timeout` with a configurable default of 30 seconds.
+
+**`llm-cli/src/subprocess/tool.rs` — external tool executor** (Step 4)
+
+- `ExternalToolExecutor`: holds `HashMap<String, (PathBuf, Tool)>` mapping tool names to binary paths and schemas.
+- `discover()`: scans PATH + fetches all schemas. `discover_with_timeout()` for custom timeout.
+- `ToolExecutor` impl: spawns the tool binary, writes `call.arguments` JSON to stdin, reads stdout/stderr. Exit 0 → success (stdout = output). Non-zero → error (stderr = message). Timeout → error.
+- `get_tool(name)` / `list_tools()` for introspection (used by CLI tool resolution and `llm tools list`).
+
+**`llm-cli/src/subprocess/provider.rs` — subprocess provider** (Step 8)
+
+- `SubprocessProvider`: holds binary path + cached metadata (provider ID, model list, key requirement).
+- `from_binary(path)`: fetches all metadata by running `--id`, `--models`, `--needs-key`. Used during provider discovery.
+- `Provider` trait impl:
+  - `id()`, `models()`, `needs_key()`, `key_env_var()`: return cached metadata.
+  - `execute()`: serializes `ProviderRequest` to stdin. Streaming mode: reads stdout line by line via `tokio::io::BufReader::lines()`, parses each as `ProtocolChunk`, converts to `Chunk`, yields via `async_stream::try_stream!`. Non-streaming mode: reads all stdout, parses `ProviderResponse`, converts to `Vec<Chunk>`.
+
+**`llm-cli/src/commands/tools.rs` — composite tool executor** (Step 5)
+
+- `CliToolExecutor` now holds `Option<ExternalToolExecutor>`. Constructor: `new(debug, approve)` + `.with_external(ext)` builder.
+- Execution order: try `BuiltinToolRegistry::execute_tool()` first. If it returns an "unknown tool" error, delegate to external executor if present.
+- `tools list` now shows both builtin tools and discovered external tools (with binary path).
+- `run()` is now `async` (needed for `ExternalToolExecutor::discover()`).
+
+**`llm-cli/src/commands/prompt.rs` + `chat.rs` — external tool wiring** (Step 6)
+
+- `-T` flag resolution: check `BuiltinToolRegistry` first, collect unresolved names, then discover external tools and resolve remaining names. Error if any name is still unknown.
+- `ExternalToolExecutor` is passed into `CliToolExecutor.with_external()` for chain loop delegation.
+- Key resolution fix: `resolve_key()` is now skipped when the provider reports `needs_key() == None` and no `--key` flag is given. Previously, calling `resolve_key` with an empty key alias always errored because it couldn't find a key for `""`. This was never hit before because both compiled-in providers (OpenAI, Anthropic) always need a key.
+
+**`llm-cli/src/commands/mod.rs` — async provider registry** (Step 9)
+
+- `compiled_providers()`: renamed from `providers()`, returns only compiled-in providers (sync).
+- `providers()`: new async function that returns compiled + discovered subprocess providers. Iterates `discover_providers()`, calls `SubprocessProvider::from_binary()` for each, warns and skips on failure.
+- All callers (`prompt::run`, `chat::run`, `models::run`) now `.await` the providers.
+- `models::run` became `async` to support the async provider discovery.
+
+**`llm-cli/src/commands/plugins.rs` — plugins command** (Step 10)
+
+- `llm plugins list`: shows compiled providers (with model lists), external providers (with binary paths and models), and external tools (with descriptions).
+- Added `Plugins` variant to `Commands` enum in `app.rs`.
+- Added `"plugins"` to `should_insert_prompt()` known subcommands in `main.rs`.
+
+**Integration test fixtures** (Step 11)
+
+- `tests/fixtures/bin/llm-tool-upper`: shell script implementing the tool protocol. `--schema` returns JSON, invocation reads stdin JSON, uppercases the `text` field via `python3`.
+- `tests/fixtures/bin/llm-provider-echo`: shell script implementing the provider protocol. `--id` → `"echo"`, `--models` → `[{"id":"echo-model",...}]`, `--needs-key` → `{"needed":false}`. Invocation echoes back prompt text in streaming or non-streaming format.
+
 ### What remains
 
-Remaining phases from `metaplan.md`:
+Remaining items from Phase 4 and beyond (`metaplan.md`):
 
-- **Phase 4 (v0.4):** Subprocess provider/tool protocol, Ollama provider, aliases, options, attachments, `--verbose`, shell completions.
+- **Phase 4 continued:** Ollama provider (as `llm-provider-ollama` subprocess binary or compiled-in crate), aliases, options passthrough, attachments (image/audio), `--verbose`, shell completions.
+- **Phase 5+:** MCP client protocol, embedding support, template system, fragment pipelines.
 
 ---
 
@@ -277,9 +345,9 @@ Clap does not natively support a default subcommand. We use argv rewriting in `m
 - `llm --help` -> unchanged (shows top-level help)
 - `llm keys list` -> unchanged (recognized subcommand)
 
-### Provider registry (Step 5 + 7)
+### Provider registry (Step 5 + 7, updated Phase 4)
 
-`commands/mod.rs::providers()` returns a `Vec<Box<dyn Provider>>` with all compiled-in providers. Each provider is behind a `#[cfg(feature)]` gate (e.g. `feature = "openai"`, `feature = "anthropic"`). Both features are default-on. The OpenAI provider reads `OPENAI_BASE_URL` env var, the Anthropic provider reads `ANTHROPIC_BASE_URL`, both defaulting to their production endpoints. This supports compatible APIs and test mocking (wiremock).
+`commands/mod.rs::compiled_providers()` returns compiled-in providers behind `#[cfg(feature)]` gates. The async `providers()` function combines these with subprocess providers discovered on PATH. The OpenAI provider reads `OPENAI_BASE_URL` env var, the Anthropic provider reads `ANTHROPIC_BASE_URL`, both defaulting to their production endpoints. Subprocess provider discovery failures are logged as warnings and skipped (graceful degradation).
 
 ### Exit code mapping (Step 5)
 
@@ -397,7 +465,7 @@ The Python virtualenv and maturin are managed via `uv` (`uv venv`, `uv run matur
 - **`llm-openai`** (42 tests): Inline modules. `wiremock::MockServer` for HTTP mocking (SSE streaming + non-streaming + error responses + tool calls + structured output). Tool calling tests use SSE cassettes with `delta.tool_calls` array chunks for streaming and `message.tool_calls` for non-streaming.
 - **`llm-anthropic`** (48 tests): Inline modules. Same pattern as `llm-openai`: serde round-trip tests for Anthropic-specific types (including `ContentBlock` with tool_use/tool_result fields, `ContentDelta` with `partial_json`), SSE parser tests, wiremock integration tests. Structured output tests verify `_schema_output` transparent wrapping: the response should contain `Chunk::Text` (not `ToolCallStart/Delta`) and `collect_tool_calls()` should return empty.
 - **`llm-store`** (49 tests): Inline modules. `tempfile::TempDir` for isolated filesystem state. JSONL round-trip tests, unicode handling, malformed-line recovery.
-- **`llm-cli`** (58 tests): 9 unit tests (tools registry, schemas) + 49 integration tests in `tests/integration.rs` using `assert_cmd` + `predicates`. Tests run the compiled binary as a subprocess, asserting on stdout/stderr/exit code. API-dependent tests use `wiremock` with `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` pointing to the local mock server. All tests use `LLM_USER_PATH` for filesystem isolation. Tool chain tests use wiremock sequential responses (`up_to_n_times(1)` for first response, default for subsequent).
+- **`llm-cli`** (103 tests): 45 unit tests (tools registry, schemas, subprocess module) + 58 integration tests in `tests/integration.rs` using `assert_cmd` + `predicates`. Tests run the compiled binary as a subprocess, asserting on stdout/stderr/exit code. API-dependent tests use `wiremock` with `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` pointing to the local mock server. All tests use `LLM_USER_PATH` for filesystem isolation. Tool chain tests use wiremock sequential responses (`up_to_n_times(1)` for first response, default for subsequent). Subprocess tests use shell script fixtures in `tests/fixtures/bin/` and `tempfile::TempDir` with `temp_env` for PATH isolation. Integration tests for subprocess extensibility prepend `tests/fixtures/bin/` to PATH via `env("PATH", path_with_fixtures())`.
 - TDD was used throughout: tests written before implementation in each cycle.
 
 ---
@@ -410,7 +478,7 @@ The Python virtualenv and maturin are managed via `uv` (`uv venv`, `uv run matur
 | `llm-openai` | `llm-core`, `reqwest` (stream + json), `futures`, `async-trait`; native: `tokio`; wasm32: `wasm-bindgen-futures` | `tokio`, `wiremock` |
 | `llm-anthropic` | `llm-core`, `reqwest` (stream + json), `futures`, `async-trait`; native: `tokio`; wasm32: `wasm-bindgen-futures` | `tokio`, `wiremock` |
 | `llm-store` | `llm-core`, `serde_json`, `ulid`, `chrono` | `tempfile` |
-| `llm-cli` | `llm-core`, `llm-openai` (optional), `llm-anthropic` (optional), `llm-store`, `clap`, `tokio`, `serde_json`, `futures`, `async-trait`, `tokio-stream`, `toml`, `ulid`, `chrono`, `rpassword` | `assert_cmd`, `predicates`, `wiremock`, `tempfile`, `temp-env` |
+| `llm-cli` | `llm-core`, `llm-openai` (optional), `llm-anthropic` (optional), `llm-store`, `clap`, `tokio`, `serde_json`, `futures`, `async-trait`, `async-stream`, `tokio-stream`, `toml`, `ulid`, `chrono`, `rpassword`, `rustyline` | `assert_cmd`, `predicates`, `wiremock`, `tempfile`, `temp-env` |
 | `llm-wasm` | `llm-core`, `llm-openai`, `llm-anthropic`, `wasm-bindgen`, `wasm-bindgen-futures`, `js-sys`, `futures` | --- |
 | `llm-python` | `llm-core`, `llm-openai`, `llm-anthropic`, `llm-store`, `pyo3`, `tokio`, `futures` | --- |
 
@@ -470,6 +538,44 @@ Steps 1, 2, 3 are independent and were implemented in parallel. Step 4 depends o
 | 7 | `llm-cli` | `llm chat` command with `rustyline` REPL, conversation accumulation, per-turn logging | 0 (interactive) |
 | 8 | `llm-cli`, `llm-store` | `llm logs path/status/on/off`, `ListOptions` with model filter and text search, `Config::save()` | 6 |
 | 9 | docs | Updated `metaplan.md` (swap Phase 3/4), `CLAUDE.md`, `implementation.md` | 0 |
+
+## Phase 4 build order
+
+Steps 1 and 2 are independent. Step 3 depends on 2. Step 4 depends on 1+3. Steps 5-6 depend on 4. Steps 7-8 depend on 2. Step 9 depends on 8. Step 10 depends on 2+3+7. Step 11 depends on all.
+
+In practice, steps 1-4 and 7-8 were implemented in a single pass (all new files created simultaneously), then steps 5-6 and 9-10 in a second pass (modifying existing CLI files), and step 11 as integration tests.
+
+| Step | Crate | What was built | Tests added |
+|------|-------|----------------|------------:|
+| 1 | `llm-cli` | `ProtocolChunk`, `ProviderRequest`, `ProviderResponse` with serde + `Chunk` conversion | 10 |
+| 2 | `llm-cli` | `scan_path()`, `discover_tools()`, `discover_providers()` | 6 |
+| 3 | `llm-cli` | `fetch_tool_schema()`, `fetch_all_tool_schemas()` | 4 |
+| 4 | `llm-cli` | `ExternalToolExecutor` implementing `ToolExecutor` | 5 |
+| 5 | `llm-cli` | `CliToolExecutor` composite (builtin + external), `tools list` shows external | 0 (existing tests cover) |
+| 6 | `llm-cli` | `-T` resolves external tools in `prompt.rs` and `chat.rs` | 0 (integration tests in step 11) |
+| 7 | `llm-cli` | `fetch_provider_id()`, `fetch_provider_models()`, `fetch_provider_key_info()` | 4 |
+| 8 | `llm-cli` | `SubprocessProvider` implementing `Provider` (streaming + non-streaming) | 7 |
+| 9 | `llm-cli` | Async `providers()` combining compiled + discovered providers | 0 (integration tests in step 11) |
+| 10 | `llm-cli` | `llm plugins list` command, `Commands::Plugins`, known subcommand registration | 0 (integration tests in step 11) |
+| 11 | `llm-cli` | E2E integration tests with fixture shell scripts | 9 |
+
+### Phase 4 learnings
+
+**Subprocess protocol design: arguments-only stdin, not full envelope.** The tool protocol sends only the `arguments` JSON to stdin (`{"text":"hello"}`), not the full `ToolCall` envelope. This makes tools simpler to implement — a shell script just reads JSON arguments without needing to parse a wrapper structure. The tool's name and ID are the CLI's concern, not the tool's.
+
+**`ProtocolChunk` is necessary because `Chunk` has no serde.** `Chunk` in `llm-core` is a plain enum without `Serialize`/`Deserialize` — intentionally, since it's an internal streaming type not meant for wire transmission. The subprocess protocol needs serializable chunks for JSONL, so `ProtocolChunk` is a parallel enum with serde derives and `From`/`Into` conversions. This avoids adding serde to the core `Chunk` type, which would be a cross-cutting concern affecting all crates.
+
+**`providers()` had to become async.** The original `providers()` was sync, returning compiled-in providers only. Subprocess provider discovery requires running `--id`, `--models`, `--needs-key` subprocesses, which are async operations (`tokio::process::Command`). Rather than using `block_on` in a sync function (which panics inside a tokio runtime), `providers()` was made async and all callers (`prompt::run`, `chat::run`, `models::run`) were updated to `.await` it. `models::run` also became async as a consequence.
+
+**`resolve_key()` fails for providers that don't need a key.** When a subprocess provider reports `needs_key: false`, `provider.needs_key()` returns `None`, which the existing code mapped to `""` via `.unwrap_or("")`. Then `resolve_key("", ...)` would fail because it couldn't find a key for empty string. The fix: skip `resolve_key()` entirely when the provider doesn't need a key and no `--key` flag was given. The key variable changed from `String` to `Option<String>`, and all provider calls use `key.as_deref()` instead of `Some(&key)`. This is the kind of edge case that never appeared in phases 1-3 because both compiled-in providers always require keys.
+
+**`ExternalToolExecutor` ownership across chat loop turns.** The chat REPL loop creates a `CliToolExecutor` each turn. Moving an `ExternalToolExecutor` into `CliToolExecutor::with_external()` transfers ownership, making it unavailable for the next turn. The fix: create the `CliToolExecutor` once before the loop and reuse it via `&executor` in `chain()`. This is cleaner anyway — the external tool set doesn't change during a chat session.
+
+**PATH scanning deduplication matters.** If the same `llm-tool-foo` binary appears in multiple PATH directories, `discover_tools()` should return only the first occurrence (matching Unix `which` semantics). A `HashSet<String>` tracks seen filenames. Without this, the same tool would appear multiple times in `tools list` and potentially run different versions depending on discovery order.
+
+**Shell script fixtures for integration testing.** Rather than writing Rust test binaries for external tools/providers, shell scripts in `tests/fixtures/bin/` implement the full protocol. This tests the actual subprocess boundary (spawn, stdin/stdout, exit codes) and validates that the protocol works with minimal, language-independent implementations. The scripts use `python3 -c` for JSON parsing — available on all CI machines and developer workstations.
+
+**`async-stream` crate for streaming subprocess output.** The streaming provider path reads stdout line-by-line and needs to yield `Chunk` items through a `Stream`. `async_stream::try_stream!` macro provides a clean way to write this as an async generator with `yield` syntax. The alternative — manual `Stream` implementation via `futures::stream::unfold` — would require explicit state management for the `BufReader` and `Child` process. The crate adds ~200 lines of proc-macro code and compiles in under a second.
 
 ### Phase 3 learnings
 

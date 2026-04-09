@@ -1,0 +1,28 @@
+#!/bin/sh
+if [ "$1" = "--id" ]; then
+    echo "echo"
+    exit 0
+fi
+
+if [ "$1" = "--models" ]; then
+    echo '[{"id":"echo-model","can_stream":true,"supports_tools":false,"supports_schema":false,"attachment_types":[]}]'
+    exit 0
+fi
+
+if [ "$1" = "--needs-key" ]; then
+    echo '{"needed":false}'
+    exit 0
+fi
+
+# Invocation: read request from stdin, echo back the prompt text
+read request
+text=$(echo "$request" | python3 -c "import sys,json; print(json.load(sys.stdin)['prompt']['text'])")
+stream=$(echo "$request" | python3 -c "import sys,json; print(json.load(sys.stdin)['stream'])")
+
+if [ "$stream" = "True" ]; then
+    echo "{\"type\":\"text\",\"content\":\"echo: $text\"}"
+    echo "{\"type\":\"usage\",\"input\":5,\"output\":10}"
+    echo "{\"type\":\"done\"}"
+else
+    echo "{\"text\":\"echo: $text\",\"tool_calls\":[],\"usage\":{\"input\":5,\"output\":10}}"
+fi

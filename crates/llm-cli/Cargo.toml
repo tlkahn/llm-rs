@@ -24,6 +24,7 @@ ulid = { workspace = true }
 chrono = { workspace = true }
 rpassword = "7"
 rustyline = "15"
+async-stream = "0.3"
 
 [dev-dependencies]
 assert_cmd = "2"
