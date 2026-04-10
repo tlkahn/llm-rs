@@ -454,7 +454,7 @@ Key design choices vs the Python original:
 - **Feature-gated providers.** Compile only the providers you need: `--features openai,anthropic` (both default), or `--no-default-features` for a minimal binary.
 - **Multi-target.** Core crates compile for both native and `wasm32-unknown-unknown`. The same provider code runs in the CLI, in a browser, and in a Python module.
 
-See [`doc/metaplan.md`](doc/metaplan.md) for the full design rationale and phased roadmap.
+See [`doc/design/architecture.md`](doc/design/architecture.md) for design rationale, [`doc/roadmap.md`](doc/roadmap.md) for the phased roadmap.
 
 ## Testing
 

@@ -2,7 +2,7 @@
 
 ## Project
 
-LLM-RS: Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) (v0.30). CLI tool for interacting with LLMs via a unified interface. See `doc/metaplan.md` for full architecture, `doc/implementation.md` for build history and decisions.
+LLM-RS: Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) (v0.30). CLI tool for interacting with LLMs via a unified interface. See `doc/roadmap.md` for status and roadmap, `doc/design/architecture.md` for design rationale, `doc/implementation.md` for build history and decisions.
 
 ## Commands
 
@@ -120,7 +120,7 @@ Phase 4 subprocess extensibility complete --- External tool protocol (`llm-tool-
 
 Phase 4 verbose observability complete --- `-v`/`--verbose` flag (count) on `prompt` and `chat` commands. `ChainEvent` enum in llm-core with `IterationStart`/`IterationEnd` variants. `chain()` accepts optional `on_event` callback. `-v` shows iteration summary (number, message count, role summary, per-iteration usage, tool call count). `-vv` additionally dumps full message JSON per iteration. `--verbose` implies `--tools-debug`. `format_chain_event()` and `format_message_summary()` in `prompt.rs`, shared by `chat.rs`.
 
-Next: Phase 4 continued (Ollama provider via subprocess, aliases, options, attachments, config resolution tracing). See `doc/metaplan.md` for the full roadmap.
+Next: Phase 4 continued (Ollama provider via subprocess, aliases, options, attachments, config resolution tracing). See `doc/roadmap.md` for the full roadmap.
 
 ## Conventions
 

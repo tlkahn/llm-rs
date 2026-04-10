@@ -1,0 +1,77 @@
+# LLM-RS Roadmap
+
+Living roadmap and planning document for LLM-RS development.
+
+**Related docs:**
+- [Development Process](process.md) --- the plan-build-close cycle
+- [Architecture & Design](design/architecture.md) --- philosophy, crate structure, design decisions
+- [External Tool Protocol](spec/external-tools.md) --- `llm-tool-*` spec
+- [External Provider Protocol](spec/external-providers.md) --- `llm-provider-*` spec
+- [Implementation Notes](implementation.md) --- pitfall journal, gotchas, workarounds
+- [CLAUDE.md](../CLAUDE.md) --- implementation reference (types, APIs, conventions)
+
+---
+
+## Scope
+
+Unix-philosophy agentic CLI for LLMs, inspired by [simonw/llm](https://github.com/simonw/llm). Core prompting, conversations, tool calling with chain loops, structured output, subprocess-based extensibility, JSONL file logging, multi-provider. Embeddings, templates, and fragments deferred to future work.
+
+---
+
+## Phase Status
+
+| Phase | Version | Status | Summary |
+|-------|---------|--------|---------|
+| 1 --- Core Loop | v0.1 | Complete | `echo "Hello" \| llm` end-to-end, streaming, logging, OpenAI + Anthropic, WASM + Python |
+| 2 --- Tools & Structured Output | v0.2 | Complete | Tool calling (both providers), chain loop, built-in tools, schema DSL, `--schema`/`--schema-multi` |
+| 3 --- Conversations & Multi-turn | v0.3 | Complete | `Message`/`Role` types, `-c`/`--cid`, `llm chat` REPL, full `llm logs` feature set |
+| 4 --- Extensibility & More | v0.4 | Partial | Subprocess tools + providers, `llm plugins`, `--verbose` observability |
+
+---
+
+## Phase 4 --- Detail
+
+### Done
+
+- [x] `llm-tool-*` subprocess tool protocol (discovery, invocation, `ExternalToolExecutor`)
+- [x] `llm-provider-*` subprocess provider protocol (discovery, execution, `SubprocessProvider`)
+- [x] `llm plugins list` command (compiled + discovered providers/tools)
+- [x] `-v/--verbose` flag with `ChainEvent` observability (`-v` summary, `-vv` full messages)
+- [x] `--verbose` implies `--tools-debug`
+
+### Remaining
+
+- [ ] `[must]` `-o/--option`, `llm options set/get/list/clear`
+- [ ] `[must]` `llm aliases set/list/remove/path`
+- [ ] `[should]` Ollama provider (via subprocess or compiled `llm-ollama` crate)
+- [ ] `[should]` `-a/--attachment`, `--at/--attachment-type`
+- [ ] `[could]` `-x/--extract`, `--xl/--extract-last` (code block extraction)
+- [ ] `[could]` Shell completions (`clap_complete`)
+
+---
+
+## Future Work
+
+Beyond Phase 4, no fixed ordering yet:
+
+- Ollama as compiled provider (`llm-ollama` crate) if subprocess approach proves insufficient
+- Embeddings support
+- Templates and fragments
+- `--async` flag for background/scripting use
+- Config resolution tracing (`--verbose` showing key/model/alias resolution steps)
+
+---
+
+## Iteration Strategy
+
+Each phase is a vertical slice delivering a usable tool. Within each phase, work bottom-up through the crate layers using TDD (red-green-refactor). The phase boundary is where you dogfood the result before planning the next.
+
+All work follows strict TDD: write failing tests first, implement until they pass, refactor. All existing tests must stay green at every step. `cargo test --workspace` and `cargo clippy --workspace` gate each commit.
+
+---
+
+## Parked
+
+Items explicitly set aside. Not planned for current or next phases.
+
+- `llm import --from-sqlite` --- low demand; users can convert with `jq` scripts if needed

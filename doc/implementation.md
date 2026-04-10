@@ -1,6 +1,6 @@
 # Implementation Notes
 
-Status snapshot of what has been built, what remains, and key decisions made along the way. Complements the design-level `metaplan.md`.
+Status snapshot of what has been built, what remains, and key decisions made along the way. Complements [`roadmap.md`](roadmap.md) (planning) and [`design/architecture.md`](design/architecture.md) (rationale).
 
 ---
 
@@ -259,7 +259,7 @@ Total: 369 tests (workspace crates), all passing. `llm-wasm` and `llm-python` ar
 
 ### What remains
 
-Remaining items from Phase 4 and beyond (`metaplan.md`):
+Remaining items from Phase 4 and beyond (`roadmap.md`):
 
 - **Phase 4 continued:** Ollama provider (as `llm-provider-ollama` subprocess binary or compiled-in crate), aliases, options passthrough, attachments (image/audio), shell completions, config resolution tracing (extending `--verbose` beyond chain scope).
 - **Phase 5+:** MCP client protocol, embedding support, template system, fragment pipelines.
@@ -357,7 +357,7 @@ Clap does not natively support a default subcommand. We use argv rewriting in `m
 | `Model`, `NeedsKey`, `Config` | 2 | Configuration error |
 | `Provider` | 3 | Network/API error |
 
-Matches the design in `metaplan.md`. Errors print to stderr before exiting.
+Matches the design in `design/architecture.md`. Errors print to stderr before exiting.
 
 ### Interactive key input (Step 5)
 
@@ -537,7 +537,7 @@ Steps 1, 2, 3 are independent and were implemented in parallel. Step 4 depends o
 | 6 | `llm-cli` | `--messages` flag (file or stdin), `--json` output envelope, `skip_stdin` for `--messages -` | 3 |
 | 7 | `llm-cli` | `llm chat` command with `rustyline` REPL, conversation accumulation, per-turn logging | 0 (interactive) |
 | 8 | `llm-cli`, `llm-store` | `llm logs path/status/on/off`, `ListOptions` with model filter and text search, `Config::save()` | 6 |
-| 9 | docs | Updated `metaplan.md` (swap Phase 3/4), `CLAUDE.md`, `implementation.md` | 0 |
+| 9 | docs | Updated `roadmap.md` (swap Phase 3/4), `CLAUDE.md`, `implementation.md` | 0 |
 
 ## Phase 4 build order
 
