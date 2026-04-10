@@ -41,12 +41,8 @@ Unix-philosophy agentic CLI for LLMs, inspired by [simonw/llm](https://github.co
 
 ### Remaining
 
-- [ ] `[must]` `-o/--option`, `llm options set/get/list/clear`
+- [x] `[must]` `-o/--option`, `llm options set/get/list/clear`
 - [ ] `[must]` `llm aliases set/list/remove/path`
-- [ ] `[should]` Ollama provider (via subprocess or compiled `llm-ollama` crate)
-- [ ] `[should]` `-a/--attachment`, `--at/--attachment-type`
-- [ ] `[could]` `-x/--extract`, `--xl/--extract-last` (code block extraction)
-- [ ] `[could]` Shell completions (`clap_complete`)
 
 ---
 
@@ -54,7 +50,10 @@ Unix-philosophy agentic CLI for LLMs, inspired by [simonw/llm](https://github.co
 
 Beyond Phase 4, no fixed ordering yet:
 
-- Ollama as compiled provider (`llm-ollama` crate) if subprocess approach proves insufficient
+- Ollama provider (via subprocess or compiled `llm-ollama` crate)
+- `-a/--attachment`, `--at/--attachment-type`
+- `-x/--extract`, `--xl/--extract-last` (code block extraction)
+- Shell completions (`clap_complete`)
 - Embeddings support
 - Templates and fragments
 - `--async` flag for background/scripting use

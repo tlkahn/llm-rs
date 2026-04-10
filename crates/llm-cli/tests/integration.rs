@@ -4,7 +4,7 @@ use std::path::Path;
 use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
-use wiremock::matchers::{method, path as match_path};
+use wiremock::matchers::{body_string_contains, method, path as match_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn llm() -> Command {
@@ -1817,4 +1817,259 @@ fn verbose_flag_parsing() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--verbose"));
+}
+
+// ==========================================================================
+// Options subcommand
+// ==========================================================================
+
+#[test]
+fn options_set_and_get() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["options", "set", "gpt-4o-mini", "temperature", "0.7"])
+        .assert()
+        .success();
+
+    llm_with_dir(&dir)
+        .args(["options", "get", "gpt-4o-mini", "temperature"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("temperature: 0.7"));
+}
+
+#[test]
+fn options_set_overwrites() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["options", "set", "gpt-4o-mini", "temperature", "0.5"])
+        .assert()
+        .success();
+    llm_with_dir(&dir)
+        .args(["options", "set", "gpt-4o-mini", "temperature", "0.9"])
+        .assert()
+        .success();
+
+    llm_with_dir(&dir)
+        .args(["options", "get", "gpt-4o-mini", "temperature"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("temperature: 0.9"));
+}
+
+#[test]
+fn options_get_missing() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["options", "get", "gpt-4o-mini", "temperature"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no option"));
+}
+
+#[test]
+fn options_get_all() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["options", "set", "gpt-4o-mini", "temperature", "0.7"])
+        .assert()
+        .success();
+    llm_with_dir(&dir)
+        .args(["options", "set", "gpt-4o-mini", "max_tokens", "200"])
+        .assert()
+        .success();
+
+    llm_with_dir(&dir)
+        .args(["options", "get", "gpt-4o-mini"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("temperature: 0.7"))
+        .stdout(predicate::str::contains("max_tokens: 200"));
+}
+
+#[test]
+fn options_list() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["options", "set", "gpt-4o-mini", "temperature", "0.7"])
+        .assert()
+        .success();
+
+    llm_with_dir(&dir)
+        .args(["options", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("gpt-4o-mini:"))
+        .stdout(predicate::str::contains("temperature: 0.7"));
+}
+
+#[test]
+fn options_list_empty() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["options", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No options set"));
+}
+
+#[test]
+fn options_clear_key() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["options", "set", "gpt-4o-mini", "temperature", "0.7"])
+        .assert()
+        .success();
+
+    llm_with_dir(&dir)
+        .args(["options", "clear", "gpt-4o-mini", "temperature"])
+        .assert()
+        .success();
+
+    llm_with_dir(&dir)
+        .args(["options", "get", "gpt-4o-mini"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No options set"));
+}
+
+#[test]
+fn options_clear_all() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["options", "set", "gpt-4o-mini", "temperature", "0.7"])
+        .assert()
+        .success();
+    llm_with_dir(&dir)
+        .args(["options", "set", "gpt-4o-mini", "max_tokens", "200"])
+        .assert()
+        .success();
+
+    llm_with_dir(&dir)
+        .args(["options", "clear", "gpt-4o-mini"])
+        .assert()
+        .success();
+
+    llm_with_dir(&dir)
+        .args(["options", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No options set"));
+}
+
+#[test]
+fn options_clear_missing() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["options", "clear", "gpt-4o-mini", "temperature"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no option"));
+}
+
+#[tokio::test]
+async fn prompt_with_option_flag() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .and(body_string_contains("\"temperature\":0.7"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_non_streaming_body("temp response")),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args([
+            "prompt", "--no-stream", "-n",
+            "-o", "temperature", "0.7",
+            "hello",
+        ])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("temp response"));
+}
+
+#[tokio::test]
+async fn prompt_config_options_applied() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    // Write config with options for gpt-4o-mini
+    fs::write(
+        dir.path().join("config.toml"),
+        "[options.gpt-4o-mini]\ntemperature = 0.3\n",
+    )
+    .unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .and(body_string_contains("\"temperature\":0.3"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_non_streaming_body("config response")),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args(["prompt", "--no-stream", "-n", "hello"])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("config response"));
+}
+
+#[tokio::test]
+async fn prompt_cli_overrides_config() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    // Config sets temperature=0.3
+    fs::write(
+        dir.path().join("config.toml"),
+        "[options.gpt-4o-mini]\ntemperature = 0.3\n",
+    )
+    .unwrap();
+
+    // CLI -o temperature 1.0 should override
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .and(body_string_contains("\"temperature\":1.0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_non_streaming_body("override response")),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args([
+            "prompt", "--no-stream", "-n",
+            "-o", "temperature", "1.0",
+            "hello",
+        ])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("override response"));
+}
+
+#[test]
+fn help_shows_options_subcommand() {
+    llm()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("options"));
 }

@@ -7,12 +7,12 @@ LLM-RS: Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) (v0
 ## Commands
 
 ```bash
-cargo test --workspace           # Run all 369 tests
-cargo test -p llm-core           # Core types/traits/config/schema/chain/messages (123 tests)
+cargo test --workspace           # Run all 402 tests
+cargo test -p llm-core           # Core types/traits/config/schema/chain/messages (138 tests)
 cargo test -p llm-openai         # OpenAI provider (42 tests)
 cargo test -p llm-anthropic      # Anthropic provider (48 tests)
 cargo test -p llm-store          # JSONL storage (49 tests)
-cargo test -p llm-cli            # CLI unit (45) + integration (62) tests
+cargo test -p llm-cli            # CLI unit (50) + integration (75) tests
 cargo clippy --workspace         # Lint
 cargo build --release -p llm-cli # Build optimized binary
 
@@ -58,7 +58,8 @@ Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry poi
 ### Config system (llm-core/config.rs)
 
 - **`Paths`**: XDG path resolution. `LLM_USER_PATH` -> flat layout; else `$XDG_CONFIG_HOME/llm` + `$XDG_DATA_HOME/llm` with `~/.config` / `~/.local/share` fallbacks.
-- **`Config`**: TOML config (`config.toml`). Fields: `default_model` (default: `"gpt-4o-mini"`), `logging` (default: `true`), `aliases`, `options`, `providers`. All `#[serde(default)]`. `effective_default_model()` checks `LLM_DEFAULT_MODEL` env var. `resolve_model()` resolves aliases.
+- **`Config`**: TOML config (`config.toml`). Fields: `default_model` (default: `"gpt-4o-mini"`), `logging` (default: `true`), `aliases`, `options`, `providers`. All `#[serde(default)]`. `effective_default_model()` checks `LLM_DEFAULT_MODEL` env var. `resolve_model()` resolves aliases. `model_options(model)` returns options HashMap. `set_option(model, key, value)`, `clear_option(model, key)`, `clear_model_options(model)` for CRUD.
+- **`parse_option_value(s)`**: smart coercion of string to JSON value (int, float, bool, null, fallback string).
 - **`KeyStore`**: TOML key storage (`keys.toml`). `load/get/set/list/path`. `set()` writes 0o600 on Unix, creates parent dirs.
 - **`resolve_key()`**: 4-level chain: explicit `--key` -> `keys.toml` -> env var -> `NeedsKey` error.
 
@@ -83,8 +84,8 @@ Binary name: `llm`. Built with `clap` derive macros.
 **Provider registry:** `commands/mod.rs::providers()` returns `Vec<Box<dyn Provider>>` with `#[cfg(feature)]`-gated providers. `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` env vars override API endpoints. Both `openai` and `anthropic` features are default-on.
 
 **Commands:**
-- `llm prompt <text>` --- flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-T/--tool`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--schema`, `--schema-multi`, `-c/--continue`, `--cid`, `--messages`, `--json`, `-v/--verbose` (count: `-v` summary, `-vv` full messages)
-- `llm chat` --- interactive REPL with `rustyline`. Flags: `-m`, `-s`, `-T/--tool`, `--chain-limit`, `-v/--verbose`
+- `llm prompt <text>` --- flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-o/--option`, `-T/--tool`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--schema`, `--schema-multi`, `-c/--continue`, `--cid`, `--messages`, `--json`, `-v/--verbose` (count: `-v` summary, `-vv` full messages)
+- `llm chat` --- interactive REPL with `rustyline`. Flags: `-m`, `-s`, `-o/--option`, `-T/--tool`, `--chain-limit`, `-v/--verbose`
 - `llm keys set/get/list/path` --- `set` uses rpassword for hidden terminal input
 - `llm models list` / `llm models default [model]`
 - `llm logs list [--json] [-r] [-n count] [-m model] [-q query] [-u]` / `llm logs path` / `llm logs status` / `llm logs on` / `llm logs off`
@@ -92,6 +93,7 @@ Binary name: `llm`. Built with `clap` derive macros.
 - `llm schemas dsl <input>` --- parse DSL to JSON Schema
 - `llm schemas list` --- scan logs for used schemas
 - `llm schemas show <id>` --- show schema by ID
+- `llm options set/get/list/clear` --- manage per-model options in config.toml
 - `llm plugins list` --- show compiled providers, external providers, and external tools
 
 **Exit codes:** 0 success, 1 runtime, 2 config/key/model, 3 provider/network.
@@ -120,7 +122,9 @@ Phase 4 subprocess extensibility complete --- External tool protocol (`llm-tool-
 
 Phase 4 verbose observability complete --- `-v`/`--verbose` flag (count) on `prompt` and `chat` commands. `ChainEvent` enum in llm-core with `IterationStart`/`IterationEnd` variants. `chain()` accepts optional `on_event` callback. `-v` shows iteration summary (number, message count, role summary, per-iteration usage, tool call count). `-vv` additionally dumps full message JSON per iteration. `--verbose` implies `--tools-debug`. `format_chain_event()` and `format_message_summary()` in `prompt.rs`, shared by `chat.rs`.
 
-Next: Phase 4 continued (Ollama provider via subprocess, aliases, options, attachments, config resolution tracing). See `doc/roadmap.md` for the full roadmap.
+Phase 4 model options complete --- `-o/--option` flag on `prompt` and `chat` commands (repeatable: `-o temperature 0.7 -o max_tokens 200`). `parse_option_value()` for smart string-to-JSON coercion. `Config.model_options/set_option/clear_option/clear_model_options` methods. `build_options()` merges config defaults with CLI overrides (CLI wins). `llm options set/get/list/clear` subcommands for persistent per-model options in `config.toml`. Options flow through to provider request bodies via `Prompt.options`.
+
+Next: Phase 4 continued (aliases). See `doc/roadmap.md` for the full roadmap.
 
 ## Conventions
 

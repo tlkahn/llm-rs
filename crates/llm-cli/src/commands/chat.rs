@@ -29,6 +29,10 @@ pub struct ChatArgs {
     #[arg(long, default_value = "5")]
     pub chain_limit: usize,
 
+    /// Set a model option (repeatable): -o temperature 0.7
+    #[arg(short = 'o', long = "option", num_args = 2, value_names = ["KEY", "VALUE"], action = ArgAction::Append)]
+    pub option: Vec<String>,
+
     /// Verbose chain loop output (-v summary, -vv full messages). Implies --tools-debug.
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
@@ -43,6 +47,9 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
     let effective_default = config.effective_default_model();
     let model_input = args.model.as_deref().unwrap_or(&effective_default);
     let model_id = config.resolve_model(model_input).to_string();
+
+    // Build options (config defaults + CLI -o overrides)
+    let options = super::build_options(&config, &model_id, &args.option);
 
     // Find the provider for this model
     let all_providers = providers().await;
@@ -142,6 +149,9 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
         if let Some(system) = &args.system {
             prompt = prompt.with_system(system);
         }
+        for (k, v) in &options {
+            prompt = prompt.with_option(k, v.clone());
+        }
         if !tools.is_empty() {
             prompt = prompt.with_tools(tools.clone());
         }
@@ -228,7 +238,7 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
                 prompt: input.clone(),
                 system: args.system.clone(),
                 response: response_text,
-                options: Default::default(),
+                options: options.clone(),
                 usage: collect_usage(&chunks),
                 tool_calls: assistant_tool_calls,
                 tool_results: chain_tool_results,

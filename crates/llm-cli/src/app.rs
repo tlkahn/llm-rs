@@ -45,4 +45,9 @@ pub enum Commands {
         #[command(subcommand)]
         command: commands::plugins::PluginsCommand,
     },
+    /// Manage model options
+    Options {
+        #[command(subcommand)]
+        command: commands::options::OptionsCommand,
+    },
 }

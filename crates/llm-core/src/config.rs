@@ -155,6 +155,67 @@ impl Config {
         std::fs::write(path, content)?;
         Ok(())
     }
+
+    /// Returns a clone of all options for a given model (empty if none set).
+    pub fn model_options(&self, model: &str) -> HashMap<String, serde_json::Value> {
+        self.options.get(model).cloned().unwrap_or_default()
+    }
+
+    /// Set a single option for a model.
+    pub fn set_option(&mut self, model: &str, key: &str, value: serde_json::Value) {
+        self.options
+            .entry(model.to_string())
+            .or_default()
+            .insert(key.to_string(), value);
+    }
+
+    /// Clear a single option for a model. Returns `true` if the key existed.
+    /// Removes the model entry entirely if no options remain.
+    pub fn clear_option(&mut self, model: &str, key: &str) -> bool {
+        if let Some(model_opts) = self.options.get_mut(model) {
+            let removed = model_opts.remove(key).is_some();
+            if model_opts.is_empty() {
+                self.options.remove(model);
+            }
+            removed
+        } else {
+            false
+        }
+    }
+
+    /// Clear all options for a model. Returns `true` if the model had options.
+    pub fn clear_model_options(&mut self, model: &str) -> bool {
+        self.options.remove(model).is_some()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// parse_option_value
+// ---------------------------------------------------------------------------
+
+/// Smart-coerce a string into a JSON value.
+///
+/// Tries, in order: integer, float, bool (`true`/`false`), `null`, fallback to string.
+pub fn parse_option_value(s: &str) -> serde_json::Value {
+    // Integer (no decimal point)
+    if let Ok(n) = s.parse::<i64>() {
+        return serde_json::Value::Number(n.into());
+    }
+    // Float
+    if let Ok(f) = s.parse::<f64>() {
+        if let Some(n) = serde_json::Number::from_f64(f) {
+            return serde_json::Value::Number(n);
+        }
+    }
+    // Bool
+    match s {
+        "true" => return serde_json::Value::Bool(true),
+        "false" => return serde_json::Value::Bool(false),
+        "null" => return serde_json::Value::Null,
+        _ => {}
+    }
+    // Fallback: string
+    serde_json::Value::String(s.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -675,5 +736,136 @@ temperature = 0.7
         let msg = err.to_string();
         assert!(msg.contains("llm keys set openai"), "msg: {msg}");
         assert!(!msg.contains("environment variable"), "msg: {msg}");
+    }
+
+    // --- parse_option_value ---
+
+    #[test]
+    fn parse_option_value_int() {
+        assert_eq!(parse_option_value("42"), serde_json::json!(42));
+        assert_eq!(parse_option_value("-1"), serde_json::json!(-1));
+        assert_eq!(parse_option_value("0"), serde_json::json!(0));
+    }
+
+    #[test]
+    fn parse_option_value_float() {
+        assert_eq!(parse_option_value("0.7"), serde_json::json!(0.7));
+        assert_eq!(parse_option_value("1.5"), serde_json::json!(1.5));
+    }
+
+    #[test]
+    fn parse_option_value_bool() {
+        assert_eq!(parse_option_value("true"), serde_json::json!(true));
+        assert_eq!(parse_option_value("false"), serde_json::json!(false));
+    }
+
+    #[test]
+    fn parse_option_value_null() {
+        assert_eq!(parse_option_value("null"), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn parse_option_value_string_fallback() {
+        assert_eq!(parse_option_value("hello"), serde_json::json!("hello"));
+        assert_eq!(parse_option_value("gpt-4o"), serde_json::json!("gpt-4o"));
+        // "True" (capitalized) is not bool
+        assert_eq!(parse_option_value("True"), serde_json::json!("True"));
+    }
+
+    #[test]
+    fn parse_option_value_edge_cases() {
+        // Large integer
+        assert_eq!(parse_option_value("4096"), serde_json::json!(4096));
+        // Negative float
+        assert_eq!(parse_option_value("-0.5"), serde_json::json!(-0.5));
+        // Empty string
+        assert_eq!(parse_option_value(""), serde_json::json!(""));
+    }
+
+    // --- Config model_options / set_option / clear ---
+
+    #[test]
+    fn config_model_options_empty() {
+        let config = Config::default();
+        assert!(config.model_options("gpt-4o").is_empty());
+    }
+
+    #[test]
+    fn config_set_and_get_option() {
+        let mut config = Config::default();
+        config.set_option("gpt-4o", "temperature", serde_json::json!(0.7));
+        config.set_option("gpt-4o", "max_tokens", serde_json::json!(200));
+
+        let opts = config.model_options("gpt-4o");
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts["temperature"], serde_json::json!(0.7));
+        assert_eq!(opts["max_tokens"], serde_json::json!(200));
+    }
+
+    #[test]
+    fn config_set_option_overwrite() {
+        let mut config = Config::default();
+        config.set_option("gpt-4o", "temperature", serde_json::json!(0.5));
+        config.set_option("gpt-4o", "temperature", serde_json::json!(0.9));
+        assert_eq!(config.model_options("gpt-4o")["temperature"], serde_json::json!(0.9));
+    }
+
+    #[test]
+    fn config_clear_option_single() {
+        let mut config = Config::default();
+        config.set_option("gpt-4o", "temperature", serde_json::json!(0.7));
+        config.set_option("gpt-4o", "max_tokens", serde_json::json!(200));
+
+        assert!(config.clear_option("gpt-4o", "temperature"));
+        let opts = config.model_options("gpt-4o");
+        assert_eq!(opts.len(), 1);
+        assert!(!opts.contains_key("temperature"));
+    }
+
+    #[test]
+    fn config_clear_option_removes_empty_model() {
+        let mut config = Config::default();
+        config.set_option("gpt-4o", "temperature", serde_json::json!(0.7));
+
+        assert!(config.clear_option("gpt-4o", "temperature"));
+        assert!(!config.options.contains_key("gpt-4o"));
+    }
+
+    #[test]
+    fn config_clear_option_missing() {
+        let mut config = Config::default();
+        assert!(!config.clear_option("gpt-4o", "temperature"));
+    }
+
+    #[test]
+    fn config_clear_model_options() {
+        let mut config = Config::default();
+        config.set_option("gpt-4o", "temperature", serde_json::json!(0.7));
+        config.set_option("gpt-4o", "max_tokens", serde_json::json!(200));
+
+        assert!(config.clear_model_options("gpt-4o"));
+        assert!(config.model_options("gpt-4o").is_empty());
+        assert!(!config.options.contains_key("gpt-4o"));
+    }
+
+    #[test]
+    fn config_clear_model_options_missing() {
+        let mut config = Config::default();
+        assert!(!config.clear_model_options("gpt-4o"));
+    }
+
+    #[test]
+    fn config_options_save_and_load_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        let mut config = Config::default();
+        config.set_option("gpt-4o", "temperature", serde_json::json!(0.7));
+        config.set_option("gpt-4o", "max_tokens", serde_json::json!(200));
+        config.save(&path).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.model_options("gpt-4o")["temperature"], serde_json::json!(0.7));
+        assert_eq!(loaded.model_options("gpt-4o")["max_tokens"], serde_json::json!(200));
     }
 }

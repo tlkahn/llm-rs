@@ -8,7 +8,7 @@ pub mod types;
 
 // Re-export key types at crate root for convenience
 pub use chain::{ChainEvent, ChainResult, ToolExecutor, chain};
-pub use config::{Config, KeyStore, Paths, resolve_key};
+pub use config::{Config, KeyStore, Paths, parse_option_value, resolve_key};
 pub use error::{LlmError, Result};
 pub use provider::Provider;
 pub use schema::{multi_schema, parse_schema_dsl};
