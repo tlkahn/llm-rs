@@ -27,20 +27,37 @@ Three stages per phase, each with clear inputs and outputs.
 
 **Input:** Previous phase complete, roadmap.md current.
 
-**Activities:**
-- Review roadmap.md Remaining items. Decide scope for the next phase.
-- Triage items with priority labels: `[must]` (phase fails without it), `[should]` (expected but deferrable), `[could]` (nice-to-have). Order within each tier matters.
+Planning has three steps: intake review, triage, and commitment.
+
+### 1a. Intake review
+
+The Future Work section in roadmap.md is the intake buffer --- new ideas, discovered needs, and carry-over items land here unsorted throughout the cycle. During Plan, review everything in Future Work plus any incomplete items from the previous phase.
+
+New items can be added to Future Work at any time (during build, between sessions, from external input). No labels needed at intake --- just capture the item so it isn't lost.
+
+### 1b. Triage
+
+Pull candidate items from Future Work into the phase's Remaining list and assign priority labels:
+
+- `[must]` --- phase fails without it. These define "done" for the phase.
+- `[should]` --- expected but deferrable. Will ship if time permits.
+- `[could]` --- nice-to-have. First to be cut.
+
+Order within each tier matters --- first item = highest priority within that tier.
+
+### 1c. Commitment
+
+- Agree on the phase goal --- one sentence describing the vertical slice this phase delivers.
 - For design questions, discuss and record decisions in `doc/design/architecture.md`.
 - For new specs (protocols, wire formats), write them in `doc/spec/` before implementing.
-- Agree on the phase goal --- one sentence describing the vertical slice this phase delivers.
 
 **Output:** roadmap.md updated with the phase's scope and prioritized items. Shared understanding of what "done" means.
 
 **Rules:**
 - A phase is a usable vertical slice, not a horizontal layer. It should be dogfood-able.
 - Keep phase scope to what fits in a single version tag. If it feels too big, split it.
-- All `[must]` items must be complete to tag the phase version. `[should]` and `[could]` items that don't make it roll to the next phase or to Future Work.
-- Items not planned for this phase go to Future Work or Parked with a reason.
+- All `[must]` items must be complete to tag the phase version. `[should]` and `[could]` items that don't make it roll back to Future Work or forward to the next phase.
+- Items explicitly not wanted go to Parked with a reason.
 
 ---
 
@@ -60,7 +77,7 @@ Three stages per phase, each with clear inputs and outputs.
 
 **Rules:**
 - One concern per commit. Commit messages explain *why*, not *what*.
-- Lightweight roadmap updates are fine during build: parking items, adding newly discovered items, adjusting priority labels. Don't restructure or do the full hygiene pass mid-phase.
+- Lightweight roadmap updates are fine during build: parking items, adjusting priority labels, adding newly discovered items to Future Work (intake). Don't triage or restructure mid-phase.
 - If scope changes mid-phase (item harder than expected, new insight), discuss before adjusting.
 
 ---
@@ -81,7 +98,7 @@ git tag vN.x <commit>
 
 | Doc | Action |
 |-----|--------|
-| `doc/roadmap.md` | Update phase status table. Promote Remaining to Done. Move incomplete `[should]`/`[could]` items to next phase or Future Work. Trim completed phase detail. |
+| `doc/roadmap.md` | Update phase status table. Promote Remaining to Done. Move incomplete `[should]`/`[could]` items back to Future Work (they'll be re-triaged in the next Plan). Trim completed phase detail. |
 | `CLAUDE.md` | Audit against actual code (see [audit checklist](#claude-md-audit-checklist) below). |
 | `doc/design/architecture.md` | Add any new design decisions made during the phase. |
 | `doc/implementation.md` | Preserve gotchas and workarounds. Trim build-log narrative that git history already covers. |
