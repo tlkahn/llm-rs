@@ -9,6 +9,30 @@ pub struct Usage {
     pub details: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+impl Usage {
+    /// Combine two `Usage` values by summing their fields.
+    #[must_use]
+    pub fn add(&self, other: &Usage) -> Usage {
+        Usage {
+            input: match (self.input, other.input) {
+                (Some(a), Some(b)) => Some(a + b),
+                (a, b) => a.or(b),
+            },
+            output: match (self.output, other.output) {
+                (Some(a), Some(b)) => Some(a + b),
+                (a, b) => a.or(b),
+            },
+            details: None,
+        }
+    }
+
+    /// Total tokens (input + output), treating None as 0.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.input.unwrap_or(0) + self.output.unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelInfo {
     pub id: String,
@@ -724,5 +748,44 @@ mod tests {
         let prompt = Prompt::new("Hello");
         let json = serde_json::to_value(&prompt).unwrap();
         assert!(json.get("messages").is_none());
+    }
+
+    // --- Usage::add() / Usage::total() tests ---
+
+    #[test]
+    fn usage_add_both_some() {
+        let a = Usage { input: Some(10), output: Some(5), details: None };
+        let b = Usage { input: Some(20), output: Some(10), details: None };
+        let result = a.add(&b);
+        assert_eq!(result.input, Some(30));
+        assert_eq!(result.output, Some(15));
+        assert!(result.details.is_none());
+    }
+
+    #[test]
+    fn usage_add_one_none() {
+        let a = Usage { input: Some(10), output: None, details: None };
+        let b = Usage { input: None, output: Some(5), details: None };
+        let result = a.add(&b);
+        assert_eq!(result.input, Some(10));
+        assert_eq!(result.output, Some(5));
+    }
+
+    #[test]
+    fn usage_add_both_none() {
+        let a = Usage::default();
+        let b = Usage::default();
+        let result = a.add(&b);
+        assert_eq!(result.input, None);
+        assert_eq!(result.output, None);
+    }
+
+    #[test]
+    fn usage_total() {
+        let u = Usage { input: Some(10), output: Some(5), details: None };
+        assert_eq!(u.total(), 15);
+
+        let empty = Usage::default();
+        assert_eq!(empty.total(), 0);
     }
 }

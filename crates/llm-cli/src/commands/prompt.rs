@@ -234,7 +234,7 @@ pub async fn run(args: &PromptArgs) -> llm_core::Result<()> {
     let start = std::time::Instant::now();
     let json_output = args.json;
 
-    let (chunks, chain_tool_results) = if !args.tool.is_empty() {
+    let (chunks, chain_tool_results, chain_total_usage) = if !args.tool.is_empty() {
         // Tool chain mode — verbose > 0 implies tools-debug
         let debug = args.tools_debug || args.verbose > 0;
         let mut executor = CliToolExecutor::new(debug, args.tools_approve);
@@ -272,9 +272,10 @@ pub async fn run(args: &PromptArgs) -> llm_core::Result<()> {
                 }
             },
             on_event,
+            None,
         )
         .await?;
-        (result.chunks, result.tool_results)
+        (result.chunks, result.tool_results, result.total_usage)
     } else {
         // Normal mode (no tools)
         let response_stream =
@@ -296,16 +297,17 @@ pub async fn run(args: &PromptArgs) -> llm_core::Result<()> {
             }
             chunks.push(chunk);
         }
-        (chunks, Vec::new())
+        let usage_data = collect_usage(&chunks);
+        (chunks, Vec::new(), usage_data)
     };
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
     let response_text = collect_text(&chunks);
-    let usage_data = collect_usage(&chunks);
     let tool_calls_data = collect_tool_calls(&chunks);
 
-    // Show usage on stderr if requested
+    // Show usage on stderr if requested (total_usage for chain, last usage for non-chain)
+    let usage_data = chain_total_usage.or_else(|| collect_usage(&chunks));
     if args.usage
         && let Some(u) = &usage_data
     {
@@ -425,19 +427,34 @@ pub fn format_chain_event(event: &ChainEvent, verbose: u8, _chain_limit: usize) 
                 eprintln!("{json}");
             }
         }
-        ChainEvent::IterationEnd { iteration, usage, tool_calls } => {
+        ChainEvent::IterationEnd { iteration, usage, cumulative_usage, tool_calls } => {
             let usage_str = if let Some(u) = usage {
-                format!(
+                let base = format!(
                     "usage: {} input, {} output",
                     u.input.unwrap_or(0),
                     u.output.unwrap_or(0),
-                )
+                );
+                if let Some(cum) = cumulative_usage {
+                    format!(
+                        "{base} (cumulative: {} input, {} output)",
+                        cum.input.unwrap_or(0),
+                        cum.output.unwrap_or(0),
+                    )
+                } else {
+                    base
+                }
             } else {
                 "no usage data".into()
             };
             eprintln!(
                 "[chain] Iteration {iteration} complete | {usage_str} | {} tool call(s)",
                 tool_calls.len(),
+            );
+        }
+        ChainEvent::BudgetExhausted { cumulative_usage, budget } => {
+            eprintln!(
+                "[budget] Budget exhausted: {}/{budget} tokens used",
+                cumulative_usage.total(),
             );
         }
     }

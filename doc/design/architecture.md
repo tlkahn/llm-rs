@@ -73,7 +73,13 @@ Agents are TOML files in discoverable directories, not database records or code 
 - **Global + local directories**: `$XDG_CONFIG_HOME/llm/agents/` for global, `$CWD/.llm/agents/` for project-local. Local shadows global (same name wins), analogous to `.gitignore` or `.env` layering.
 - **Name derived from filename**: `reviewer.toml` -> agent name `reviewer`. No separate name field, no registry, no ID generation. The filesystem is the index.
 - **All fields optional**: An empty `.toml` file is a valid agent that uses all defaults. This makes `llm agent init` trivial and lets users build up config incrementally.
-- **Stub fields for future tiers**: `sub_agents`, `memory`, `budget` parse and persist but aren't wired. This avoids breaking config files when those features ship — users can start writing configs now.
+- **Stub fields for future tiers**: `sub_agents` and `memory` parse and persist but aren't wired. This avoids breaking config files when those features ship — users can start writing configs now. `budget` was a stub through Phase 5 and is now wired (Phase 6).
+
+### Budget Enforcement as Graceful Stop
+
+Budget enforcement mirrors chain_limit semantics: when cumulative token usage exceeds the budget, the chain completes the current iteration fully (collects all chunks, emits the IterationEnd event), then stops before starting the next. It does not error — `ChainResult.budget_exhausted` is a flag, not an exception. This matches the chain_limit pattern and avoids losing partial results.
+
+Budget = input + output tokens combined. The budget is checked only when there are pending tool calls (i.e., the chain would continue). A single-iteration chain that exceeds the budget still completes normally — budget prevents *additional* iterations, not the current one.
 
 ### Platform Abstraction (WASM + Python)
 

@@ -3,7 +3,7 @@ use std::io::Write;
 use clap::{ArgAction, Args};
 use futures::StreamExt;
 use llm_core::{
-    ChainEvent, Chunk, Config, KeyStore, Message, Paths, Prompt, Response,
+    ChainEvent, Chunk, Config, KeyStore, Message, Paths, Prompt, Response, Usage,
     collect_text, collect_tool_calls, collect_usage, resolve_key,
 };
 
@@ -121,6 +121,7 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
         None
     };
     let mut conversation_id: Option<String> = None;
+    let mut session_usage: Option<Usage> = None;
 
     loop {
         let input = match editor.readline("> ") {
@@ -159,7 +160,7 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
 
         let start = std::time::Instant::now();
 
-        let (chunks, chain_tool_results) = if !tools.is_empty() {
+        let (chunks, chain_tool_results, turn_total_usage) = if !tools.is_empty() {
             let mut stdout = std::io::stdout().lock();
 
             let verbose = args.verbose;
@@ -188,9 +189,10 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
                     }
                 },
                 on_event,
+                None,
             )
             .await?;
-            (result.chunks, result.tool_results)
+            (result.chunks, result.tool_results, result.total_usage)
         } else {
             let response_stream = provider
                 .execute(&model_id, &prompt, key.as_deref(), true)
@@ -208,7 +210,8 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
                 }
                 chunks.push(chunk);
             }
-            (chunks, Vec::new())
+            let usage_data = collect_usage(&chunks);
+            (chunks, Vec::new(), usage_data)
         };
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -231,6 +234,15 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
             }
         }
 
+        // Accumulate session-wide usage
+        let turn_usage = turn_total_usage.clone().or_else(|| collect_usage(&chunks));
+        if let Some(tu) = &turn_usage {
+            session_usage = Some(match &session_usage {
+                Some(s) => s.add(tu),
+                None => tu.clone(),
+            });
+        }
+
         // Log turn
         if let Some(store) = &store {
             let response = Response {
@@ -240,7 +252,7 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
                 system: args.system.clone(),
                 response: response_text,
                 options: options.clone(),
-                usage: collect_usage(&chunks),
+                usage: turn_usage.clone(),
                 tool_calls: assistant_tool_calls,
                 tool_results: chain_tool_results,
                 attachments: Vec::new(),
@@ -254,6 +266,13 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
                 Err(e) => eprintln!("Warning: failed to log: {e}"),
             }
         }
+    }
+
+    // Print session usage summary on exit
+    if let Some(u) = &session_usage {
+        let input = u.input.unwrap_or(0);
+        let output = u.output.unwrap_or(0);
+        eprintln!("Session usage: {input} input, {output} output, {} total", input + output);
     }
 
     Ok(())

@@ -2541,3 +2541,139 @@ fn agent_run_unknown_tool() {
         .code(2)
         .stderr(predicate::str::contains("unknown tool"));
 }
+
+// ==========================================================================
+// Phase 6: Budget tracking
+// ==========================================================================
+
+#[tokio::test]
+async fn usage_flag_shows_total_across_chain() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    // First call: tool call (usage: 10 input, 5 output)
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_tool_call_response("upper", "call_1", r#"{"text":"hello"}"#)),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    // Second call: text response (usage: 20 input, 10 output)
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_text_response("HELLO")),
+        )
+        .mount(&server)
+        .await;
+
+    // -u should show cumulative: 30 input, 15 output
+    llm_with_dir(&dir)
+        .args([
+            "prompt", "--no-stream", "--no-log",
+            "-m", "gpt-4o-mini",
+            "-T", "upper",
+            "-u",
+            "hello",
+        ])
+        .env("PATH", path_with_fixtures())
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("30 input"))
+        .stderr(predicate::str::contains("15 output"));
+}
+
+#[tokio::test]
+async fn verbose_shows_cumulative_usage() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_tool_call_response("upper", "call_1", r#"{"text":"hello"}"#)),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_text_response("HELLO")),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args([
+            "prompt", "--no-stream", "--no-log",
+            "-m", "gpt-4o-mini",
+            "-T", "upper",
+            "--verbose",
+            "hello",
+        ])
+        .env("PATH", path_with_fixtures())
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("cumulative: 30 input, 15 output"));
+}
+
+#[tokio::test]
+async fn agent_budget_exhausted_output() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+    let agents_dir = dir.path().join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+    fs::write(
+        agents_dir.join("budgeted.toml"),
+        "model = \"gpt-4o-mini\"\ntools = [\"llm_time\"]\n\n[budget]\nmax_tokens = 10\n",
+    )
+    .unwrap();
+
+    // Tool call response (10+5=15 tokens total > budget 10)
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_tool_call_response("llm_time", "call_1", "{}")),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    // Second response should not be reached (budget exhausted after iter 1)
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_text_response("Done!")),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args(["agent", "run", "budgeted", "--no-stream", "What time is it?"])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("[budget] Budget exhausted: 15/10 tokens used"));
+}

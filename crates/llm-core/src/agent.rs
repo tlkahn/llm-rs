@@ -44,7 +44,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub memory: Option<MemoryConfig>,
 
-    /// Budget configuration (Phase 6 stub).
+    /// Budget configuration (max_tokens enforced by chain loop).
     #[serde(default)]
     pub budget: Option<BudgetConfig>,
 }
@@ -88,7 +88,7 @@ pub struct MemoryConfig {
     pub last_n: Option<usize>,
 }
 
-/// Budget configuration (Phase 6 stub — parsed but not wired up).
+/// Budget configuration. `max_tokens` is passed to `chain()` for enforcement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetConfig {
     #[serde(default)]

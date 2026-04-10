@@ -96,6 +96,14 @@ Surgical cfg-gating — `llm-core` had `tokio` as a dependency but never used it
 
 ---
 
+## Budget tracking
+
+**Budget check position in the loop.** Budget is checked after collecting usage for iteration N but *before* executing that iteration's tool calls. When budget is exceeded, the tool calls from the final iteration go unexecuted — the chain breaks before dispatching them. This matches chain_limit behavior (reaching the limit also skips tool execution for the last iteration's calls). The alternative — checking after tool execution — would mean the budget controls how many tool *results* you get, not how many LLM calls you make, which is counterintuitive for token budget accounting.
+
+**`Option<Usage>` move in `.or_else()`.** `turn_total_usage.or_else(|| collect_usage(&chunks))` moves `turn_total_usage` because `Option::or_else` takes `self` by value. If you need the value again later (e.g., for session accumulation *and* logging), clone before the `.or_else()` call. This bit chat.rs where the same usage was needed for both session accumulation and the log `Response`.
+
+---
+
 ## Verbose observability
 
 **`on_event` as `Option<&mut dyn FnMut>`.** Avoids heap allocation. `None` means zero overhead. The `let mut on_event = on_event;` rebinding is needed because `Option<&mut dyn FnMut>` requires the outer binding to be mutable for `if let Some(cb) = &mut on_event`.

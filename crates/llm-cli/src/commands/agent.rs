@@ -341,6 +341,8 @@ async fn run_agent(args: &AgentRunArgs) -> llm_core::Result<()> {
         None
     };
 
+    let agent_budget = agent_config.budget.as_ref().and_then(|b| b.max_tokens);
+
     let result = llm_core::chain(
         provider,
         &model_id,
@@ -358,13 +360,20 @@ async fn run_agent(args: &AgentRunArgs) -> llm_core::Result<()> {
             }
         },
         on_event,
+        agent_budget,
     )
     .await?;
+
+    if result.budget_exhausted
+        && let (Some(u), Some(b)) = (&result.total_usage, agent_budget)
+    {
+        eprintln!("[budget] Budget exhausted: {}/{b} tokens used", u.total());
+    }
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
     let response_text = collect_text(&result.chunks);
-    let usage_data = collect_usage(&result.chunks);
+    let usage_data = result.total_usage.or_else(|| collect_usage(&result.chunks));
     let tool_calls_data = collect_tool_calls(&result.chunks);
 
     // Show usage on stderr if requested

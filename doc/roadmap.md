@@ -27,15 +27,13 @@ Unix-philosophy agentic CLI for LLMs, inspired by [simonw/llm](https://github.co
 | 3 --- Conversations & Multi-turn | v0.3 | Complete | `Message`/`Role` types, `-c`/`--cid`, `llm chat` REPL, full `llm logs` feature set |
 | 4 --- Extensibility & More | v0.4 | Complete | Subprocess tools + providers, `llm plugins`, `--verbose`, `-o/--option`, aliases |
 | 5 --- Agent Config & Discovery | v0.5 | Complete | Agent TOML config, directory discovery (local shadows global), `llm agent run/list/show/init/path` |
+| 6 --- Budget Tracking | v0.6 | Complete | `Usage::add()`/`total()`, cumulative chain usage, budget enforcement, `-u` totals, chat session usage |
 
 ---
 
 ## Future Work
 
 ### Axe: Agent Features (prioritized, see [readiness assessment](research/axe-readiness-assessment.md))
-
-**Tier 1** — zero unresolved deps, highest value:
-- Budget tracking (accumulation + display) --- cross-turn token accumulation in `chain()`, surface via `-u`/`ChainEvent`
 
 **Tier 2** — zero or newly-resolved deps:
 - Retry/backoff --- exponential backoff + jitter for 429/5xx, wraps provider calls

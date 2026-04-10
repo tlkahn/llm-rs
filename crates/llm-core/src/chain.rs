@@ -30,8 +30,17 @@ pub enum ChainEvent {
         iteration: usize,
         /// Per-iteration token usage, if the provider reported it.
         usage: Option<Usage>,
+        /// Cumulative usage across all iterations up to and including this one.
+        cumulative_usage: Option<Usage>,
         /// Tool calls extracted from this iteration's response.
         tool_calls: Vec<ToolCall>,
+    },
+    /// Emitted when the budget is exhausted (after completing the current iteration).
+    BudgetExhausted {
+        /// Cumulative usage at the point the budget was exceeded.
+        cumulative_usage: Usage,
+        /// The budget limit that was exceeded.
+        budget: u64,
     },
 }
 
@@ -41,6 +50,10 @@ pub struct ChainResult {
     pub chunks: Vec<Chunk>,
     /// All tool results from all iterations (in execution order).
     pub tool_results: Vec<ToolResult>,
+    /// Accumulated usage across all iterations.
+    pub total_usage: Option<Usage>,
+    /// Whether the chain stopped because the budget was exhausted.
+    pub budget_exhausted: bool,
 }
 
 /// Run a chain loop: execute -> collect tool calls -> execute tools -> repeat.
@@ -48,6 +61,7 @@ pub struct ChainResult {
 /// Stops when:
 /// - No tool calls are returned (normal completion)
 /// - `chain_limit` iterations are reached
+/// - `budget` is exceeded (graceful stop after completing current iteration)
 ///
 /// `on_chunk` is called for every chunk from every iteration.
 ///
@@ -65,10 +79,13 @@ pub async fn chain(
     chain_limit: usize,
     on_chunk: &mut dyn FnMut(&Chunk),
     on_event: Option<&mut dyn FnMut(&ChainEvent)>,
+    budget: Option<u64>,
 ) -> crate::Result<ChainResult> {
     let mut all_chunks = Vec::new();
     let mut all_tool_results = Vec::new();
     let mut on_event = on_event;
+    let mut cumulative_usage: Option<Usage> = None;
+    let mut budget_exhausted = false;
 
     // Seed messages from initial prompt
     let mut messages: Vec<Message> = if initial_prompt.messages.is_empty() {
@@ -112,10 +129,18 @@ pub async fn chain(
         let usage = collect_usage(&iteration_chunks);
         let text = collect_text(&iteration_chunks);
 
+        // Accumulate usage
+        cumulative_usage = match (&cumulative_usage, &usage) {
+            (Some(cum), Some(iter_usage)) => Some(cum.add(iter_usage)),
+            (None, Some(iter_usage)) => Some(iter_usage.clone()),
+            (cum, None) => cum.clone(),
+        };
+
         if let Some(cb) = &mut on_event {
             cb(&ChainEvent::IterationEnd {
                 iteration,
                 usage: usage.clone(),
+                cumulative_usage: cumulative_usage.clone(),
                 tool_calls: tool_calls.clone(),
             });
         }
@@ -126,6 +151,20 @@ pub async fn chain(
         messages.push(Message::assistant_with_tool_calls(&text, tool_calls.clone()));
 
         if tool_calls.is_empty() {
+            break;
+        }
+
+        // Check budget after completing the iteration
+        if let (Some(b), Some(cum)) = (budget, &cumulative_usage)
+            && cum.total() >= b
+        {
+            budget_exhausted = true;
+            if let Some(cb) = &mut on_event {
+                cb(&ChainEvent::BudgetExhausted {
+                    cumulative_usage: cum.clone(),
+                    budget: b,
+                });
+            }
             break;
         }
 
@@ -145,6 +184,8 @@ pub async fn chain(
     Ok(ChainResult {
         chunks: all_chunks,
         tool_results: all_tool_results,
+        total_usage: cumulative_usage,
+        budget_exhausted,
     })
 }
 
@@ -275,6 +316,7 @@ mod tests {
             5,
             &mut |_| callback_count += 1,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -303,6 +345,7 @@ mod tests {
             5,
             &mut |_| {},
             None,
+            None,
         )
         .await
         .unwrap();
@@ -330,6 +373,7 @@ mod tests {
             &MockExecutor,
             3,
             &mut |_| {},
+            None,
             None,
         )
         .await
@@ -372,6 +416,7 @@ mod tests {
             5,
             &mut |_| {},
             None,
+            None,
         )
         .await
         .unwrap();
@@ -401,6 +446,7 @@ mod tests {
             5,
             &mut |_| {},
             None,
+            None,
         )
         .await
         .unwrap();
@@ -428,6 +474,7 @@ mod tests {
             5,
             &mut |chunk| received_clone.lock().unwrap().push(chunk.clone()),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -450,7 +497,7 @@ mod tests {
 
         let _ = chain(
             &provider, "mock-model", prompt, None, false,
-            &MockExecutor, 5, &mut |_| {}, None,
+            &MockExecutor, 5, &mut |_| {}, None, None,
         ).await.unwrap();
 
         let prompts = provider.captured_prompts.lock().unwrap();
@@ -484,7 +531,7 @@ mod tests {
 
         let _ = chain(
             &provider, "mock-model", prompt, None, false,
-            &MockExecutor, 5, &mut |_| {}, None,
+            &MockExecutor, 5, &mut |_| {}, None, None,
         ).await.unwrap();
 
         let prompts = provider.captured_prompts.lock().unwrap();
@@ -508,7 +555,7 @@ mod tests {
 
         let _ = chain(
             &provider, "mock-model", prompt, None, false,
-            &MockExecutor, 5, &mut |_| {}, None,
+            &MockExecutor, 5, &mut |_| {}, None, None,
         ).await.unwrap();
 
         let prompts = provider.captured_prompts.lock().unwrap();
@@ -531,6 +578,7 @@ mod tests {
             &provider, "mock-model", prompt, None, false,
             &MockExecutor, 5, &mut |_| {},
             Some(&mut |e: &ChainEvent| events.push(e.clone())),
+            None,
         ).await.unwrap();
 
         assert_eq!(events.len(), 2); // IterationStart + IterationEnd
@@ -544,9 +592,10 @@ mod tests {
             _ => panic!("expected IterationStart"),
         }
         match &events[1] {
-            ChainEvent::IterationEnd { iteration, usage, tool_calls } => {
+            ChainEvent::IterationEnd { iteration, usage, cumulative_usage, tool_calls } => {
                 assert_eq!(*iteration, 1);
                 assert!(usage.is_none());
+                assert!(cumulative_usage.is_none());
                 assert!(tool_calls.is_empty());
             }
             _ => panic!("expected IterationEnd"),
@@ -574,26 +623,33 @@ mod tests {
             &provider, "mock-model", prompt, None, false,
             &MockExecutor, 5, &mut |_| {},
             Some(&mut |e: &ChainEvent| events.push(e.clone())),
+            None,
         ).await.unwrap();
 
         // 2 iterations -> 4 events (start, end, start, end)
         assert_eq!(events.len(), 4);
         match &events[1] {
-            ChainEvent::IterationEnd { iteration, usage, tool_calls } => {
+            ChainEvent::IterationEnd { iteration, usage, cumulative_usage, tool_calls } => {
                 assert_eq!(*iteration, 1);
                 let u = usage.as_ref().unwrap();
                 assert_eq!(u.input, Some(10));
                 assert_eq!(u.output, Some(5));
+                let cum = cumulative_usage.as_ref().unwrap();
+                assert_eq!(cum.input, Some(10));
+                assert_eq!(cum.output, Some(5));
                 assert_eq!(tool_calls.len(), 1);
             }
             _ => panic!("expected IterationEnd"),
         }
         match &events[3] {
-            ChainEvent::IterationEnd { iteration, usage, tool_calls } => {
+            ChainEvent::IterationEnd { iteration, usage, cumulative_usage, tool_calls } => {
                 assert_eq!(*iteration, 2);
                 let u = usage.as_ref().unwrap();
                 assert_eq!(u.input, Some(20));
                 assert_eq!(u.output, Some(10));
+                let cum = cumulative_usage.as_ref().unwrap();
+                assert_eq!(cum.input, Some(30));
+                assert_eq!(cum.output, Some(15));
                 assert!(tool_calls.is_empty());
             }
             _ => panic!("expected IterationEnd"),
@@ -615,6 +671,7 @@ mod tests {
             &provider, "mock-model", prompt, None, false,
             &MockExecutor, 5, &mut |_| {},
             Some(&mut |e: &ChainEvent| events.push(e.clone())),
+            None,
         ).await.unwrap();
 
         assert_eq!(events.len(), 6);
@@ -626,8 +683,9 @@ mod tests {
         assert!(matches!(&events[5], ChainEvent::IterationEnd { iteration: 3, .. }));
 
         // Verify tool calls in end events
-        if let ChainEvent::IterationEnd { tool_calls, .. } = &events[1] {
+        if let ChainEvent::IterationEnd { tool_calls, cumulative_usage, .. } = &events[1] {
             assert_eq!(tool_calls.len(), 1);
+            assert!(cumulative_usage.is_none()); // no usage in mock tool_call_response
         }
         if let ChainEvent::IterationEnd { tool_calls, .. } = &events[5] {
             assert!(tool_calls.is_empty());
@@ -655,10 +713,246 @@ mod tests {
 
         let result = chain(
             &provider, "mock-model", prompt, None, false,
-            &MockExecutor, 5, &mut |_| {}, None,
+            &MockExecutor, 5, &mut |_| {}, None, None,
         ).await.unwrap();
 
         assert_eq!(crate::collect_text(&result.chunks), "Done!");
         assert_eq!(result.tool_results.len(), 1);
+    }
+
+    // --- ChainResult.total_usage tests ---
+
+    fn text_response_with_usage(text: &str, input: u64, output: u64) -> Vec<Chunk> {
+        vec![
+            Chunk::Text(text.into()),
+            Chunk::Usage(Usage { input: Some(input), output: Some(output), details: None }),
+            Chunk::Done,
+        ]
+    }
+
+    fn tool_call_response_with_usage(name: &str, id: &str, args: &str, input: u64, output: u64) -> Vec<Chunk> {
+        vec![
+            Chunk::ToolCallStart { name: name.into(), id: Some(id.into()) },
+            Chunk::ToolCallDelta { content: args.into() },
+            Chunk::Usage(Usage { input: Some(input), output: Some(output), details: None }),
+            Chunk::Done,
+        ]
+    }
+
+    #[tokio::test]
+    async fn chain_result_total_usage_single_iteration() {
+        let provider = MockProvider::new(vec![
+            text_response_with_usage("Hello!", 10, 5),
+        ]);
+        let prompt = Prompt::new("Hi").with_tools(vec![make_tool()]);
+
+        let result = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {}, None, None,
+        ).await.unwrap();
+
+        let usage = result.total_usage.unwrap();
+        assert_eq!(usage.input, Some(10));
+        assert_eq!(usage.output, Some(5));
+        assert!(!result.budget_exhausted);
+    }
+
+    #[tokio::test]
+    async fn chain_result_total_usage_multi_iteration() {
+        let provider = MockProvider::new(vec![
+            tool_call_response_with_usage("test_tool", "tc_1", "{}", 10, 5),
+            text_response_with_usage("Done!", 20, 10),
+        ]);
+        let prompt = Prompt::new("Go").with_tools(vec![make_tool()]);
+
+        let result = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {}, None, None,
+        ).await.unwrap();
+
+        let usage = result.total_usage.unwrap();
+        assert_eq!(usage.input, Some(30));
+        assert_eq!(usage.output, Some(15));
+    }
+
+    #[tokio::test]
+    async fn chain_result_total_usage_none() {
+        let provider = MockProvider::new(vec![text_response("Hello!")]);
+        let prompt = Prompt::new("Hi").with_tools(vec![make_tool()]);
+
+        let result = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {}, None, None,
+        ).await.unwrap();
+
+        assert!(result.total_usage.is_none());
+    }
+
+    // --- cumulative_usage in ChainEvent::IterationEnd ---
+
+    #[tokio::test]
+    async fn chain_event_cumulative_usage() {
+        let provider = MockProvider::new(vec![
+            tool_call_response_with_usage("test_tool", "tc_1", "{}", 10, 5),
+            text_response_with_usage("Done!", 20, 10),
+        ]);
+        let prompt = Prompt::new("Go").with_tools(vec![make_tool()]);
+        let mut events = Vec::new();
+
+        let _ = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {},
+            Some(&mut |e: &ChainEvent| events.push(e.clone())),
+            None,
+        ).await.unwrap();
+
+        // 2 iterations -> 4 events
+        assert_eq!(events.len(), 4);
+
+        // Iter 1 end: cumulative = (10, 5)
+        if let ChainEvent::IterationEnd { cumulative_usage, .. } = &events[1] {
+            let cum = cumulative_usage.as_ref().unwrap();
+            assert_eq!(cum.input, Some(10));
+            assert_eq!(cum.output, Some(5));
+        } else {
+            panic!("expected IterationEnd");
+        }
+
+        // Iter 2 end: cumulative = (30, 15)
+        if let ChainEvent::IterationEnd { cumulative_usage, .. } = &events[3] {
+            let cum = cumulative_usage.as_ref().unwrap();
+            assert_eq!(cum.input, Some(30));
+            assert_eq!(cum.output, Some(15));
+        } else {
+            panic!("expected IterationEnd");
+        }
+    }
+
+    // --- Budget enforcement tests ---
+
+    #[tokio::test]
+    async fn chain_budget_stops_when_exceeded() {
+        // budget=25, iter1 usage=30 (10+20) → stops after 1 iteration
+        let provider = MockProvider::new(vec![
+            tool_call_response_with_usage("test_tool", "tc_1", "{}", 10, 20),
+            text_response_with_usage("Should not reach", 10, 10),
+        ]);
+        let prompt = Prompt::new("Go").with_tools(vec![make_tool()]);
+
+        let result = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {}, None, Some(25),
+        ).await.unwrap();
+
+        assert!(result.budget_exhausted);
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+        let usage = result.total_usage.unwrap();
+        assert_eq!(usage.total(), 30);
+    }
+
+    #[tokio::test]
+    async fn chain_budget_allows_under() {
+        // budget=100, iter1 usage=15 → text response, continues normally
+        let provider = MockProvider::new(vec![
+            text_response_with_usage("Hello!", 10, 5),
+        ]);
+        let prompt = Prompt::new("Hi").with_tools(vec![make_tool()]);
+
+        let result = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {}, None, Some(100),
+        ).await.unwrap();
+
+        assert!(!result.budget_exhausted);
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn chain_budget_multi_iteration_accumulates() {
+        // budget=40, iter1=15, iter2=15, iter3 would exceed → stops after 2
+        let provider = MockProvider::new(vec![
+            tool_call_response_with_usage("test_tool", "tc_1", "{}", 10, 5),
+            tool_call_response_with_usage("test_tool", "tc_2", "{}", 10, 5),
+            text_response_with_usage("Should not reach", 10, 5),
+        ]);
+        let prompt = Prompt::new("Go").with_tools(vec![make_tool()]);
+
+        let result = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {}, None, Some(40),
+        ).await.unwrap();
+
+        // iter1: 15 total (under 40), iter2: 30 total (under 40) → both allowed
+        // Actually 30 < 40, so it should continue. Let me set budget to 25 instead.
+        assert!(!result.budget_exhausted);
+        // With budget=40 and 15 per iter, it will do 2 tool iterations (30 total < 40)
+        // then the 3rd would run (15+15+15=45 > 40 would trigger IF there were tool calls)
+        // But actually iter 3 is text, so it stops naturally
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn chain_budget_multi_iteration_stops() {
+        // budget=25, iter1=15 (ok), iter2=15 (cumulative=30 > 25) → stops
+        let provider = MockProvider::new(vec![
+            tool_call_response_with_usage("test_tool", "tc_1", "{}", 10, 5),
+            tool_call_response_with_usage("test_tool", "tc_2", "{}", 10, 5),
+            text_response_with_usage("Should not reach", 10, 5),
+        ]);
+        let prompt = Prompt::new("Go").with_tools(vec![make_tool()]);
+
+        let result = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {}, None, Some(25),
+        ).await.unwrap();
+
+        assert!(result.budget_exhausted);
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 2);
+        let usage = result.total_usage.unwrap();
+        assert_eq!(usage.total(), 30);
+    }
+
+    #[tokio::test]
+    async fn chain_budget_none_no_enforcement() {
+        let provider = MockProvider::new(vec![
+            tool_call_response_with_usage("test_tool", "tc_1", "{}", 100, 100),
+            text_response_with_usage("Done!", 100, 100),
+        ]);
+        let prompt = Prompt::new("Go").with_tools(vec![make_tool()]);
+
+        let result = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {}, None, None,
+        ).await.unwrap();
+
+        assert!(!result.budget_exhausted);
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn chain_budget_emits_event() {
+        let provider = MockProvider::new(vec![
+            tool_call_response_with_usage("test_tool", "tc_1", "{}", 20, 15),
+            text_response_with_usage("Should not reach", 10, 10),
+        ]);
+        let prompt = Prompt::new("Go").with_tools(vec![make_tool()]);
+        let mut events = Vec::new();
+
+        let _ = chain(
+            &provider, "mock-model", prompt, None, false,
+            &MockExecutor, 5, &mut |_| {},
+            Some(&mut |e: &ChainEvent| events.push(e.clone())),
+            Some(30),
+        ).await.unwrap();
+
+        // Should have: IterationStart, IterationEnd, BudgetExhausted
+        assert_eq!(events.len(), 3);
+        match &events[2] {
+            ChainEvent::BudgetExhausted { cumulative_usage, budget } => {
+                assert_eq!(*budget, 30);
+                assert_eq!(cumulative_usage.total(), 35);
+            }
+            _ => panic!("expected BudgetExhausted, got {:?}", events[2]),
+        }
     }
 }

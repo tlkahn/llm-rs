@@ -7,12 +7,12 @@ LLM-RS: Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) (v0
 ## Commands
 
 ```bash
-cargo test --workspace           # Run all 452 tests
-cargo test -p llm-core           # Core types/traits/config/schema/chain/messages/agent (163 tests)
+cargo test --workspace           # Run all 469 tests
+cargo test -p llm-core           # Core types/traits/config/schema/chain/messages/agent (177 tests)
 cargo test -p llm-openai         # OpenAI provider (42 tests)
 cargo test -p llm-anthropic      # Anthropic provider (48 tests)
 cargo test -p llm-store          # JSONL storage (49 tests)
-cargo test -p llm-cli            # CLI unit (50) + integration (100) tests
+cargo test -p llm-cli            # CLI unit (50) + integration (103) tests
 cargo clippy --workspace         # Lint
 cargo build --release -p llm-cli # Build optimized binary
 
@@ -50,8 +50,10 @@ Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry poi
 - **`LlmError`** (`error.rs`): six variants (`Model`, `NeedsKey`, `Provider`, `Config`, `Io`, `Store`).
 - Stream helpers: `collect_text()`, `collect_tool_calls()`, `collect_usage()`.
 - **`ToolExecutor` trait** (`chain.rs`): async interface for executing tool calls. `execute(&ToolCall) -> ToolResult`.
-- **`ChainEvent`** (`chain.rs`): enum for chain loop observability. `IterationStart { iteration, limit, messages }` emitted before provider call, `IterationEnd { iteration, usage, tool_calls }` after.
-- **`chain()`** (`chain.rs`): chain loop that accumulates `Vec<Message>` across iterations — each provider call sees full conversation history. Executes provider → collects tool calls → executes tools → repeats until no tool calls or limit reached. Optional `on_event` callback for observability.
+- **`Usage`** (`types.rs`): token usage with `input`, `output`, `details` fields. `add(&other)` combines two Usage values (summing fields). `total()` returns input + output (treating None as 0).
+- **`ChainEvent`** (`chain.rs`): enum for chain loop observability. `IterationStart { iteration, limit, messages }` emitted before provider call, `IterationEnd { iteration, usage, cumulative_usage, tool_calls }` after, `BudgetExhausted { cumulative_usage, budget }` when token budget exceeded.
+- **`ChainResult`** (`chain.rs`): result of chain loop. Fields: `chunks`, `tool_results`, `total_usage` (accumulated across all iterations), `budget_exhausted` (bool).
+- **`chain()`** (`chain.rs`): chain loop that accumulates `Vec<Message>` across iterations — each provider call sees full conversation history. Executes provider → collects tool calls → executes tools → repeats until no tool calls, limit reached, or budget exceeded. Optional `on_event` callback for observability. `budget: Option<u64>` parameter for token budget enforcement.
 - **`parse_schema_dsl()`** (`schema.rs`): parses "name str, age int" DSL into JSON Schema. Types: str, int, float, bool.
 - **`multi_schema()`** (`schema.rs`): wraps a schema in `{"items":{"type":"array","items":<schema>}}` for `--schema-multi`.
 
@@ -65,9 +67,9 @@ Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry poi
 
 ### Agent system (llm-core/agent.rs)
 
-- **`AgentConfig`**: TOML config loaded from agent files. Fields: `model` (Option), `system_prompt` (Option), `tools` (Vec), `chain_limit` (default 10), `options` (HashMap), `sub_agents` (Vec, stub), `memory` (Option<MemoryConfig>, stub), `budget` (Option<BudgetConfig>, stub). `AgentConfig::load(path)` returns error if file not found (unlike `Config`).
+- **`AgentConfig`**: TOML config loaded from agent files. Fields: `model` (Option), `system_prompt` (Option), `tools` (Vec), `chain_limit` (default 10), `options` (HashMap), `sub_agents` (Vec, stub), `memory` (Option<MemoryConfig>, stub), `budget` (Option<BudgetConfig>, wired). `AgentConfig::load(path)` returns error if file not found (unlike `Config`).
 - **`MemoryConfig`**: stub — `enabled` (bool), `last_n` (Option<usize>). Parsed but not wired up.
-- **`BudgetConfig`**: stub — `max_tokens` (Option<u64>). Parsed but not wired up.
+- **`BudgetConfig`**: `max_tokens` (Option<u64>). Wired to `chain()` budget enforcement in agent run.
 - **`AgentSource`**: enum `Global` / `Local`. Display trait for output.
 - **`AgentInfo`**: name + path + source. Returned by discovery.
 - **`discover_agents(global_dir, local_dir)`**: scans `.toml` files in both dirs. Local shadows global (same name). Sorted alphabetically. Nonexistent dirs silently skipped.
@@ -142,9 +144,11 @@ Phase 4 model options complete --- `-o/--option` flag on `prompt` and `chat` com
 
 Phase 4 aliases complete --- `Config.set_alias/remove_alias` methods. `llm aliases set/show/list/remove/path` subcommands for managing model aliases in `config.toml`. `resolve_model()` (already existed) resolves aliases at runtime in prompt/chat. No transitive resolution (matches simonw/llm behavior).
 
-Phase 4 (v0.4) is complete. See `doc/roadmap.md` for future work.
+Phase 4 (v0.4) is complete. Phase 6 (budget tracking) is complete. See `doc/roadmap.md` for future work.
 
 Phase 5 agent config & discovery complete --- `AgentConfig` struct with TOML parsing (`model`, `system_prompt`, `tools`, `chain_limit`, `options`, plus `sub_agents`/`memory`/`budget` stubs). `Paths.agents_dir()`. Discovery: `discover_agents()` scans global (`$XDG_CONFIG_HOME/llm/agents/`) and local (`$CWD/.llm/agents/`) directories, local shadows global. `resolve_agent()` finds agent by name. CLI: `llm agent run <name> [prompt]` resolves config, model (CLI > agent TOML > global default), tools, builds prompt with system_prompt, calls `chain()`. `llm agent list/show/init/path` management commands. Shared helpers (`find_provider`, `resolve_prompt_text`, `format_chain_event`) extracted from `prompt.rs` as `pub(crate)` and reused by `agent.rs` and `chat.rs`.
+
+Phase 6 budget tracking complete --- `Usage::add()` and `Usage::total()` accumulation helpers. `ChainResult.total_usage` accumulates usage across all chain iterations. `ChainEvent::IterationEnd` includes `cumulative_usage`. `chain()` gains `budget: Option<u64>` parameter — exceeding budget triggers `ChainEvent::BudgetExhausted` and graceful stop (like chain_limit). `ChainResult.budget_exhausted` flag. `-u` flag now shows cumulative usage across chain iterations. Verbose output includes cumulative usage per iteration. `BudgetConfig.max_tokens` wired from agent TOML to `chain()`. Agent budget exhaustion prints `[budget]` warning. Chat REPL tracks session-wide cumulative usage across turns, prints summary on exit.
 
 ## Conventions
 
