@@ -1,83 +1,112 @@
 # Axe Feature Readiness Assessment
 
-Assessment of llm-rs Phase 2 architecture against the Unix-philosophy agent features described in `axe/docs/idea/unix-philosophy-agent-in-rust.md`.
+Assessment of llm-rs architecture against the Unix-philosophy agent features described in `~/Desktop/axe/docs/idea/unix-philosophy-agent-in-rust.md`.
 
-## What Works Well
+Original assessment written after Phase 2; updated after Phase 4 completion (v0.4).
 
-**The `ToolExecutor` trait is the right seam.** `llm-core/src/chain.rs:11` defines `async fn execute(&self, call: &ToolCall) -> ToolResult` — this is exactly where CLI tool dispatch (fork/exec, capture stdout/stderr/exit code) plugs in. A new `ExternalToolExecutor` alongside the existing `CliToolExecutor` requires no trait changes.
+---
 
-**The `chain()` loop structure is sound.** The iterate -> collect tool calls -> execute -> loop pattern at `chain.rs:31-89` matches the ReAct loop axe needs. The `chain_limit`, `on_chunk` callback for streaming output, and `ChainResult` with full chunk/tool_result history are all directly usable.
+## Phase 2 Assessment (2026-04-09)
 
-**Streaming chunk types already handle the hard case.** `Chunk::ToolCallStart`, `ToolCallDelta`, and the `collect_tool_calls()` assembler at `stream.rs:35-73` solve the "stream text to terminal while buffering tool calls internally" problem. You can stream and accumulate simultaneously — the code already does this.
+The original assessment identified 5 roadblocks and 12 feature gaps. See git history (`9fd2374a`) for the full original text.
 
-**Tool types are right.** `Tool { name, description, input_schema }`, `ToolCall { name, arguments, tool_call_id }`, `ToolResult { name, output, tool_call_id, error }` — these map 1:1 to the axe tool contract. External tools return plain text on stdout; wrapping into `ToolResult` is straightforward. The error field already handles non-zero exit codes.
+---
 
-**Both providers construct multi-turn messages** from `Prompt.tool_calls` + `Prompt.tool_results`, each following their API's conventions (OpenAI `tool` role, Anthropic `tool_result` blocks in user messages).
+## Post-Phase 4 Reassessment (2026-04-10)
 
-## What Doesn't Work
+Phases 3 (Conversations & Multi-turn) and 4 (Extensibility & More) have landed. The original "single biggest blocker" — `Prompt` being a single-turn type — is resolved.
 
-### 1. Conversation history is one turn deep (the critical gap)
+### Resolved
 
-The `chain()` loop at line 76-83 rebuilds the prompt each iteration:
+**1. Conversation history is one turn deep** — Phase 3 added `Prompt.messages: Vec<Message>`. `chain()` now accumulates the full `[user, assistant+tools, tool, assistant+tools, tool, ...]` history across iterations. Both providers consume the messages field. The critical architectural gap is closed.
 
-```rust
-let mut next_prompt = Prompt::new(&current_prompt.text)
-    .with_tools(current_prompt.tools.clone())
-    .with_tool_calls(tool_calls)
-    .with_tool_results(tool_results);
-```
+**2. No external CLI tool dispatch** — Phase 4 added `subprocess/tool.rs` with `ExternalToolExecutor` implementing `ToolExecutor`. Fork/exec via `tokio::process::Command`, stdin JSON for arguments, stdout/stderr/exit-code capture. The `llm-tool-*` PATH convention provides discovery. `-T` flag resolves external tools in both `prompt` and `chat`.
 
-This carries only the **latest** tool calls/results. On turn 3, the LLM has no memory of turn 1's tool interactions. The providers build a mini-conversation from these fields, but it's always: `[user, assistant+tool_calls, tool_results]` — never the full `[user, assistant, tool, assistant, tool, ...]` accumulation that a multi-turn ReAct loop requires.
+**3. No `--messages` input or `--json` output** — Phase 3 added both flags to `llm prompt`. `--messages` loads a JSON conversation history (file or stdin). `--json` emits a structured envelope with model, content, tool_calls, usage, and conversation_id. The binary can now be used as a composable sub-process.
 
-**The `Prompt` type itself is the bottleneck.** It has a single `text: String`, not a `messages: Vec<Message>`. There's no way to represent "here are 6 prior turns of conversation." The `Provider::execute()` signature takes `&Prompt`, so this constraint propagates everywhere.
+**4. Verbose/observability** — Phase 4 added `ChainEvent` enum (`IterationStart`/`IterationEnd`) with `on_event` callback in `chain()`. `-v` shows per-iteration summary; `-vv` dumps full message JSON. `--verbose` implies `--tools-debug`.
 
-**What's needed:** Either extend `Prompt` with a `messages` field (and teach both providers to use it), or introduce a separate `Conversation` / `Messages` type that `chain()` accumulates into.
+### Partially Resolved
 
-### 2. No external CLI tool dispatch
+**5. Budget/token tracking across turns** — Per-iteration usage is collected via `ChainEvent::IterationEnd` and displayed with `-u/--usage`. However: no cross-turn budget accumulation, no `LLM_BUDGET_REMAINING` env var for sub-agents, no exit-code-4 on budget exhaustion.
 
-`CliToolExecutor` at `tools.rs:104` delegates everything to `BuiltinToolRegistry::execute_tool()`, which is a match on hardcoded tool names. There is no:
-- Fork/exec of CLI commands
-- stdout/stderr/exit code capture
-- Argument serialization (JSON args -> CLI flags/positional args)
-- Timeout handling
-- Parallel tool execution (the chain loop at `chain.rs:67-71` runs tools sequentially with `for call in &tool_calls`)
+### Still Open
 
-The `ToolExecutor` trait supports this — it's just not implemented. An `ExternalToolExecutor` that does `Command::new(name).args(...).output()` is straightforward, but the argument mapping (JSON object -> CLI args) needs a convention.
+**6. Parallel tool execution** — Tool execution in `chain()` is still sequential (`for call in &tool_calls`). No `join_all()` or `JoinSet`.
 
-### 3. No `--messages` input or `--json` output
+**7. Agent config and discovery** — No `llm agent run` subcommand, no `.llm/agents/` directory support, no agent TOML config parsing.
 
-The axe doc identifies this: `llm --messages history.jsonl --tools tools.json --json`. Currently:
+**8. Sub-agent delegation** — No parent/child agent orchestration. The `--messages` + `--json` plumbing now exists, but no dispatch mechanism.
 
-- **Input:** `prompt.rs:219-236` resolves text from arg or stdin. No way to pass a conversation history.
-- **Output:** Text streamed to stdout, no structured JSON envelope. Axe wants a trace with model, content, tokens, duration, and per-tool-call details.
+**9. Dry-run mode** — No `--dry-run` flag to resolve config and print without executing.
 
-Without these, the binary can't be used as a sub-agent (child `llm agent run` needs to receive context and return structured results).
+**10. Retry/backoff** — No retry logic wrapping provider calls.
 
-### 4. No budget/token tracking across turns
+**11. Memory system** — No cross-conversation memory or RAG abstraction.
 
-`collect_usage()` extracts usage from chunks, but `chain()` doesn't accumulate token counts across iterations. There is no budget concept — no `max_tokens` budget that spans the whole loop, no `LLM_BUDGET_REMAINING` env var for sub-agents, no exit-code-4 on budget exhaustion.
+### Updated Summary Table
 
-### 5. No agent config or discovery
-
-No TOML agent config parsing. No `<cwd>/.llm/agents/` -> `~/.config/llm/agents/` shadowing. No `llm agent run <name>` subcommand. This is new code, not a refactor of existing code — but the `Config` system in `llm-core/config.rs` (TOML + XDG paths) provides the pattern to follow.
-
-## Summary Table
-
-| axe Feature | Current State | Work Required |
+| axe Feature | Phase 2 State | Post-Phase 4 State |
 |---|---|---|
-| ReAct loop | `chain()` exists, works | Minor — fix history accumulation |
-| Multi-turn messages | **Missing** — `Prompt` is single-turn | **Major** — core type change, both providers |
-| External CLI tools | `ToolExecutor` trait exists | Medium — new executor impl, arg mapping |
-| Parallel tool exec | Sequential `for` loop | Small — `tokio::join!` / `JoinSet` |
-| `--messages` input | Not exposed | Medium — new CLI flag + parser |
-| `--json` output | Not exposed | Medium — structured envelope |
-| Agent TOML config | Not started | Medium — new module, follows existing config pattern |
-| Sub-agent delegation | Not started | Medium — depends on `--messages` + `--json` |
-| Budget tracking | Not started | Small-medium — accumulate usage in `chain()` |
-| Dry-run mode | Not started | Small — resolve config, print, exit |
-| Retry/backoff | Not started | Small — wrap provider calls |
-| Memory system | Not started | Medium — new module |
+| ReAct loop (multi-turn chain) | Single-turn only | **Resolved** — full message accumulation |
+| Multi-turn messages in `Prompt` | **Missing** | **Resolved** — `Prompt.messages: Vec<Message>` |
+| External CLI tools | Trait only | **Resolved** — `ExternalToolExecutor`, `llm-tool-*` protocol |
+| `--messages` input | Not exposed | **Resolved** |
+| `--json` output | Not exposed | **Resolved** |
+| Chain observability | Not started | **Resolved** — `ChainEvent`, `-v`/`-vv` |
+| Budget tracking | Not started | **Partial** — per-iteration only, no budget enforcement |
+| Parallel tool exec | Sequential loop | **Still open** |
+| Agent TOML config | Not started | **Still open** |
+| Sub-agent delegation | Not started | **Still open** (plumbing ready via `--messages`/`--json`) |
+| Dry-run mode | Not started | **Still open** |
+| Retry/backoff | Not started | **Still open** |
+| Memory system | Not started | **Still open** |
 
 ## Bottom Line
 
-The architecture is pointed in the right direction — `ToolExecutor`, `chain()`, the streaming chunk types, and the provider abstractions are all the right shapes. The single biggest blocker is that `Prompt` is a single-turn type with no conversation history. Fix that (and propagate through the providers), and most of the axe features become straightforward additions on top of what exists.
+7 of 12 items from the Phase 2 assessment are resolved. The architecture no longer has fundamental blockers. The remaining gaps — parallel tool exec, agent config/discovery, sub-agent delegation, budget enforcement, dry-run, retry, memory — are all additive features that build on existing seams rather than requiring core type changes.
+
+---
+
+## Prioritized Plan for Axe-on-LLM-RS
+
+Grouping and tiering of remaining work, based on importance and dependency analysis.
+
+### Group A: Agent Core
+
+The feature that turns llm-rs into an agent framework. Everything in Group C blocks on this.
+
+- **Agent config & discovery** — TOML config (`model`, `system_prompt`, `tools`, `budget`), `.llm/agents/` directory with local-shadows-global, `llm agent run <name>` subcommand. Sub-agents and memory fields are inventoried in the TOML schema but not wired up until their implementations land.
+
+### Group B: Loop Hardening
+
+Making `chain()` production-ready for long-running agentic use. All independent of each other and of Group A.
+
+- **Budget tracking (accumulation + display)** — Cross-turn token accumulation in `chain()`, surface via `-u`/`--usage` and `ChainEvent`. Exit-code-4 and `LLM_BUDGET_REMAINING` env var deferred to sub-agent tier.
+- **Retry/backoff** — Exponential backoff + jitter for 429/5xx. Never retry 401/403/400. Wraps provider calls.
+- **Parallel tool execution** — `JoinSet` / `join_all` in `chain()` tool dispatch loop.
+
+### Group C: Agent Ecosystem
+
+Features that build on a working agent (depend on Group A).
+
+- **Dry-run mode** — `--dry-run` resolves agent config (system prompt + tools + memory + budget) and prints without making an LLM call. Needs agent TOML to exist.
+- **Sub-agent delegation** — `call_agent` as a special tool that spawns child `llm agent run`. Needs agent config + budget env var plumbing (exit-code-4 + `LLM_BUDGET_REMAINING` land here).
+- **Memory system** — Per-agent JSONL storage (reuses `llm-store` patterns). Pluggable backends (markdown, SQLite, Redis) deferred.
+
+### Tiering
+
+```
+Tier 1 ─── zero unresolved deps, highest value
+  ├── Agent config & discovery
+  └── Budget tracking (accumulation + display)
+
+Tier 2 ─── zero or newly-resolved deps
+  ├── Retry/backoff
+  ├── Dry-run mode (unblocked by Tier 1)
+  └── Parallel tool execution
+
+Tier 3 ─── higher complexity, unblocked by Tier 1
+  ├── Sub-agent delegation (+ budget env var plumbing)
+  └── Memory system (JSONL first, pluggable backends later)
+```

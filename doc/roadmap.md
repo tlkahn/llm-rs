@@ -31,8 +31,24 @@ Unix-philosophy agentic CLI for LLMs, inspired by [simonw/llm](https://github.co
 
 ## Future Work
 
-Beyond Phase 4, no fixed ordering yet:
+### Axe: Agent Features (prioritized, see [readiness assessment](research/axe-readiness-assessment.md))
 
+**Tier 1** — zero unresolved deps, highest value:
+- Agent config & discovery --- TOML config (`model`, `system_prompt`, `tools`, `budget`), `.llm/agents/` with local-shadows-global, `llm agent run <name>`
+- Budget tracking (accumulation + display) --- cross-turn token accumulation in `chain()`, surface via `-u`/`ChainEvent`
+
+**Tier 2** — zero or newly-resolved deps:
+- Retry/backoff --- exponential backoff + jitter for 429/5xx, wraps provider calls
+- Dry-run mode --- `--dry-run` resolves agent config and prints without LLM call (depends on Tier 1 agent config)
+- Parallel tool execution --- `JoinSet` in `chain()` tool dispatch
+
+**Tier 3** — higher complexity, depends on Tier 1:
+- Sub-agent delegation --- `call_agent` tool spawning child `llm agent run` (+ exit-code-4, `LLM_BUDGET_REMAINING` env var)
+- Memory system --- per-agent JSONL storage; pluggable backends (markdown, SQLite, Redis) deferred
+
+### Other
+
+No fixed ordering:
 - Ollama provider (via subprocess or compiled `llm-ollama` crate)
 - `-a/--attachment`, `--at/--attachment-type`
 - `-x/--extract`, `--xl/--extract-last` (code block extraction)
