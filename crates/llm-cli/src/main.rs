@@ -25,6 +25,7 @@ async fn main() {
         Some(Commands::Schemas { command }) => commands::schemas::run(&command),
         Some(Commands::Plugins { command }) => commands::plugins::run(&command).await,
         Some(Commands::Options { command }) => commands::options::run(&command),
+        Some(Commands::Aliases { command }) => commands::aliases::run(&command),
         None => Ok(()),
     };
 
@@ -61,7 +62,7 @@ fn rewrite_args() -> Vec<OsString> {
 fn should_insert_prompt(first_arg: &str) -> bool {
     let known = [
         "prompt", "keys", "models", "logs", "tools", "schemas", "chat", "plugins",
-        "options", "help", "--help", "-h", "--version", "-V",
+        "options", "aliases", "help", "--help", "-h", "--version", "-V",
     ];
     !known.contains(&first_arg)
 }

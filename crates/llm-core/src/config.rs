@@ -187,6 +187,16 @@ impl Config {
     pub fn clear_model_options(&mut self, model: &str) -> bool {
         self.options.remove(model).is_some()
     }
+
+    /// Set an alias mapping `alias` to `model`.
+    pub fn set_alias(&mut self, alias: &str, model: &str) {
+        self.aliases.insert(alias.to_string(), model.to_string());
+    }
+
+    /// Remove an alias. Returns `true` if the alias existed.
+    pub fn remove_alias(&mut self, alias: &str) -> bool {
+        self.aliases.remove(alias).is_some()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -867,5 +877,51 @@ temperature = 0.7
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.model_options("gpt-4o")["temperature"], serde_json::json!(0.7));
         assert_eq!(loaded.model_options("gpt-4o")["max_tokens"], serde_json::json!(200));
+    }
+
+    // --- Aliases: set_alias / remove_alias ---
+
+    #[test]
+    fn config_set_alias() {
+        let mut config = Config::default();
+        config.set_alias("claude", "claude-sonnet-4-20250514");
+        assert_eq!(config.aliases["claude"], "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn config_set_alias_overwrite() {
+        let mut config = Config::default();
+        config.set_alias("claude", "claude-sonnet-4-20250514");
+        config.set_alias("claude", "claude-opus-4-20250514");
+        assert_eq!(config.aliases["claude"], "claude-opus-4-20250514");
+    }
+
+    #[test]
+    fn config_remove_alias() {
+        let mut config = Config::default();
+        config.set_alias("claude", "claude-sonnet-4-20250514");
+        assert!(config.remove_alias("claude"));
+        assert!(!config.aliases.contains_key("claude"));
+    }
+
+    #[test]
+    fn config_remove_alias_missing() {
+        let mut config = Config::default();
+        assert!(!config.remove_alias("nonexistent"));
+    }
+
+    #[test]
+    fn config_alias_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        let mut config = Config::default();
+        config.set_alias("claude", "claude-sonnet-4-20250514");
+        config.set_alias("fast", "gpt-4o-mini");
+        config.save(&path).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.aliases["claude"], "claude-sonnet-4-20250514");
+        assert_eq!(loaded.aliases["fast"], "gpt-4o-mini");
     }
 }

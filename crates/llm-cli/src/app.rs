@@ -50,4 +50,9 @@ pub enum Commands {
         #[command(subcommand)]
         command: commands::options::OptionsCommand,
     },
+    /// Manage model aliases
+    Aliases {
+        #[command(subcommand)]
+        command: commands::aliases::AliasesCommand,
+    },
 }

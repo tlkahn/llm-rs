@@ -2073,3 +2073,130 @@ fn help_shows_options_subcommand() {
         .success()
         .stdout(predicate::str::contains("options"));
 }
+
+// ==========================================================================
+// Aliases
+// ==========================================================================
+
+#[test]
+fn aliases_path() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["aliases", "path"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("config.toml"));
+}
+
+#[test]
+fn aliases_set_and_list() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["aliases", "set", "claude", "claude-sonnet-4-20250514"])
+        .assert()
+        .success();
+    llm_with_dir(&dir)
+        .args(["aliases", "set", "fast", "gpt-4o-mini"])
+        .assert()
+        .success();
+
+    llm_with_dir(&dir)
+        .args(["aliases", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("claude: claude-sonnet-4-20250514"))
+        .stdout(predicate::str::contains("fast: gpt-4o-mini"));
+}
+
+#[test]
+fn aliases_set_overwrites() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["aliases", "set", "claude", "claude-sonnet-4-20250514"])
+        .assert()
+        .success();
+    llm_with_dir(&dir)
+        .args(["aliases", "set", "claude", "claude-opus-4-20250514"])
+        .assert()
+        .success();
+
+    llm_with_dir(&dir)
+        .args(["aliases", "show", "claude"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("claude: claude-opus-4-20250514"));
+}
+
+#[test]
+fn aliases_show() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["aliases", "set", "claude", "claude-sonnet-4-20250514"])
+        .assert()
+        .success();
+
+    llm_with_dir(&dir)
+        .args(["aliases", "show", "claude"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("claude: claude-sonnet-4-20250514"));
+}
+
+#[test]
+fn aliases_show_missing() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["aliases", "show", "nonexistent"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("alias 'nonexistent' not found"));
+}
+
+#[test]
+fn aliases_remove() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["aliases", "set", "claude", "claude-sonnet-4-20250514"])
+        .assert()
+        .success();
+
+    llm_with_dir(&dir)
+        .args(["aliases", "remove", "claude"])
+        .assert()
+        .success();
+
+    llm_with_dir(&dir)
+        .args(["aliases", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No aliases set"));
+}
+
+#[test]
+fn aliases_remove_missing() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["aliases", "remove", "nonexistent"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("alias 'nonexistent' not found"));
+}
+
+#[test]
+fn aliases_list_empty() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["aliases", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No aliases set"));
+}
+
+#[test]
+fn help_shows_aliases_subcommand() {
+    llm()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("aliases"));
+}
