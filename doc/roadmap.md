@@ -26,6 +26,7 @@ Unix-philosophy agentic CLI for LLMs, inspired by [simonw/llm](https://github.co
 | 2 --- Tools & Structured Output | v0.2 | Complete | Tool calling (both providers), chain loop, built-in tools, schema DSL, `--schema`/`--schema-multi` |
 | 3 --- Conversations & Multi-turn | v0.3 | Complete | `Message`/`Role` types, `-c`/`--cid`, `llm chat` REPL, full `llm logs` feature set |
 | 4 --- Extensibility & More | v0.4 | Complete | Subprocess tools + providers, `llm plugins`, `--verbose`, `-o/--option`, aliases |
+| 5 --- Agent Config & Discovery | v0.5 | Complete | Agent TOML config, directory discovery (local shadows global), `llm agent run/list/show/init/path` |
 
 ---
 
@@ -34,15 +35,14 @@ Unix-philosophy agentic CLI for LLMs, inspired by [simonw/llm](https://github.co
 ### Axe: Agent Features (prioritized, see [readiness assessment](research/axe-readiness-assessment.md))
 
 **Tier 1** — zero unresolved deps, highest value:
-- Agent config & discovery --- TOML config (`model`, `system_prompt`, `tools`, `budget`), `.llm/agents/` with local-shadows-global, `llm agent run <name>`
 - Budget tracking (accumulation + display) --- cross-turn token accumulation in `chain()`, surface via `-u`/`ChainEvent`
 
 **Tier 2** — zero or newly-resolved deps:
 - Retry/backoff --- exponential backoff + jitter for 429/5xx, wraps provider calls
-- Dry-run mode --- `--dry-run` resolves agent config and prints without LLM call (depends on Tier 1 agent config)
+- Dry-run mode --- `--dry-run` resolves agent config and prints without LLM call
 - Parallel tool execution --- `JoinSet` in `chain()` tool dispatch
 
-**Tier 3** — higher complexity, depends on Tier 1:
+**Tier 3** — higher complexity:
 - Sub-agent delegation --- `call_agent` tool spawning child `llm agent run` (+ exit-code-4, `LLM_BUDGET_REMAINING` env var)
 - Memory system --- per-agent JSONL storage; pluggable backends (markdown, SQLite, Redis) deferred
 

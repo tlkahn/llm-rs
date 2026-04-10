@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod aliases;
 pub mod chat;
 pub mod keys;

@@ -66,6 +66,15 @@ Python maintains parallel sync and async class hierarchies (`Model`/`AsyncModel`
 
 Python scatters state across `keys.json`, `aliases.json`, `default_model.txt`, `options.json`, and YAML templates. Rust consolidates into two files: `config.toml` (settings, aliases, options) + `keys.toml` (API keys, 0600 permissions). Both under XDG-compliant paths.
 
+### Agent Config as TOML Files
+
+Agents are TOML files in discoverable directories, not database records or code definitions. This matches the Unix philosophy: agents are config, not programs.
+
+- **Global + local directories**: `$XDG_CONFIG_HOME/llm/agents/` for global, `$CWD/.llm/agents/` for project-local. Local shadows global (same name wins), analogous to `.gitignore` or `.env` layering.
+- **Name derived from filename**: `reviewer.toml` -> agent name `reviewer`. No separate name field, no registry, no ID generation. The filesystem is the index.
+- **All fields optional**: An empty `.toml` file is a valid agent that uses all defaults. This makes `llm agent init` trivial and lets users build up config incrementally.
+- **Stub fields for future tiers**: `sub_agents`, `memory`, `budget` parse and persist but aren't wired. This avoids breaking config files when those features ship — users can start writing configs now.
+
 ### Platform Abstraction (WASM + Python)
 
 `llm-core` production code has zero tokio usage. `llm-openai` has exactly 3 tokio-specific lines in its streaming path. Platform portability is achieved through surgical cfg-gating:

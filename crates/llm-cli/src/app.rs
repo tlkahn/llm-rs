@@ -55,4 +55,9 @@ pub enum Commands {
         #[command(subcommand)]
         command: commands::aliases::AliasesCommand,
     },
+    /// Run and manage agents
+    Agent {
+        #[command(subcommand)]
+        command: commands::agent::AgentCommand,
+    },
 }

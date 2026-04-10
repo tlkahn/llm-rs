@@ -72,6 +72,10 @@ impl Paths {
     pub fn logs_dir(&self) -> PathBuf {
         self.data_dir.join("logs")
     }
+
+    pub fn agents_dir(&self) -> PathBuf {
+        self.config_dir.join("agents")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +355,22 @@ mod tests {
         assert_eq!(paths.config_file(), PathBuf::from("/base/config.toml"));
         assert_eq!(paths.keys_file(), PathBuf::from("/base/keys.toml"));
         assert_eq!(paths.logs_dir(), PathBuf::from("/base/logs"));
+        assert_eq!(paths.agents_dir(), PathBuf::from("/base/agents"));
+    }
+
+    #[test]
+    fn paths_agents_dir() {
+        let paths = Paths {
+            config_dir: PathBuf::from("/etc/llm"),
+            data_dir: PathBuf::from("/var/llm"),
+        };
+        assert_eq!(paths.agents_dir(), PathBuf::from("/etc/llm/agents"));
+    }
+
+    #[test]
+    fn paths_agents_dir_from_dir() {
+        let paths = Paths::from_dir(Path::new("/tmp/llm-test"));
+        assert_eq!(paths.agents_dir(), PathBuf::from("/tmp/llm-test/agents"));
     }
 
     #[test]

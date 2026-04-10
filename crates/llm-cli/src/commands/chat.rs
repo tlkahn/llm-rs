@@ -3,10 +3,11 @@ use std::io::Write;
 use clap::{ArgAction, Args};
 use futures::StreamExt;
 use llm_core::{
-    ChainEvent, Chunk, Config, KeyStore, Message, Paths, Prompt, Provider, Response,
+    ChainEvent, Chunk, Config, KeyStore, Message, Paths, Prompt, Response,
     collect_text, collect_tool_calls, collect_usage, resolve_key,
 };
 
+use super::prompt::find_provider;
 use super::providers;
 use super::tools::{BuiltinToolRegistry, CliToolExecutor};
 use crate::subprocess::tool::ExternalToolExecutor;
@@ -258,18 +259,3 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
     Ok(())
 }
 
-fn find_provider<'a>(
-    providers: &'a [Box<dyn Provider>],
-    model_id: &str,
-) -> llm_core::Result<(&'a dyn Provider, llm_core::ModelInfo)> {
-    for provider in providers {
-        for model in provider.models() {
-            if model.id == model_id {
-                return Ok((provider.as_ref(), model));
-            }
-        }
-    }
-    Err(llm_core::LlmError::Model(format!(
-        "unknown model: {model_id}"
-    )))
-}

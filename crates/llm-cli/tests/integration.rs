@@ -2200,3 +2200,344 @@ fn help_shows_aliases_subcommand() {
         .success()
         .stdout(predicate::str::contains("aliases"));
 }
+
+// ==========================================================================
+// Phase 5: Agent commands
+// ==========================================================================
+
+#[test]
+fn help_shows_agent_subcommand() {
+    llm()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("agent"));
+}
+
+// --- agent path ---
+
+#[test]
+fn agent_path_shows_directories() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["agent", "path"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Global:"))
+        .stdout(predicate::str::contains("Local:"));
+}
+
+// --- agent list ---
+
+#[test]
+fn agent_list_empty() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["agent", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No agents found"));
+}
+
+#[test]
+fn agent_list_with_agents() {
+    let dir = TempDir::new().unwrap();
+    let agents_dir = dir.path().join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+    fs::write(
+        agents_dir.join("reviewer.toml"),
+        "model = \"gpt-4o\"\nsystem_prompt = \"Review code.\"\n",
+    )
+    .unwrap();
+    fs::write(
+        agents_dir.join("helper.toml"),
+        "model = \"gpt-4o-mini\"\n",
+    )
+    .unwrap();
+
+    llm_with_dir(&dir)
+        .args(["agent", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("helper"))
+        .stdout(predicate::str::contains("reviewer"))
+        .stdout(predicate::str::contains("gpt-4o"));
+}
+
+// --- agent show ---
+
+#[test]
+fn agent_show_existing() {
+    let dir = TempDir::new().unwrap();
+    let agents_dir = dir.path().join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+    fs::write(
+        agents_dir.join("reviewer.toml"),
+        "model = \"gpt-4o\"\nsystem_prompt = \"Review code.\"\ntools = [\"llm_time\"]\nchain_limit = 15\n",
+    )
+    .unwrap();
+
+    llm_with_dir(&dir)
+        .args(["agent", "show", "reviewer"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Agent: reviewer"))
+        .stdout(predicate::str::contains("Model: gpt-4o"))
+        .stdout(predicate::str::contains("System: Review code."))
+        .stdout(predicate::str::contains("Tools: llm_time"))
+        .stdout(predicate::str::contains("Chain limit: 15"));
+}
+
+#[test]
+fn agent_show_nonexistent() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["agent", "show", "nonexistent"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("agent not found"));
+}
+
+// --- agent init ---
+
+#[test]
+fn agent_init_local() {
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+
+    llm_with_dir(&dir)
+        .args(["agent", "init", "myagent"])
+        .current_dir(&cwd)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created"));
+
+    let agent_file = cwd.join(".llm").join("agents").join("myagent.toml");
+    assert!(agent_file.exists());
+    let content = fs::read_to_string(agent_file).unwrap();
+    assert!(content.contains("# Agent: myagent"));
+}
+
+#[test]
+fn agent_init_global() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["agent", "init", "myagent", "--global"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created"));
+
+    let agent_file = dir.path().join("agents").join("myagent.toml");
+    assert!(agent_file.exists());
+}
+
+#[test]
+fn agent_init_already_exists() {
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().join("project");
+    let agents_dir = cwd.join(".llm").join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+    fs::write(agents_dir.join("myagent.toml"), "model = \"gpt-4o\"\n").unwrap();
+
+    llm_with_dir(&dir)
+        .args(["agent", "init", "myagent"])
+        .current_dir(&cwd)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("agent already exists"));
+}
+
+// --- agent run ---
+
+#[tokio::test]
+async fn agent_run_basic() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+    let agents_dir = dir.path().join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+    fs::write(
+        agents_dir.join("greeter.toml"),
+        "model = \"gpt-4o-mini\"\nsystem_prompt = \"You greet people.\"\n",
+    )
+    .unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .and(body_string_contains("You greet people"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_non_streaming_body("Hello there!")),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args(["agent", "run", "greeter", "--no-stream", "Hi!"])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Hello there!"));
+}
+
+#[tokio::test]
+async fn agent_run_stdin() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+    let agents_dir = dir.path().join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+    fs::write(
+        agents_dir.join("greeter.toml"),
+        "model = \"gpt-4o-mini\"\n",
+    )
+    .unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_non_streaming_body("Response!")),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args(["agent", "run", "greeter", "--no-stream"])
+        .write_stdin("Hello from stdin\n")
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Response!"));
+}
+
+#[tokio::test]
+async fn agent_run_model_override() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+    let agents_dir = dir.path().join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+    fs::write(
+        agents_dir.join("greeter.toml"),
+        "model = \"gpt-4o-mini\"\n",
+    )
+    .unwrap();
+
+    // Mock expects gpt-4o model (overridden from agent's gpt-4o-mini)
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .and(body_string_contains("gpt-4o"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_non_streaming_body("Overridden!")),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args(["agent", "run", "greeter", "--no-stream", "-m", "gpt-4o", "Hi"])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Overridden!"));
+}
+
+#[tokio::test]
+async fn agent_run_system_override() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+    let agents_dir = dir.path().join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+    fs::write(
+        agents_dir.join("greeter.toml"),
+        "model = \"gpt-4o-mini\"\nsystem_prompt = \"Original system.\"\n",
+    )
+    .unwrap();
+
+    // Verify the overridden system prompt is sent
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .and(body_string_contains("Overridden system"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_non_streaming_body("OK")),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args(["agent", "run", "greeter", "--no-stream", "-s", "Overridden system", "Hi"])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK"));
+}
+
+#[tokio::test]
+async fn agent_run_json_output() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+    let agents_dir = dir.path().join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+    fs::write(
+        agents_dir.join("greeter.toml"),
+        "model = \"gpt-4o-mini\"\n",
+    )
+    .unwrap();
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_non_streaming_body("JSON output")),
+        )
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args(["agent", "run", "greeter", "--json", "Hi"])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"model\""))
+        .stdout(predicate::str::contains("\"content\""))
+        .stdout(predicate::str::contains("JSON output"));
+}
+
+#[test]
+fn agent_run_nonexistent() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["agent", "run", "nonexistent", "Hi"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("agent not found"));
+}
+
+#[test]
+fn agent_run_unknown_tool() {
+    let dir = TempDir::new().unwrap();
+    let agents_dir = dir.path().join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+    fs::write(
+        agents_dir.join("bad.toml"),
+        "model = \"gpt-4o-mini\"\ntools = [\"nonexistent_tool_xyz\"]\n",
+    )
+    .unwrap();
+
+    llm_with_dir(&dir)
+        .args(["agent", "run", "bad", "Hi"])
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unknown tool"));
+}

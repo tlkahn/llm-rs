@@ -368,7 +368,7 @@ pub async fn run(args: &PromptArgs) -> llm_core::Result<()> {
     Ok(())
 }
 
-fn resolve_prompt_text(
+pub(crate) fn resolve_prompt_text(
     arg_text: &Option<String>,
     allow_empty: bool,
     skip_stdin: bool,
@@ -444,7 +444,7 @@ pub fn format_chain_event(event: &ChainEvent, verbose: u8, _chain_limit: usize) 
 }
 
 /// Summarize a message list as e.g. "user, assistant+tools(1), tool(1)"
-fn format_message_summary(messages: &[Message]) -> String {
+pub(crate) fn format_message_summary(messages: &[Message]) -> String {
     messages
         .iter()
         .map(|m| match m.role {
@@ -462,7 +462,7 @@ fn format_message_summary(messages: &[Message]) -> String {
         .join(", ")
 }
 
-fn find_provider<'a>(
+pub(crate) fn find_provider<'a>(
     providers: &'a [Box<dyn Provider>],
     model_id: &str,
 ) -> llm_core::Result<(&'a dyn Provider, llm_core::ModelInfo)> {

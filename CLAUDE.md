@@ -7,12 +7,12 @@ LLM-RS: Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) (v0
 ## Commands
 
 ```bash
-cargo test --workspace           # Run all 416 tests
-cargo test -p llm-core           # Core types/traits/config/schema/chain/messages (143 tests)
+cargo test --workspace           # Run all 452 tests
+cargo test -p llm-core           # Core types/traits/config/schema/chain/messages/agent (163 tests)
 cargo test -p llm-openai         # OpenAI provider (42 tests)
 cargo test -p llm-anthropic      # Anthropic provider (48 tests)
 cargo test -p llm-store          # JSONL storage (49 tests)
-cargo test -p llm-cli            # CLI unit (50) + integration (84) tests
+cargo test -p llm-cli            # CLI unit (50) + integration (100) tests
 cargo clippy --workspace         # Lint
 cargo build --release -p llm-cli # Build optimized binary
 
@@ -57,11 +57,21 @@ Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry poi
 
 ### Config system (llm-core/config.rs)
 
-- **`Paths`**: XDG path resolution. `LLM_USER_PATH` -> flat layout; else `$XDG_CONFIG_HOME/llm` + `$XDG_DATA_HOME/llm` with `~/.config` / `~/.local/share` fallbacks.
+- **`Paths`**: XDG path resolution. `LLM_USER_PATH` -> flat layout; else `$XDG_CONFIG_HOME/llm` + `$XDG_DATA_HOME/llm` with `~/.config` / `~/.local/share` fallbacks. `agents_dir()` returns `config_dir/agents`.
 - **`Config`**: TOML config (`config.toml`). Fields: `default_model` (default: `"gpt-4o-mini"`), `logging` (default: `true`), `aliases`, `options`, `providers`. All `#[serde(default)]`. `effective_default_model()` checks `LLM_DEFAULT_MODEL` env var. `resolve_model()` resolves aliases. `model_options(model)` returns options HashMap. `set_option(model, key, value)`, `clear_option(model, key)`, `clear_model_options(model)` for CRUD.
 - **`parse_option_value(s)`**: smart coercion of string to JSON value (int, float, bool, null, fallback string).
 - **`KeyStore`**: TOML key storage (`keys.toml`). `load/get/set/list/path`. `set()` writes 0o600 on Unix, creates parent dirs.
 - **`resolve_key()`**: 4-level chain: explicit `--key` -> `keys.toml` -> env var -> `NeedsKey` error.
+
+### Agent system (llm-core/agent.rs)
+
+- **`AgentConfig`**: TOML config loaded from agent files. Fields: `model` (Option), `system_prompt` (Option), `tools` (Vec), `chain_limit` (default 10), `options` (HashMap), `sub_agents` (Vec, stub), `memory` (Option<MemoryConfig>, stub), `budget` (Option<BudgetConfig>, stub). `AgentConfig::load(path)` returns error if file not found (unlike `Config`).
+- **`MemoryConfig`**: stub — `enabled` (bool), `last_n` (Option<usize>). Parsed but not wired up.
+- **`BudgetConfig`**: stub — `max_tokens` (Option<u64>). Parsed but not wired up.
+- **`AgentSource`**: enum `Global` / `Local`. Display trait for output.
+- **`AgentInfo`**: name + path + source. Returned by discovery.
+- **`discover_agents(global_dir, local_dir)`**: scans `.toml` files in both dirs. Local shadows global (same name). Sorted alphabetically. Nonexistent dirs silently skipped.
+- **`resolve_agent(name, global_dir, local_dir)`**: finds agent by name, returns `(AgentConfig, PathBuf)`. Local wins. Error if not found.
 
 ### Providers
 
@@ -96,6 +106,11 @@ Binary name: `llm`. Built with `clap` derive macros.
 - `llm options set/get/list/clear` --- manage per-model options in config.toml
 - `llm aliases set/show/list/remove/path` --- manage model aliases in config.toml
 - `llm plugins list` --- show compiled providers, external providers, and external tools
+- `llm agent run <name> [prompt]` --- run an agent (accepts stdin). Flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-v/--verbose`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--json`
+- `llm agent list` --- list discovered agents (name, model, source)
+- `llm agent show <name>` --- print agent config details
+- `llm agent init <name> [--global]` --- scaffold TOML template (local by default)
+- `llm agent path` --- print global and local agent directory paths
 
 **Exit codes:** 0 success, 1 runtime, 2 config/key/model, 3 provider/network.
 
@@ -128,6 +143,8 @@ Phase 4 model options complete --- `-o/--option` flag on `prompt` and `chat` com
 Phase 4 aliases complete --- `Config.set_alias/remove_alias` methods. `llm aliases set/show/list/remove/path` subcommands for managing model aliases in `config.toml`. `resolve_model()` (already existed) resolves aliases at runtime in prompt/chat. No transitive resolution (matches simonw/llm behavior).
 
 Phase 4 (v0.4) is complete. See `doc/roadmap.md` for future work.
+
+Phase 5 agent config & discovery complete --- `AgentConfig` struct with TOML parsing (`model`, `system_prompt`, `tools`, `chain_limit`, `options`, plus `sub_agents`/`memory`/`budget` stubs). `Paths.agents_dir()`. Discovery: `discover_agents()` scans global (`$XDG_CONFIG_HOME/llm/agents/`) and local (`$CWD/.llm/agents/`) directories, local shadows global. `resolve_agent()` finds agent by name. CLI: `llm agent run <name> [prompt]` resolves config, model (CLI > agent TOML > global default), tools, builds prompt with system_prompt, calls `chain()`. `llm agent list/show/init/path` management commands. Shared helpers (`find_provider`, `resolve_prompt_text`, `format_chain_event`) extracted from `prompt.rs` as `pub(crate)` and reused by `agent.rs` and `chat.rs`.
 
 ## Conventions
 

@@ -102,4 +102,4 @@ Surgical cfg-gating — `llm-core` had `tokio` as a dependency but never used it
 
 **Per-iteration `collect_usage()` before `all_chunks.extend()`.** Moving chunks into `all_chunks` consumes them; collect usage first. The `usage.clone()` in `IterationEnd` is cheap (`Option<Usage>`).
 
-**`format_chain_event` shared via `pub` on prompt module.** Called from `chat` via `super::prompt::format_chain_event()`. A shared `verbose.rs` module would be premature — move it when more commands need it.
+**`format_chain_event` shared via `pub(crate)` on prompt module.** Called from `chat` and `agent` via `super::prompt::format_chain_event()`. `find_provider()` and `resolve_prompt_text()` are also `pub(crate)` in prompt, reused by agent. `chat.rs` had its own duplicate `find_provider()` which was removed. A shared `helpers.rs` module would be premature — move them when the third copy appears.
