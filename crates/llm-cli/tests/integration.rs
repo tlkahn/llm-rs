@@ -2677,3 +2677,97 @@ async fn agent_budget_exhausted_output() {
         .success()
         .stderr(predicate::str::contains("[budget] Budget exhausted: 15/10 tokens used"));
 }
+
+// ==========================================================================
+// Phase 7: Retry / Backoff
+// ==========================================================================
+
+#[test]
+fn retries_flag_accepted() {
+    let dir = TempDir::new().unwrap();
+    // --retries flag parses without error (fails for a different reason: no key)
+    llm_with_dir(&dir)
+        .args(["prompt", "--retries", "3", "--no-stream", "hello"])
+        .env("OPENAI_BASE_URL", "http://127.0.0.1:1")
+        .assert()
+        .failure();
+}
+
+#[tokio::test]
+async fn retries_on_429() {
+    let dir = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+
+    // First request returns 429, second returns success
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(&openai_text_response("OK")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args(["prompt", "--retries", "2", "--no-stream", "-n", "hello"])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK"))
+        .stderr(predicate::str::contains("[retry]"));
+}
+
+#[tokio::test]
+async fn retries_exhausted_returns_error() {
+    let dir = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+
+    // All requests return 500
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("server error"))
+        .expect(3) // 1 original + 2 retries
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args(["prompt", "--retries", "2", "--no-stream", "-n", "hello"])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("HTTP error 500"));
+}
+
+#[tokio::test]
+async fn no_retry_on_401() {
+    let dir = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+
+    // 401 is not retryable — should fail immediately with only 1 call
+    Mock::given(method("POST"))
+        .and(match_path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    llm_with_dir(&dir)
+        .args(["prompt", "--retries", "3", "--no-stream", "-n", "hello"])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "sk-test")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("HTTP error 401"));
+}

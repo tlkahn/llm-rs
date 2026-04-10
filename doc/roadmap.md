@@ -28,6 +28,7 @@ Unix-philosophy agentic CLI for LLMs, inspired by [simonw/llm](https://github.co
 | 4 --- Extensibility & More | v0.4 | Complete | Subprocess tools + providers, `llm plugins`, `--verbose`, `-o/--option`, aliases |
 | 5 --- Agent Config & Discovery | v0.5 | Complete | Agent TOML config, directory discovery (local shadows global), `llm agent run/list/show/init/path` |
 | 6 --- Budget Tracking | v0.6 | Complete | `Usage::add()`/`total()`, cumulative chain usage, budget enforcement, `-u` totals, chat session usage |
+| 7 --- Retry/Backoff | v0.7 | Complete | `HttpError` variant, `RetryConfig`, `RetryProvider` wrapper, `--retries` flag on prompt/chat/agent |
 
 ---
 
@@ -36,7 +37,6 @@ Unix-philosophy agentic CLI for LLMs, inspired by [simonw/llm](https://github.co
 ### Axe: Agent Features (prioritized, see [readiness assessment](research/axe-readiness-assessment.md))
 
 **Tier 2** — zero or newly-resolved deps:
-- Retry/backoff --- exponential backoff + jitter for 429/5xx, wraps provider calls
 - Dry-run mode --- `--dry-run` resolves agent config and prints without LLM call
 - Parallel tool execution --- `JoinSet` in `chain()` tool dispatch
 

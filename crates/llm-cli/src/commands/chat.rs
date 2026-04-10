@@ -3,13 +3,14 @@ use std::io::Write;
 use clap::{ArgAction, Args};
 use futures::StreamExt;
 use llm_core::{
-    ChainEvent, Chunk, Config, KeyStore, Message, Paths, Prompt, Response, Usage,
-    collect_text, collect_tool_calls, collect_usage, resolve_key,
+    ChainEvent, Chunk, Config, KeyStore, Message, Paths, Prompt, Provider, Response, RetryConfig,
+    Usage, collect_text, collect_tool_calls, collect_usage, resolve_key,
 };
 
 use super::prompt::find_provider;
 use super::providers;
 use super::tools::{BuiltinToolRegistry, CliToolExecutor};
+use crate::retry::RetryProvider;
 use crate::subprocess::tool::ExternalToolExecutor;
 
 #[derive(Args)]
@@ -37,6 +38,10 @@ pub struct ChatArgs {
     /// Verbose chain loop output (-v summary, -vv full messages). Implies --tools-debug.
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
+
+    /// Maximum number of retries for transient HTTP errors (429, 5xx)
+    #[arg(long)]
+    pub retries: Option<u32>,
 }
 
 pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
@@ -55,6 +60,18 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
     // Find the provider for this model
     let all_providers = providers().await;
     let (provider, _model_info) = find_provider(&all_providers, &model_id)?;
+
+    // Wrap provider with retry logic if --retries is set
+    let retry_provider;
+    let provider: &dyn Provider = if let Some(retries) = args.retries {
+        retry_provider = RetryProvider::new(
+            provider,
+            RetryConfig { max_retries: retries, ..Default::default() },
+        );
+        &retry_provider
+    } else {
+        provider
+    };
 
     // Resolve key (skip if provider doesn't need one)
     let key = if provider.needs_key().is_some() {

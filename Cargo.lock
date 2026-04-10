@@ -1005,6 +1005,7 @@ name = "llm-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "fastrand",
  "futures",
  "serde",
  "serde_json",

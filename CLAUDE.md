@@ -7,12 +7,12 @@ LLM-RS: Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) (v0
 ## Commands
 
 ```bash
-cargo test --workspace           # Run all 469 tests
-cargo test -p llm-core           # Core types/traits/config/schema/chain/messages/agent (177 tests)
-cargo test -p llm-openai         # OpenAI provider (42 tests)
-cargo test -p llm-anthropic      # Anthropic provider (48 tests)
+cargo test --workspace           # Run all 497 tests
+cargo test -p llm-core           # Core types/traits/config/schema/chain/messages/agent/retry (192 tests)
+cargo test -p llm-openai         # OpenAI provider (44 tests)
+cargo test -p llm-anthropic      # Anthropic provider (50 tests)
 cargo test -p llm-store          # JSONL storage (49 tests)
-cargo test -p llm-cli            # CLI unit (50) + integration (103) tests
+cargo test -p llm-cli            # CLI unit (55) + integration (107) tests
 cargo clippy --workspace         # Lint
 cargo build --release -p llm-cli # Build optimized binary
 
@@ -47,7 +47,8 @@ Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry poi
 - **`Response`** (`types.rs`): materialized post-stream result (16 fields: id, model, prompt, system, response text, options, usage, tool_calls, tool_results, attachments, schema, schema_id, duration_ms, datetime).
 - **`Chunk`** (`stream.rs`): streaming enum (`Text`, `ToolCallStart`, `ToolCallDelta`, `Usage`, `Done`).
 - **`ResponseStream`**: `Pin<Box<dyn Stream<Item=Result<Chunk>> + Send>>` (native); without `Send` on wasm32.
-- **`LlmError`** (`error.rs`): six variants (`Model`, `NeedsKey`, `Provider`, `Config`, `Io`, `Store`).
+- **`LlmError`** (`error.rs`): seven variants (`Model`, `NeedsKey`, `Provider`, `HttpError`, `Config`, `Io`, `Store`). `HttpError { status: u16, message: String }` for HTTP-level errors. `is_retryable()` returns `true` for 429 and 5xx status codes.
+- **`RetryConfig`** (`retry.rs`): exponential backoff configuration. Fields: `max_retries` (default 3), `base_delay_ms` (default 1000), `max_delay_ms` (default 30000), `jitter` (default true). `delay_for_attempt(attempt) -> Duration` computes delay with exponential backoff and optional jitter. Serde-compatible (TOML/JSON).
 - Stream helpers: `collect_text()`, `collect_tool_calls()`, `collect_usage()`.
 - **`ToolExecutor` trait** (`chain.rs`): async interface for executing tool calls. `execute(&ToolCall) -> ToolResult`.
 - **`Usage`** (`types.rs`): token usage with `input`, `output`, `details` fields. `add(&other)` combines two Usage values (summing fields). `total()` returns input + output (treating None as 0).
@@ -67,7 +68,7 @@ Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry poi
 
 ### Agent system (llm-core/agent.rs)
 
-- **`AgentConfig`**: TOML config loaded from agent files. Fields: `model` (Option), `system_prompt` (Option), `tools` (Vec), `chain_limit` (default 10), `options` (HashMap), `sub_agents` (Vec, stub), `memory` (Option<MemoryConfig>, stub), `budget` (Option<BudgetConfig>, wired). `AgentConfig::load(path)` returns error if file not found (unlike `Config`).
+- **`AgentConfig`**: TOML config loaded from agent files. Fields: `model` (Option), `system_prompt` (Option), `tools` (Vec), `chain_limit` (default 10), `options` (HashMap), `sub_agents` (Vec, stub), `memory` (Option<MemoryConfig>, stub), `budget` (Option<BudgetConfig>, wired), `retry` (Option<RetryConfig>, wired). `AgentConfig::load(path)` returns error if file not found (unlike `Config`).
 - **`MemoryConfig`**: stub — `enabled` (bool), `last_n` (Option<usize>). Parsed but not wired up.
 - **`BudgetConfig`**: `max_tokens` (Option<u64>). Wired to `chain()` budget enforcement in agent run.
 - **`AgentSource`**: enum `Global` / `Local`. Display trait for output.
@@ -77,9 +78,9 @@ Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry poi
 
 ### Providers
 
-**OpenAI** (`llm-openai`): `POST /v1/chat/completions`, `Authorization: Bearer` auth, SSE with `data: [DONE]` sentinel, `stream_options.include_usage` for token counts. Tool calling via `tools` + `tool_calls` in delta/message. Structured output via `response_format: { type: "json_schema" }`. Models: `gpt-4o`, `gpt-4o-mini`.
+**OpenAI** (`llm-openai`): `POST /v1/chat/completions`, `Authorization: Bearer` auth, SSE with `data: [DONE]` sentinel, `stream_options.include_usage` for token counts. Tool calling via `tools` + `tool_calls` in delta/message. Structured output via `response_format: { type: "json_schema" }`. HTTP errors returned as `LlmError::HttpError { status, message }`. Models: `gpt-4o`, `gpt-4o-mini`.
 
-**Anthropic** (`llm-anthropic`): `POST /v1/messages`, `x-api-key` + `anthropic-version: 2023-06-01` headers, typed SSE events (`message_start`, `content_block_start`, `content_block_delta`, `message_delta`, `message_stop`), `max_tokens` required (default 4096), system prompt as top-level field (not in messages). Tool calling via `tools` + `tool_use` content blocks + `input_json_delta` streaming. Structured output via transparent `_schema_output` tool wrapping (tool_use input emitted as Text). Models: `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`.
+**Anthropic** (`llm-anthropic`): `POST /v1/messages`, `x-api-key` + `anthropic-version: 2023-06-01` headers, typed SSE events (`message_start`, `content_block_start`, `content_block_delta`, `message_delta`, `message_stop`), `max_tokens` required (default 4096), system prompt as top-level field (not in messages). Tool calling via `tools` + `tool_use` content blocks + `input_json_delta` streaming. Structured output via transparent `_schema_output` tool wrapping (tool_use input emitted as Text). HTTP errors returned as `LlmError::HttpError { status, message }`. Models: `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`.
 
 ### Storage (llm-store)
 
@@ -96,8 +97,8 @@ Binary name: `llm`. Built with `clap` derive macros.
 **Provider registry:** `commands/mod.rs::providers()` returns `Vec<Box<dyn Provider>>` with `#[cfg(feature)]`-gated providers. `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` env vars override API endpoints. Both `openai` and `anthropic` features are default-on.
 
 **Commands:**
-- `llm prompt <text>` --- flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-o/--option`, `-T/--tool`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--schema`, `--schema-multi`, `-c/--continue`, `--cid`, `--messages`, `--json`, `-v/--verbose` (count: `-v` summary, `-vv` full messages)
-- `llm chat` --- interactive REPL with `rustyline`. Flags: `-m`, `-s`, `-o/--option`, `-T/--tool`, `--chain-limit`, `-v/--verbose`
+- `llm prompt <text>` --- flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-o/--option`, `-T/--tool`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--schema`, `--schema-multi`, `-c/--continue`, `--cid`, `--messages`, `--json`, `-v/--verbose` (count: `-v` summary, `-vv` full messages), `--retries`
+- `llm chat` --- interactive REPL with `rustyline`. Flags: `-m`, `-s`, `-o/--option`, `-T/--tool`, `--chain-limit`, `-v/--verbose`, `--retries`
 - `llm keys set/get/list/path` --- `set` uses rpassword for hidden terminal input
 - `llm models list` / `llm models default [model]`
 - `llm logs list [--json] [-r] [-n count] [-m model] [-q query] [-u]` / `llm logs path` / `llm logs status` / `llm logs on` / `llm logs off`
@@ -108,7 +109,7 @@ Binary name: `llm`. Built with `clap` derive macros.
 - `llm options set/get/list/clear` --- manage per-model options in config.toml
 - `llm aliases set/show/list/remove/path` --- manage model aliases in config.toml
 - `llm plugins list` --- show compiled providers, external providers, and external tools
-- `llm agent run <name> [prompt]` --- run an agent (accepts stdin). Flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-v/--verbose`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--json`
+- `llm agent run <name> [prompt]` --- run an agent (accepts stdin). Flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-v/--verbose`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--json`, `--retries`
 - `llm agent list` --- list discovered agents (name, model, source)
 - `llm agent show <name>` --- print agent config details
 - `llm agent init <name> [--global]` --- scaffold TOML template (local by default)
@@ -144,11 +145,13 @@ Phase 4 model options complete --- `-o/--option` flag on `prompt` and `chat` com
 
 Phase 4 aliases complete --- `Config.set_alias/remove_alias` methods. `llm aliases set/show/list/remove/path` subcommands for managing model aliases in `config.toml`. `resolve_model()` (already existed) resolves aliases at runtime in prompt/chat. No transitive resolution (matches simonw/llm behavior).
 
-Phase 4 (v0.4) is complete. Phase 6 (budget tracking) is complete. See `doc/roadmap.md` for future work.
+Phase 4 (v0.4) is complete. Phase 6 (budget tracking) is complete. Phase 7 (retry/backoff) is complete. See `doc/roadmap.md` for future work.
 
 Phase 5 agent config & discovery complete --- `AgentConfig` struct with TOML parsing (`model`, `system_prompt`, `tools`, `chain_limit`, `options`, plus `sub_agents`/`memory`/`budget` stubs). `Paths.agents_dir()`. Discovery: `discover_agents()` scans global (`$XDG_CONFIG_HOME/llm/agents/`) and local (`$CWD/.llm/agents/`) directories, local shadows global. `resolve_agent()` finds agent by name. CLI: `llm agent run <name> [prompt]` resolves config, model (CLI > agent TOML > global default), tools, builds prompt with system_prompt, calls `chain()`. `llm agent list/show/init/path` management commands. Shared helpers (`find_provider`, `resolve_prompt_text`, `format_chain_event`) extracted from `prompt.rs` as `pub(crate)` and reused by `agent.rs` and `chat.rs`.
 
 Phase 6 budget tracking complete --- `Usage::add()` and `Usage::total()` accumulation helpers. `ChainResult.total_usage` accumulates usage across all chain iterations. `ChainEvent::IterationEnd` includes `cumulative_usage`. `chain()` gains `budget: Option<u64>` parameter — exceeding budget triggers `ChainEvent::BudgetExhausted` and graceful stop (like chain_limit). `ChainResult.budget_exhausted` flag. `-u` flag now shows cumulative usage across chain iterations. Verbose output includes cumulative usage per iteration. `BudgetConfig.max_tokens` wired from agent TOML to `chain()`. Agent budget exhaustion prints `[budget]` warning. Chat REPL tracks session-wide cumulative usage across turns, prints summary on exit.
+
+Phase 7 retry/backoff complete --- `LlmError::HttpError { status, message }` variant for HTTP-level errors (replacing opaque `Provider` strings for HTTP failures). `is_retryable()` method returns `true` for 429 and 5xx. `RetryConfig` struct in `llm-core/retry.rs` with exponential backoff + jitter (`delay_for_attempt()`). `RetryProvider` wrapper in `llm-cli/retry.rs` decorates any `Provider` with retry logic (pre-stream only). `--retries` flag on `prompt`, `chat`, and `agent run` commands. Agent TOML `[retry]` section wired — CLI `--retries` overrides agent config. Both OpenAI and Anthropic providers emit `HttpError` for non-success HTTP status codes.
 
 ## Conventions
 

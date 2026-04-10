@@ -3,6 +3,7 @@ pub mod chain;
 pub mod config;
 pub mod error;
 pub mod provider;
+pub mod retry;
 pub mod schema;
 pub mod stream;
 pub mod types;
@@ -12,6 +13,7 @@ pub use agent::{AgentConfig, AgentInfo, AgentSource, discover_agents, resolve_ag
 pub use chain::{ChainEvent, ChainResult, ToolExecutor, chain};
 pub use config::{Config, KeyStore, Paths, parse_option_value, resolve_key};
 pub use error::{LlmError, Result};
+pub use retry::RetryConfig;
 pub use provider::Provider;
 pub use schema::{multi_schema, parse_schema_dsl};
 pub use stream::{Chunk, ResponseStream, collect_text, collect_tool_calls, collect_usage};

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{LlmError, Result};
+use crate::retry::RetryConfig;
 
 // ---------------------------------------------------------------------------
 // AgentConfig
@@ -47,6 +48,10 @@ pub struct AgentConfig {
     /// Budget configuration (max_tokens enforced by chain loop).
     #[serde(default)]
     pub budget: Option<BudgetConfig>,
+
+    /// Retry configuration for transient HTTP errors.
+    #[serde(default)]
+    pub retry: Option<RetryConfig>,
 }
 
 impl Default for AgentConfig {
@@ -60,6 +65,7 @@ impl Default for AgentConfig {
             sub_agents: Vec::new(),
             memory: None,
             budget: None,
+            retry: None,
         }
     }
 }
@@ -218,6 +224,7 @@ mod tests {
         assert!(config.sub_agents.is_empty());
         assert!(config.memory.is_none());
         assert!(config.budget.is_none());
+        assert!(config.retry.is_none());
     }
 
     #[test]
@@ -472,6 +479,55 @@ max_tokens = 100000
         let err = result.unwrap_err();
         assert!(matches!(err, LlmError::Config(_)));
         assert!(err.to_string().contains("agent not found"));
+    }
+
+    // --- Retry config tests ---
+
+    #[test]
+    fn agent_config_parses_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("retry.toml");
+        std::fs::write(
+            &path,
+            r#"
+[retry]
+max_retries = 5
+base_delay_ms = 500
+"#,
+        )
+        .unwrap();
+
+        let config = AgentConfig::load(&path).unwrap();
+        let retry = config.retry.unwrap();
+        assert_eq!(retry.max_retries, 5);
+        assert_eq!(retry.base_delay_ms, 500);
+        // Defaults for unspecified fields
+        assert_eq!(retry.max_delay_ms, 30_000);
+        assert!(retry.jitter);
+    }
+
+    #[test]
+    fn agent_config_retry_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("retry_defaults.toml");
+        std::fs::write(&path, "[retry]\n").unwrap();
+
+        let config = AgentConfig::load(&path).unwrap();
+        let retry = config.retry.unwrap();
+        assert_eq!(retry.max_retries, 3);
+        assert_eq!(retry.base_delay_ms, 1000);
+        assert_eq!(retry.max_delay_ms, 30_000);
+        assert!(retry.jitter);
+    }
+
+    #[test]
+    fn agent_config_no_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("no_retry.toml");
+        std::fs::write(&path, "model = \"gpt-4o-mini\"\n").unwrap();
+
+        let config = AgentConfig::load(&path).unwrap();
+        assert!(config.retry.is_none());
     }
 
     #[test]

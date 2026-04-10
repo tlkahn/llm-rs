@@ -11,6 +11,9 @@ pub enum LlmError {
     #[error("provider error: {0}")]
     Provider(String),
 
+    #[error("HTTP error {status}: {message}")]
+    HttpError { status: u16, message: String },
+
     #[error("config error: {0}")]
     Config(String),
 
@@ -19,6 +22,15 @@ pub enum LlmError {
 
     #[error("store error: {0}")]
     Store(String),
+}
+
+impl LlmError {
+    /// Returns `true` if this error is transient and worth retrying.
+    /// Only HTTP 429 (rate limit) and 5xx (server errors) are retryable.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, LlmError::HttpError { status, .. }
+            if *status == 429 || (500..=599).contains(status))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, LlmError>;
@@ -86,5 +98,44 @@ mod tests {
 
         let err: Result<i32> = Err(LlmError::Config("bad".into()));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn error_display_http() {
+        let err = LlmError::HttpError { status: 429, message: "rate limited".into() };
+        assert_eq!(err.to_string(), "HTTP error 429: rate limited");
+    }
+
+    #[test]
+    fn http_error_retryable_429() {
+        let err = LlmError::HttpError { status: 429, message: "rate limited".into() };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn http_error_retryable_5xx() {
+        for status in [500, 502, 503, 504] {
+            let err = LlmError::HttpError { status, message: "server error".into() };
+            assert!(err.is_retryable(), "status {status} should be retryable");
+        }
+    }
+
+    #[test]
+    fn http_error_not_retryable_4xx() {
+        for status in [400, 401, 403, 404, 422] {
+            let err = LlmError::HttpError { status, message: "client error".into() };
+            assert!(!err.is_retryable(), "status {status} should not be retryable");
+        }
+    }
+
+    #[test]
+    fn non_http_errors_not_retryable() {
+        assert!(!LlmError::Provider("fail".into()).is_retryable());
+        assert!(!LlmError::Model("bad".into()).is_retryable());
+        assert!(!LlmError::NeedsKey("key".into()).is_retryable());
+        assert!(!LlmError::Config("cfg".into()).is_retryable());
+        assert!(!LlmError::Store("store".into()).is_retryable());
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "io");
+        assert!(!LlmError::Io(io_err).is_retryable());
     }
 }

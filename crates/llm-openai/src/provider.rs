@@ -132,14 +132,17 @@ impl Provider for OpenAiProvider {
 
         let status = response.status();
         if !status.is_success() {
+            let status_code = status.as_u16();
             let body = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "unknown error".into());
-            if let Ok(err_resp) = serde_json::from_str::<ErrorResponse>(&body) {
-                return Err(LlmError::Provider(err_resp.error.message));
-            }
-            return Err(LlmError::Provider(format!("HTTP {status}: {body}")));
+            let message = if let Ok(err_resp) = serde_json::from_str::<ErrorResponse>(&body) {
+                err_resp.error.message
+            } else {
+                body
+            };
+            return Err(LlmError::HttpError { status: status_code, message });
         }
 
         if stream {
@@ -474,10 +477,65 @@ data: [DONE]\n\n";
             .execute("gpt-4o-mini", &prompt, Some("bad-key"), true)
             .await;
         assert!(result.is_err());
-        if let Err(LlmError::Provider(msg)) = result {
-            assert!(msg.contains("Incorrect API key"));
+        if let Err(LlmError::HttpError { status, message }) = result {
+            assert_eq!(status, 401);
+            assert!(message.contains("Incorrect API key"));
         } else {
-            panic!("expected Provider error");
+            panic!("expected HttpError");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_429_returns_http_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_string("rate limited"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = make_provider(&server.uri());
+        let prompt = Prompt::new("Hi");
+        let result = provider
+            .execute("gpt-4o-mini", &prompt, Some("sk-test"), true)
+            .await;
+        match result {
+            Err(ref e @ LlmError::HttpError { status, .. }) => {
+                assert_eq!(status, 429);
+                assert!(e.is_retryable());
+            }
+            _ => panic!("expected HttpError with status 429"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_500_returns_http_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string("internal server error"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = make_provider(&server.uri());
+        let prompt = Prompt::new("Hi");
+        let result = provider
+            .execute("gpt-4o-mini", &prompt, Some("sk-test"), true)
+            .await;
+        match result {
+            Err(ref e @ LlmError::HttpError { status, .. }) => {
+                assert_eq!(status, 500);
+                assert!(e.is_retryable());
+            }
+            _ => panic!("expected HttpError with status 500"),
         }
     }
 

@@ -1,5 +1,6 @@
 mod app;
 mod commands;
+mod retry;
 mod subprocess;
 
 use std::ffi::OsString;
@@ -72,6 +73,6 @@ fn exit_code(err: &LlmError) -> i32 {
     match err {
         LlmError::Io(_) | LlmError::Store(_) => 1,
         LlmError::Model(_) | LlmError::NeedsKey(_) | LlmError::Config(_) => 2,
-        LlmError::Provider(_) => 3,
+        LlmError::Provider(_) | LlmError::HttpError { .. } => 3,
     }
 }

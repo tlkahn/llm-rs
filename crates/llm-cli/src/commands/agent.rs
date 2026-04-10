@@ -2,13 +2,15 @@ use std::io::Write;
 
 use clap::{ArgAction, Args, Subcommand};
 use llm_core::{
-    AgentConfig, ChainEvent, Chunk, Config, KeyStore, Paths, Prompt, Response,
-    collect_text, collect_tool_calls, collect_usage, discover_agents, resolve_agent, resolve_key,
+    AgentConfig, ChainEvent, Chunk, Config, KeyStore, Paths, Prompt, Provider, Response,
+    RetryConfig, collect_text, collect_tool_calls, collect_usage, discover_agents, resolve_agent,
+    resolve_key,
 };
 
 use super::prompt::{find_provider, format_chain_event, resolve_prompt_text};
 use super::providers;
 use super::tools::{BuiltinToolRegistry, CliToolExecutor};
+use crate::retry::RetryProvider;
 use crate::subprocess::tool::ExternalToolExecutor;
 
 #[derive(Subcommand)]
@@ -79,6 +81,10 @@ pub struct AgentRunArgs {
     /// Verbose chain loop output (-v summary, -vv full messages). Implies --tools-debug.
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
+
+    /// Maximum number of retries for transient HTTP errors (429, 5xx). Overrides agent TOML.
+    #[arg(long)]
+    pub retries: Option<u32>,
 }
 
 #[derive(Args)]
@@ -182,6 +188,12 @@ fn show_agent(name: &str) -> llm_core::Result<()> {
     if let Some(budget) = &config.budget {
         println!("Budget: max_tokens={:?}", budget.max_tokens);
     }
+    if let Some(retry) = &config.retry {
+        println!(
+            "Retry: max_retries={}, base_delay_ms={}, max_delay_ms={}, jitter={}",
+            retry.max_retries, retry.base_delay_ms, retry.max_delay_ms, retry.jitter
+        );
+    }
     Ok(())
 }
 
@@ -215,6 +227,9 @@ fn init_agent(args: &AgentInitArgs) -> llm_core::Result<()> {
 
 # [options]
 # temperature = 0.7
+
+# [retry]
+# max_retries = 3
 "#,
         args.name
     );
@@ -258,6 +273,19 @@ async fn run_agent(args: &AgentRunArgs) -> llm_core::Result<()> {
     // Find the provider for this model
     let all_providers = providers().await;
     let (provider, _model_info) = find_provider(&all_providers, &model_id)?;
+
+    // Wrap provider with retry logic: CLI --retries overrides agent TOML [retry]
+    let retry_config = args
+        .retries
+        .map(|n| RetryConfig { max_retries: n, ..Default::default() })
+        .or(agent_config.retry.clone());
+    let retry_provider;
+    let provider: &dyn Provider = if let Some(rc) = retry_config {
+        retry_provider = RetryProvider::new(provider, rc);
+        &retry_provider
+    } else {
+        provider
+    };
 
     // Resolve key
     let key = if provider.needs_key().is_some() || args.key.is_some() {
