@@ -7,12 +7,12 @@ LLM-RS: Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) (v0
 ## Commands
 
 ```bash
-cargo test --workspace           # Run all 402 tests
-cargo test -p llm-core           # Core types/traits/config/schema/chain/messages (138 tests)
+cargo test --workspace           # Run all 416 tests
+cargo test -p llm-core           # Core types/traits/config/schema/chain/messages (143 tests)
 cargo test -p llm-openai         # OpenAI provider (42 tests)
 cargo test -p llm-anthropic      # Anthropic provider (48 tests)
 cargo test -p llm-store          # JSONL storage (49 tests)
-cargo test -p llm-cli            # CLI unit (50) + integration (75) tests
+cargo test -p llm-cli            # CLI unit (50) + integration (84) tests
 cargo clippy --workspace         # Lint
 cargo build --release -p llm-cli # Build optimized binary
 
@@ -94,6 +94,7 @@ Binary name: `llm`. Built with `clap` derive macros.
 - `llm schemas list` --- scan logs for used schemas
 - `llm schemas show <id>` --- show schema by ID
 - `llm options set/get/list/clear` --- manage per-model options in config.toml
+- `llm aliases set/show/list/remove/path` --- manage model aliases in config.toml
 - `llm plugins list` --- show compiled providers, external providers, and external tools
 
 **Exit codes:** 0 success, 1 runtime, 2 config/key/model, 3 provider/network.
@@ -124,7 +125,9 @@ Phase 4 verbose observability complete --- `-v`/`--verbose` flag (count) on `pro
 
 Phase 4 model options complete --- `-o/--option` flag on `prompt` and `chat` commands (repeatable: `-o temperature 0.7 -o max_tokens 200`). `parse_option_value()` for smart string-to-JSON coercion. `Config.model_options/set_option/clear_option/clear_model_options` methods. `build_options()` merges config defaults with CLI overrides (CLI wins). `llm options set/get/list/clear` subcommands for persistent per-model options in `config.toml`. Options flow through to provider request bodies via `Prompt.options`.
 
-Next: Phase 4 continued (aliases). See `doc/roadmap.md` for the full roadmap.
+Phase 4 aliases complete --- `Config.set_alias/remove_alias` methods. `llm aliases set/show/list/remove/path` subcommands for managing model aliases in `config.toml`. `resolve_model()` (already existed) resolves aliases at runtime in prompt/chat. No transitive resolution (matches simonw/llm behavior).
+
+Phase 4 (v0.4) is complete. See `doc/roadmap.md` for future work.
 
 ## Conventions
 

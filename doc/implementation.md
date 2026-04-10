@@ -4,23 +4,23 @@ Status snapshot of what has been built, what remains, and key decisions made alo
 
 ---
 
-## Current state (Phase 4 core + verbose observability complete)
+## Current state (Phase 4 complete)
 
-Phase 1 goal was: `echo "Hello" | llm` works end-to-end --- streams to stdout, logs to JSONL. Phase 2 goal was: tool calling, structured output, and the chain loop --- the core "agentic" capability. Phase 3 goal was: multi-turn conversations, interactive chat, conversation continuation. Phase 4 core goal was: subprocess extensibility --- any executable on `$PATH` matching `llm-tool-*` or `llm-provider-*` can extend the system with new tools or model providers without recompilation. Phase 4 continued: `--verbose` flag for chain loop observability.
+Phase 1 goal was: `echo "Hello" | llm` works end-to-end --- streams to stdout, logs to JSONL. Phase 2 goal was: tool calling, structured output, and the chain loop --- the core "agentic" capability. Phase 3 goal was: multi-turn conversations, interactive chat, conversation continuation. Phase 4 goal was: subprocess extensibility, verbose observability, model options, and aliases.
 
 ### Crate map
 
 | Crate | Status | Tests | Purpose |
 |-------|--------|------:|---------|
-| `llm-core` | Complete | 123 | Traits, types, streaming, errors, config, keys, schema DSL, chain loop, ChainEvent |
+| `llm-core` | Complete | 143 | Traits, types, streaming, errors, config, keys, schema DSL, chain loop, ChainEvent |
 | `llm-openai` | Complete | 42 | OpenAI Chat API provider (streaming SSE + non-streaming + tool calling + structured output) |
 | `llm-anthropic` | Complete | 48 | Anthropic Messages API provider (streaming SSE + non-streaming + tool calling + structured output) |
 | `llm-store` | Complete | 49 | JSONL conversation file I/O and queries |
-| `llm-cli` | Complete | 111 | Binary: prompt, keys, models, logs, tools, schemas, plugins commands; subprocess tool/provider extensibility; verbose chain observability |
+| `llm-cli` | Complete | 134 | Binary: prompt, keys, models, logs, tools, schemas, plugins, options, aliases commands; subprocess tool/provider extensibility; verbose chain observability |
 | `llm-wasm` | Complete | --- | WASM library for browser/Obsidian plugin (wasm-bindgen) |
 | `llm-python` | Complete | --- | Python native module via PyO3/maturin |
 
-Total: 369 tests (workspace crates), all passing. `llm-wasm` and `llm-python` are excluded from the workspace and built with their own toolchains.
+Total: 416 tests (workspace crates), all passing. `llm-wasm` and `llm-python` are excluded from the workspace and built with their own toolchains.
 
 ### What works
 
@@ -259,10 +259,14 @@ Total: 369 tests (workspace crates), all passing. `llm-wasm` and `llm-python` ar
 
 ### What remains
 
-Remaining items from Phase 4 and beyond (`roadmap.md`):
+All Phase 4 items complete. See `roadmap.md` Future Work for what's next:
 
-- **Phase 4 continued:** Ollama provider (as `llm-provider-ollama` subprocess binary or compiled-in crate), aliases, options passthrough, attachments (image/audio), shell completions, config resolution tracing (extending `--verbose` beyond chain scope).
-- **Phase 5+:** MCP client protocol, embedding support, template system, fragment pipelines.
+- Ollama provider (subprocess binary or compiled-in crate)
+- Attachments (`-a/--attachment`, `--at/--attachment-type`)
+- Code block extraction (`-x/--extract`, `--xl/--extract-last`)
+- Shell completions (`clap_complete`)
+- Embeddings, templates, fragments
+- Config resolution tracing (extending `--verbose` beyond chain scope)
 
 ---
 
@@ -461,11 +465,11 @@ The Python virtualenv and maturin are managed via `uv` (`uv venv`, `uv run matur
 
 ## Test strategy
 
-- **`llm-core`** (119 tests): Inline `#[cfg(test)]` modules. `tempfile::TempDir` for filesystem isolation, `temp_env` for safe env var scoping. Schema DSL tests cover all type mappings, descriptions, whitespace tolerance, newline separation, error cases. Chain loop tests use a `MockProvider` that returns pre-configured responses and an `AtomicUsize` call counter to verify iteration counts.
+- **`llm-core`** (143 tests): Inline `#[cfg(test)]` modules. `tempfile::TempDir` for filesystem isolation, `temp_env` for safe env var scoping. Schema DSL tests cover all type mappings, descriptions, whitespace tolerance, newline separation, error cases. Chain loop tests use a `MockProvider` that returns pre-configured responses and an `AtomicUsize` call counter to verify iteration counts.
 - **`llm-openai`** (42 tests): Inline modules. `wiremock::MockServer` for HTTP mocking (SSE streaming + non-streaming + error responses + tool calls + structured output). Tool calling tests use SSE cassettes with `delta.tool_calls` array chunks for streaming and `message.tool_calls` for non-streaming.
 - **`llm-anthropic`** (48 tests): Inline modules. Same pattern as `llm-openai`: serde round-trip tests for Anthropic-specific types (including `ContentBlock` with tool_use/tool_result fields, `ContentDelta` with `partial_json`), SSE parser tests, wiremock integration tests. Structured output tests verify `_schema_output` transparent wrapping: the response should contain `Chunk::Text` (not `ToolCallStart/Delta`) and `collect_tool_calls()` should return empty.
 - **`llm-store`** (49 tests): Inline modules. `tempfile::TempDir` for isolated filesystem state. JSONL round-trip tests, unicode handling, malformed-line recovery.
-- **`llm-cli`** (103 tests): 45 unit tests (tools registry, schemas, subprocess module) + 58 integration tests in `tests/integration.rs` using `assert_cmd` + `predicates`. Tests run the compiled binary as a subprocess, asserting on stdout/stderr/exit code. API-dependent tests use `wiremock` with `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` pointing to the local mock server. All tests use `LLM_USER_PATH` for filesystem isolation. Tool chain tests use wiremock sequential responses (`up_to_n_times(1)` for first response, default for subsequent). Subprocess tests use shell script fixtures in `tests/fixtures/bin/` and `tempfile::TempDir` with `temp_env` for PATH isolation. Integration tests for subprocess extensibility prepend `tests/fixtures/bin/` to PATH via `env("PATH", path_with_fixtures())`.
+- **`llm-cli`** (134 tests): 50 unit tests (tools registry, schemas, subprocess module, config options/aliases) + 84 integration tests in `tests/integration.rs` using `assert_cmd` + `predicates`. Tests run the compiled binary as a subprocess, asserting on stdout/stderr/exit code. API-dependent tests use `wiremock` with `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` pointing to the local mock server. All tests use `LLM_USER_PATH` for filesystem isolation. Tool chain tests use wiremock sequential responses (`up_to_n_times(1)` for first response, default for subsequent). Subprocess tests use shell script fixtures in `tests/fixtures/bin/` and `tempfile::TempDir` with `temp_env` for PATH isolation. Integration tests for subprocess extensibility prepend `tests/fixtures/bin/` to PATH via `env("PATH", path_with_fixtures())`.
 - TDD was used throughout: tests written before implementation in each cycle.
 
 ---
@@ -486,92 +490,9 @@ Workspace dependencies declared in root `Cargo.toml`. `llm-openai` and `llm-anth
 
 ---
 
-## Phase 1 build order
+## Build order
 
-Each step was a self-contained TDD cycle: write failing tests, make them pass, refactor.
-
-| Step | Crate | What was built | Tests added |
-|------|-------|----------------|------------:|
-| 1 | `llm-core` | `Prompt`, `Chunk`, `Response`, `Usage`, `Provider` trait, `LlmError` | 54 |
-| 2 | `llm-openai` | `OpenAiProvider`, SSE parser, message builder | 29 |
-| 3 | `llm-store` | `LogStore`, JSONL file I/O, conversation listing | 42 |
-| 4 | `llm-core` | `Paths`, `Config`, `KeyStore`, `resolve_key()` | 34 |
-| 5 | `llm-cli` | `prompt`, `keys`, `models`, `logs` commands, default subcommand, exit codes, logging | 29 |
-| 6a | `llm-core` | cfg-gate `ResponseStream` Send, `Provider` Send+Sync for wasm32; remove tokio from deps | 0 (existing pass) |
-| 6b | `llm-openai` | `futures::channel::mpsc`, cfg-gate spawn, remove `tokio-stream` | 0 (existing pass) |
-| 6c | `llm-wasm` | wasm-bindgen `LlmClient`, `prompt()`, `promptStreaming()` | wasm-pack build |
-| 6d | `llm-python` | PyO3 `LlmClient`, `prompt()`, `prompt_stream()` iterator | maturin develop |
-| 7 | `llm-anthropic` | `AnthropicProvider`, SSE parser, message builder, CLI registration | 34 + 3 CLI |
-| 8 | `llm-wasm`, `llm-python` | Multi-provider support via `ProviderImpl` enum, auto-detection from model name | 0 (build verified) |
-
-Step 5 was further broken into 12 inner TDD cycles (scaffold, keys path, keys set/get/list, models list, models default, logs list, prompt non-streaming, prompt streaming, prompt flags, stdin+default-subcmd, exit codes, logging).
-
-Steps 6a-6b were refactoring steps: the "test" was that all 188 existing tests continued passing AND `cargo check --target wasm32-unknown-unknown` succeeded for both crates. Steps 6c-6d were new crates verified by their respective build toolchains (`wasm-pack build`, `maturin develop`) and smoke tests (`import llm_rs` in Python, TypeScript declarations in WASM output).
-
-Step 7 added 34 unit tests in `llm-anthropic` (types, SSE, messages, provider) plus 3 CLI integration tests (model listing, streaming, non-streaming). Step 8 refactored `llm-wasm` and `llm-python` to support both providers --- verified by `wasm-pack build` and `maturin develop`.
-
-## Phase 2 build order
-
-Steps 1, 2, 3 are independent and were implemented in parallel. Step 4 depends on 2+3. Step 5 depends on 4. Steps 6-8 are sequential.
-
-| Step | Crate | What was built | Tests added |
-|------|-------|----------------|------------:|
-| 1 | `llm-core` | `parse_schema_dsl()`, `multi_schema()` | 12 |
-| 2 | `llm-core`, `llm-openai` | `Prompt.tool_calls`, OpenAI tool types, `build_messages` with tool results, streaming/non-streaming tool call parsing | 10 |
-| 3 | `llm-anthropic` | Anthropic tool types, `build_messages` with tool results, streaming/non-streaming tool_use parsing | 10 |
-| 4 | `llm-openai`, `llm-anthropic` | OpenAI `response_format` for structured output, Anthropic `_schema_output` transparent tool wrapping | 3 |
-| 5 | `llm-core` | `ToolExecutor` trait, `chain()` loop function | 6 |
-| 6 | `llm-cli` | `BuiltinToolRegistry`, `CliToolExecutor`, `llm tools list` command | 6 |
-| 7 | `llm-cli` | `-T/--tool`, `--chain-limit`, `--tools-debug`, `--tools-approve` flags, chain integration | 4 |
-| 8 | `llm-cli` | `--schema`, `--schema-multi` flags, `llm schemas dsl/list/show` commands, schema resolution chain | 7 |
-
-## Phase 3 build order
-
-| Step | Crate | What was built | Tests added |
-|------|-------|----------------|------------:|
-| 1 | `llm-core` | `Role` enum, `Message` struct with constructors, `Prompt.messages` field, `with_messages()` builder | 11 |
-| 2 | `llm-openai`, `llm-anthropic` | `build_from_conversation()` multi-turn message builders, `build_single_turn()` extraction | 4 |
-| 3 | `llm-core` | Chain loop rewrite: accumulate `Vec<Message>` across iterations, `MockProvider` captures prompts | 3 |
-| 4 | `llm-store` | `reconstruct_messages()` from stored `Vec<Response>` | 4 |
-| 5 | `llm-cli` | `-c/--continue`, `--cid` flags, conversation loading/continuation, `rewrite_args` update | 2 |
-| 6 | `llm-cli` | `--messages` flag (file or stdin), `--json` output envelope, `skip_stdin` for `--messages -` | 3 |
-| 7 | `llm-cli` | `llm chat` command with `rustyline` REPL, conversation accumulation, per-turn logging | 0 (interactive) |
-| 8 | `llm-cli`, `llm-store` | `llm logs path/status/on/off`, `ListOptions` with model filter and text search, `Config::save()` | 6 |
-| 9 | docs | Updated `roadmap.md` (swap Phase 3/4), `CLAUDE.md`, `implementation.md` | 0 |
-
-## Phase 4 build order
-
-Steps 1 and 2 are independent. Step 3 depends on 2. Step 4 depends on 1+3. Steps 5-6 depend on 4. Steps 7-8 depend on 2. Step 9 depends on 8. Step 10 depends on 2+3+7. Step 11 depends on all.
-
-In practice, steps 1-4 and 7-8 were implemented in a single pass (all new files created simultaneously), then steps 5-6 and 9-10 in a second pass (modifying existing CLI files), and step 11 as integration tests.
-
-| Step | Crate | What was built | Tests added |
-|------|-------|----------------|------------:|
-| 1 | `llm-cli` | `ProtocolChunk`, `ProviderRequest`, `ProviderResponse` with serde + `Chunk` conversion | 10 |
-| 2 | `llm-cli` | `scan_path()`, `discover_tools()`, `discover_providers()` | 6 |
-| 3 | `llm-cli` | `fetch_tool_schema()`, `fetch_all_tool_schemas()` | 4 |
-| 4 | `llm-cli` | `ExternalToolExecutor` implementing `ToolExecutor` | 5 |
-| 5 | `llm-cli` | `CliToolExecutor` composite (builtin + external), `tools list` shows external | 0 (existing tests cover) |
-| 6 | `llm-cli` | `-T` resolves external tools in `prompt.rs` and `chat.rs` | 0 (integration tests in step 11) |
-| 7 | `llm-cli` | `fetch_provider_id()`, `fetch_provider_models()`, `fetch_provider_key_info()` | 4 |
-| 8 | `llm-cli` | `SubprocessProvider` implementing `Provider` (streaming + non-streaming) | 7 |
-| 9 | `llm-cli` | Async `providers()` combining compiled + discovered providers | 0 (integration tests in step 11) |
-| 10 | `llm-cli` | `llm plugins list` command, `Commands::Plugins`, known subcommand registration | 0 (integration tests in step 11) |
-| 11 | `llm-cli` | E2E integration tests with fixture shell scripts | 9 |
-
-## Verbose chain observability build order
-
-Single implementation pass — the chain event system, CLI flag, formatting, and tests were all implemented together since the scope was small and self-contained.
-
-| Step | Crate | What was built | Tests added |
-|------|-------|----------------|------------:|
-| 1 | `llm-core` | `ChainEvent` enum (`IterationStart`, `IterationEnd`), `on_event` param on `chain()`, event emission with per-iteration `collect_usage()` | 4 |
-| 2 | `llm-core` | Updated all 8 existing `chain()` test call sites to pass `None` for `on_event` | 0 |
-| 3 | `llm-core` | Re-export `ChainEvent` from `lib.rs` | 0 |
-| 4 | `llm-cli` | `-v`/`--verbose` flag on `PromptArgs` (`ArgAction::Count`), `format_chain_event()`, `format_message_summary()` | 0 |
-| 5 | `llm-cli` | `verbose > 0` implies `tools_debug` in `CliToolExecutor`, wired `on_event` callback in `prompt.rs` | 0 |
-| 6 | `llm-cli` | `-v`/`--verbose` on `ChatArgs`, wired through to `chain()` + executor, reuses `prompt::format_chain_event` | 0 |
-| 7 | `llm-cli` | Integration tests: verbose summary, `-vv` message dump, verbose-implies-tools-debug, flag parsing | 4 |
+Detailed step-by-step build order tables for Phases 1-4 are in git history. Each phase followed the same pattern: TDD cycles bottom-up through the crate layers. See commits tagged `v0.1` through `v0.4` for the exact progression.
 
 ### Verbose observability learnings
 
