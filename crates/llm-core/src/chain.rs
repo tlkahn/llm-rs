@@ -7,9 +7,18 @@ use crate::stream::{Chunk, collect_text, collect_tool_calls, collect_usage};
 use crate::types::{Message, Prompt, ToolCall, ToolResult, Usage};
 
 /// Trait for executing tool calls. Implement this to provide tool execution logic.
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+///
+/// On `wasm32`, the `Send + Sync` bound is dropped so executors may hold
+/// non-`Send` host types like `js_sys::Function`.
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait]
 pub trait ToolExecutor: Send + Sync {
+    async fn execute(&self, call: &ToolCall) -> ToolResult;
+}
+
+#[cfg(target_arch = "wasm32")]
+#[async_trait(?Send)]
+pub trait ToolExecutor {
     async fn execute(&self, call: &ToolCall) -> ToolResult;
 }
 
@@ -111,6 +120,9 @@ pub struct ChainResult {
     pub total_usage: Option<Usage>,
     /// Whether the chain stopped because the budget was exhausted.
     pub budget_exhausted: bool,
+    /// Final message history after the chain loop completes — includes the
+    /// seed messages, every assistant turn, and any tool-result messages.
+    pub messages: Vec<Message>,
 }
 
 /// Run a chain loop: execute -> collect tool calls -> execute tools -> repeat.
@@ -240,6 +252,7 @@ pub async fn chain(
         tool_results: all_tool_results,
         total_usage: cumulative_usage,
         budget_exhausted,
+        messages,
     })
 }
 

@@ -10,7 +10,7 @@ use llm_core::{
 use super::dry_run::{DryRunReport, ModelSource, ToolEntry, ToolSource};
 use super::prompt::{find_provider, format_chain_event, resolve_prompt_text};
 use super::providers;
-use super::tools::{BuiltinToolRegistry, CliToolExecutor};
+use super::tools::{builtin_registry, CliToolExecutor};
 use crate::retry::RetryProvider;
 use crate::subprocess::tool::ExternalToolExecutor;
 
@@ -301,7 +301,7 @@ async fn run_agent(args: &AgentRunArgs) -> llm_core::Result<()> {
     let mut tool_entries: Vec<ToolEntry> = Vec::new();
     let mut need_external: Vec<(usize, String)> = Vec::new();
     if !agent_config.tools.is_empty() {
-        let registry = BuiltinToolRegistry::new();
+        let registry = builtin_registry();
         for (idx, name) in agent_config.tools.iter().enumerate() {
             match registry.get(name) {
                 Some(tool) => {

@@ -9,7 +9,7 @@ use llm_core::{
 
 use super::providers;
 use super::schemas::make_schema_id;
-use super::tools::{BuiltinToolRegistry, CliToolExecutor};
+use super::tools::{builtin_registry, CliToolExecutor};
 use crate::retry::RetryProvider;
 use crate::subprocess::tool::ExternalToolExecutor;
 
@@ -154,7 +154,7 @@ pub async fn run(args: &PromptArgs) -> llm_core::Result<()> {
     let mut tools = Vec::new();
     let mut need_external: Vec<String> = Vec::new();
     if !args.tool.is_empty() {
-        let registry = BuiltinToolRegistry::new();
+        let registry = builtin_registry();
         for name in &args.tool {
             match registry.get(name) {
                 Some(tool) => tools.push(tool.clone()),
