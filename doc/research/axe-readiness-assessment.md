@@ -2,7 +2,7 @@
 
 Assessment of llm-rs architecture against the Unix-philosophy agent features described in `~/Desktop/axe/docs/idea/unix-philosophy-agent-in-rust.md`.
 
-Original assessment written after Phase 2; updated after Phase 4 completion (v0.4).
+Original assessment written after Phase 2; updated after Phase 4 (v0.4) and again after Phase 9 (v0.9).
 
 ---
 
@@ -62,51 +62,61 @@ Phases 3 (Conversations & Multi-turn) and 4 (Extensibility & More) have landed. 
 | Retry/backoff | Not started | **Still open** |
 | Memory system | Not started | **Still open** |
 
-## Bottom Line
+## Bottom Line (Post-Phase 4)
 
 7 of 12 items from the Phase 2 assessment are resolved. The architecture no longer has fundamental blockers. The remaining gaps — parallel tool exec, agent config/discovery, sub-agent delegation, budget enforcement, dry-run, retry, memory — are all additive features that build on existing seams rather than requiring core type changes.
 
 ---
 
-## Prioritized Plan for Axe-on-LLM-RS
+## Post-Phase 9 Reassessment (v0.9, 2026-04-11)
 
-Grouping and tiering of remaining work, based on importance and dependency analysis.
+Phases 5 through 9 have all landed. Five tiered items from the prior plan are now complete: agent config & discovery (v0.5), budget tracking (v0.6), retry/backoff (v0.7), dry-run mode (v0.8), and parallel tool execution (v0.9). Only sub-agent delegation and the memory system remain open from the original axe list.
 
-### Group A: Agent Core
+### Newly Resolved
 
-The feature that turns llm-rs into an agent framework. Everything in Group C blocks on this.
+**5. Budget tracking** (was partial) — Phase 6 added `Usage::add()`/`total()`, `ChainResult.total_usage` accumulation across iterations, `ChainEvent::IterationEnd.cumulative_usage`, and a `budget: Option<u64>` parameter on `chain()`. Exceeding budget triggers `ChainEvent::BudgetExhausted` and a graceful stop (mirroring `chain_limit`). `-u` surfaces cumulative totals; the chat REPL tracks session-wide usage. `BudgetConfig.max_tokens` is wired from agent TOML. `LLM_BUDGET_REMAINING` env var and exit-code-4 are still deferred to the sub-agent tier.
 
-- **Agent config & discovery** — TOML config (`model`, `system_prompt`, `tools`, `budget`), `.llm/agents/` directory with local-shadows-global, `llm agent run <name>` subcommand. Sub-agents and memory fields are inventoried in the TOML schema but not wired up until their implementations land.
+**6. Parallel tool execution** — Phase 9 added `ParallelConfig { enabled, max_concurrent }` and `dispatch_tools()` in `llm-core/chain.rs`. Sequential fast path when disabled or single-call; otherwise `future::join_all` (unlimited) or `stream::iter(futs).buffered(n)` (bounded). Result order is preserved. `--sequential-tools`/`--max-parallel-tools` on `prompt`/`chat`/`agent run`; `parallel_tools`/`max_parallel_tools` in agent TOML. `--tools-approve` forces sequential to avoid interleaved stdin prompts.
 
-### Group B: Loop Hardening
+**7. Agent config and discovery** — Phase 5 added `AgentConfig` with full TOML parsing (`model`, `system_prompt`, `tools`, `chain_limit`, `options`, plus `budget`/`retry`/`parallel_tools`/`max_parallel_tools` wired; `sub_agents`/`memory` parsed as stubs). `Paths.agents_dir()`, `discover_agents()` scanning global + local with local-shadows-global, `resolve_agent()`, and `llm agent run/list/show/init/path` subcommands all shipped.
 
-Making `chain()` production-ready for long-running agentic use. All independent of each other and of Group A.
+**9. Dry-run mode** — Phase 8 added `--dry-run` on `llm agent run`. Resolves the full invocation pipeline (agent file, model + source, provider, system prompt, prompt text, tools classified builtin/external, merged options, chain limit, budget, retry, logging flag, resolved `ParallelConfig`) without calling the LLM, resolving keys, or writing logs. `DryRunReport` with `render_plain()` and `render_json()`. `-v`/`-vv` populate the serialized `Prompt` JSON the provider would have received.
 
-- **Budget tracking (accumulation + display)** — Cross-turn token accumulation in `chain()`, surface via `-u`/`--usage` and `ChainEvent`. Exit-code-4 and `LLM_BUDGET_REMAINING` env var deferred to sub-agent tier.
-- **Retry/backoff** — Exponential backoff + jitter for 429/5xx. Never retry 401/403/400. Wraps provider calls.
-- **Parallel tool execution** — `JoinSet` / `join_all` in `chain()` tool dispatch loop.
+**10. Retry/backoff** — Phase 7 added `LlmError::HttpError { status, message }` (with `is_retryable()` true for 429/5xx), `RetryConfig` with exponential backoff + jitter in `llm-core/retry.rs`, and `RetryProvider` wrapper in `llm-cli/retry.rs` (pre-stream only). `--retries` flag on `prompt`, `chat`, and `agent run`. Agent TOML `[retry]` section wired; CLI overrides agent config. Both OpenAI and Anthropic emit `HttpError` for non-success HTTP status codes.
 
-### Group C: Agent Ecosystem
+### Still Open
 
-Features that build on a working agent (depend on Group A).
+**8. Sub-agent delegation** — No parent/child orchestration. `--messages` + `--json` + agent TOML plumbing are all in place, but there is no `call_agent` dispatch tool, no exit-code-4 on budget exhaustion, and no `LLM_BUDGET_REMAINING` env var for child processes.
 
-- **Dry-run mode** — `--dry-run` resolves agent config (system prompt + tools + memory + budget) and prints without making an LLM call. Needs agent TOML to exist.
-- **Sub-agent delegation** — `call_agent` as a special tool that spawns child `llm agent run`. Needs agent config + budget env var plumbing (exit-code-4 + `LLM_BUDGET_REMAINING` land here).
-- **Memory system** — Per-agent JSONL storage (reuses `llm-store` patterns). Pluggable backends (markdown, SQLite, Redis) deferred.
+**11. Memory system** — `MemoryConfig` is parsed from agent TOML as a stub (`enabled`, `last_n`) but not wired. No per-agent JSONL storage, no pluggable backends.
 
-### Tiering
+### v0.9 Summary Table
 
-```
-Tier 1 ─── zero unresolved deps, highest value
-  ├── Agent config & discovery
-  └── Budget tracking (accumulation + display)
+| axe Feature | Phase 2 State | Post-Phase 4 State | Post-Phase 9 State |
+|---|---|---|---|
+| ReAct loop (multi-turn chain) | Single-turn only | **Resolved** | Resolved |
+| Multi-turn messages in `Prompt` | **Missing** | **Resolved** | Resolved |
+| External CLI tools | Trait only | **Resolved** | Resolved |
+| `--messages` input | Not exposed | **Resolved** | Resolved |
+| `--json` output | Not exposed | **Resolved** | Resolved |
+| Chain observability | Not started | **Resolved** | Resolved |
+| Budget tracking | Not started | Partial | **Resolved** (v0.6) — env var + exit-code deferred |
+| Parallel tool exec | Sequential loop | Still open | **Resolved** (v0.9) |
+| Agent TOML config | Not started | Still open | **Resolved** (v0.5) |
+| Dry-run mode | Not started | Still open | **Resolved** (v0.8) |
+| Retry/backoff | Not started | Still open | **Resolved** (v0.7) |
+| Sub-agent delegation | Not started | Still open | **Still open** |
+| Memory system | Not started | Still open | **Still open** |
 
-Tier 2 ─── zero or newly-resolved deps
-  ├── Retry/backoff
-  ├── Dry-run mode (unblocked by Tier 1)
-  └── Parallel tool execution
+## Bottom Line (Post-Phase 9)
 
-Tier 3 ─── higher complexity, unblocked by Tier 1
-  ├── Sub-agent delegation (+ budget env var plumbing)
-  └── Memory system (JSONL first, pluggable backends later)
-```
+11 of 13 axe features are resolved. Only sub-agent delegation and the memory system remain, both parked in Tier 3 of the roadmap's future work. Every seam they need — agent discovery, `--messages`/`--json` I/O, budget accounting, dry-run, retry, `MemoryConfig` stub — already exists; the remaining work is pure composition on top of the current architecture.
+
+---
+
+## Remaining Work
+
+### Tier 3 — Agent Ecosystem (unchanged from prior plan)
+
+- **Sub-agent delegation** — `call_agent` as a special tool that spawns child `llm agent run`. Lands exit-code-4 on budget exhaustion and `LLM_BUDGET_REMAINING` env var plumbing at the same time.
+- **Memory system** — Per-agent JSONL storage (reuses `llm-store` patterns). `MemoryConfig` stub already parsed from agent TOML. Pluggable backends (markdown, SQLite, Redis) deferred.
