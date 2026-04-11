@@ -121,3 +121,23 @@ Surgical cfg-gating — `llm-core` had `tokio` as a dependency but never used it
 **`Prompt` serializes as `text`, not `prompt`.** Integration tests for `-v`/`-vv` Prompt JSON dump initially asserted on a `"prompt"` field name. The `Prompt` struct's text field is named `text` and serde serializes the field name as-is, so the top-level JSON key is `"text"`. Caught by the first test run. No rename — the existing wire format is load-bearing for log deserialization.
 
 **Tool source classification piggybacks on existing resolution loop.** Rather than re-classifying tools for the dry-run report, `run_agent` now builds a parallel `Vec<ToolEntry>` in the same loop that separates builtins from externals. Order is preserved (builtins first, then externals in discovery order) since that mirrors how `tools` itself is assembled. External tool discovery still runs under dry-run so unknown tool names fail fast with the same error as normal runs.
+
+---
+
+## Parallel tool execution
+
+**Eagerly collect per-call futures into a `Vec` before driving them.** The natural shape for bounded concurrency is `stream::iter(calls.iter()).map(|c| executor.execute(c)).buffered(n)`, but this trips the borrow checker: the stream holds `&executor` and `&calls` across awaits via the elided lifetimes inside the `async_trait`-returned boxed future, and the chained `.map().buffered()` defeats lifetime elision. The fix is a two-step shape:
+
+```rust
+let futs: Vec<_> = calls.iter().map(|c| executor.execute(c)).collect();
+match parallel.max_concurrent {
+    Some(n) if n > 0 => stream::iter(futs).buffered(n).collect::<Vec<_>>().await,
+    _ => future::join_all(futs).await,
+}
+```
+
+Collecting first places every borrow under one unified lifetime tied to the enclosing `async fn`, and both dispatch backends become single expressions. Also: we picked `futures::future::join_all` / `stream::buffered` over `tokio::task::JoinSet` — `JoinSet` would require `'static` futures (forcing an `Arc<dyn ToolExecutor>` signature change on every caller) and a new `tokio` dep in `llm-core`, for no real win since tool work is I/O-bound and not CPU-bound.
+
+**`--tools-approve` must force sequential dispatch.** `CliToolExecutor` prompts on stdin before running each tool when `--tools-approve` is set. If parallel dispatch were allowed, multiple concurrent tool calls would race to read from the same stdin and interleave their approval prompts unreadably. The agent/prompt/chat handlers check `args.tools_approve` when building `ParallelConfig` and unconditionally set `enabled = false` — tested explicitly via dry-run JSON on `agent run` so a future refactor cannot regress it silently.
+
+**Known caveat: `--tools-debug` stdout interleaves under parallel dispatch.** `CliToolExecutor` prints `running tool X` / `tool X returned` lines from inside `execute()`. With the default parallel dispatch those lines can interleave across concurrent calls — visually noisy, but not a correctness bug. Fix options if users complain: buffer per-call output and flush in input order after dispatch, force sequential under `-vv`, or prefix each debug line with the `tool_call_id`.

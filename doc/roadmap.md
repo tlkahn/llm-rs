@@ -30,15 +30,13 @@ Unix-philosophy agentic CLI for LLMs, inspired by [simonw/llm](https://github.co
 | 6 --- Budget Tracking | v0.6 | Complete | `Usage::add()`/`total()`, cumulative chain usage, budget enforcement, `-u` totals, chat session usage |
 | 7 --- Retry/Backoff | v0.7 | Complete | `HttpError` variant, `RetryConfig`, `RetryProvider` wrapper, `--retries` flag on prompt/chat/agent |
 | 8 --- Dry-Run Mode | v0.8 | Complete | `--dry-run` on `llm agent run` resolves agent config and prints (plain or `--json`) without LLM call; `-v`/`-vv` dumps full `Prompt` JSON |
+| 9 --- Parallel Tool Execution | v0.9 | Complete | `ParallelConfig` dispatched via `future::join_all`/`buffered(n)`; order-preserving; `--sequential-tools`/`--max-parallel-tools` on prompt/chat/agent; `parallel_tools`/`max_parallel_tools` in agent TOML; `--tools-approve` forces sequential |
 
 ---
 
 ## Future Work
 
 ### Axe: Agent Features (prioritized, see [readiness assessment](research/axe-readiness-assessment.md))
-
-**Tier 2** — zero or newly-resolved deps:
-- Parallel tool execution --- `JoinSet` in `chain()` tool dispatch
 
 **Tier 3** — higher complexity:
 - Sub-agent delegation --- `call_agent` tool spawning child `llm agent run` (+ exit-code-4, `LLM_BUDGET_REMAINING` env var)

@@ -54,7 +54,8 @@ Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry poi
 - **`Usage`** (`types.rs`): token usage with `input`, `output`, `details` fields. `add(&other)` combines two Usage values (summing fields). `total()` returns input + output (treating None as 0).
 - **`ChainEvent`** (`chain.rs`): enum for chain loop observability. `IterationStart { iteration, limit, messages }` emitted before provider call, `IterationEnd { iteration, usage, cumulative_usage, tool_calls }` after, `BudgetExhausted { cumulative_usage, budget }` when token budget exceeded.
 - **`ChainResult`** (`chain.rs`): result of chain loop. Fields: `chunks`, `tool_results`, `total_usage` (accumulated across all iterations), `budget_exhausted` (bool).
-- **`chain()`** (`chain.rs`): chain loop that accumulates `Vec<Message>` across iterations — each provider call sees full conversation history. Executes provider → collects tool calls → executes tools → repeats until no tool calls, limit reached, or budget exceeded. Optional `on_event` callback for observability. `budget: Option<u64>` parameter for token budget enforcement.
+- **`chain()`** (`chain.rs`): chain loop that accumulates `Vec<Message>` across iterations — each provider call sees full conversation history. Executes provider → collects tool calls → executes tools → repeats until no tool calls, limit reached, or budget exceeded. Optional `on_event` callback for observability. `budget: Option<u64>` parameter for token budget enforcement. `parallel: ParallelConfig` controls parallel tool dispatch within a single iteration.
+- **`ParallelConfig`** (`chain.rs`): parallel tool dispatch config. Fields: `enabled` (default `true`), `max_concurrent` (`Option<usize>`, `None` = unlimited). `dispatch_tools()` takes a sequential fast path when `enabled == false` or `calls.len() <= 1`; otherwise eagerly collects per-call futures into a `Vec` and drives them via `future::join_all` (unlimited) or `stream::iter(futs).buffered(n)` (bounded). Result order always matches input order. Serde-compatible.
 - **`parse_schema_dsl()`** (`schema.rs`): parses "name str, age int" DSL into JSON Schema. Types: str, int, float, bool.
 - **`multi_schema()`** (`schema.rs`): wraps a schema in `{"items":{"type":"array","items":<schema>}}` for `--schema-multi`.
 
@@ -68,7 +69,7 @@ Dependency flow: `llm-cli`, `llm-wasm`, and `llm-python` are top-level entry poi
 
 ### Agent system (llm-core/agent.rs)
 
-- **`AgentConfig`**: TOML config loaded from agent files. Fields: `model` (Option), `system_prompt` (Option), `tools` (Vec), `chain_limit` (default 10), `options` (HashMap), `sub_agents` (Vec, stub), `memory` (Option<MemoryConfig>, stub), `budget` (Option<BudgetConfig>, wired), `retry` (Option<RetryConfig>, wired). `AgentConfig::load(path)` returns error if file not found (unlike `Config`).
+- **`AgentConfig`**: TOML config loaded from agent files. Fields: `model` (Option), `system_prompt` (Option), `tools` (Vec), `chain_limit` (default 10), `options` (HashMap), `sub_agents` (Vec, stub), `memory` (Option<MemoryConfig>, stub), `budget` (Option<BudgetConfig>, wired), `retry` (Option<RetryConfig>, wired), `parallel_tools` (bool, default `true`), `max_parallel_tools` (Option<usize>, default `None`). `AgentConfig::load(path)` returns error if file not found (unlike `Config`).
 - **`MemoryConfig`**: stub — `enabled` (bool), `last_n` (Option<usize>). Parsed but not wired up.
 - **`BudgetConfig`**: `max_tokens` (Option<u64>). Wired to `chain()` budget enforcement in agent run.
 - **`AgentSource`**: enum `Global` / `Local`. Display trait for output.
@@ -97,8 +98,8 @@ Binary name: `llm`. Built with `clap` derive macros.
 **Provider registry:** `commands/mod.rs::providers()` returns `Vec<Box<dyn Provider>>` with `#[cfg(feature)]`-gated providers. `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` env vars override API endpoints. Both `openai` and `anthropic` features are default-on.
 
 **Commands:**
-- `llm prompt <text>` --- flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-o/--option`, `-T/--tool`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--schema`, `--schema-multi`, `-c/--continue`, `--cid`, `--messages`, `--json`, `-v/--verbose` (count: `-v` summary, `-vv` full messages), `--retries`
-- `llm chat` --- interactive REPL with `rustyline`. Flags: `-m`, `-s`, `-o/--option`, `-T/--tool`, `--chain-limit`, `-v/--verbose`, `--retries`
+- `llm prompt <text>` --- flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-o/--option`, `-T/--tool`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--schema`, `--schema-multi`, `-c/--continue`, `--cid`, `--messages`, `--json`, `-v/--verbose` (count: `-v` summary, `-vv` full messages), `--retries`, `--sequential-tools`, `--max-parallel-tools`
+- `llm chat` --- interactive REPL with `rustyline`. Flags: `-m`, `-s`, `-o/--option`, `-T/--tool`, `--chain-limit`, `-v/--verbose`, `--retries`, `--sequential-tools`, `--max-parallel-tools`
 - `llm keys set/get/list/path` --- `set` uses rpassword for hidden terminal input
 - `llm models list` / `llm models default [model]`
 - `llm logs list [--json] [-r] [-n count] [-m model] [-q query] [-u]` / `llm logs path` / `llm logs status` / `llm logs on` / `llm logs off`
@@ -109,7 +110,7 @@ Binary name: `llm`. Built with `clap` derive macros.
 - `llm options set/get/list/clear` --- manage per-model options in config.toml
 - `llm aliases set/show/list/remove/path` --- manage model aliases in config.toml
 - `llm plugins list` --- show compiled providers, external providers, and external tools
-- `llm agent run <name> [prompt]` --- run an agent (accepts stdin). Flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-v/--verbose`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--json`, `--retries`, `--dry-run`
+- `llm agent run <name> [prompt]` --- run an agent (accepts stdin). Flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-v/--verbose`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--json`, `--retries`, `--dry-run`, `--sequential-tools`, `--max-parallel-tools`
 - `llm agent list` --- list discovered agents (name, model, source)
 - `llm agent show <name>` --- print agent config details
 - `llm agent init <name> [--global]` --- scaffold TOML template (local by default)
@@ -145,7 +146,7 @@ Phase 4 model options complete --- `-o/--option` flag on `prompt` and `chat` com
 
 Phase 4 aliases complete --- `Config.set_alias/remove_alias` methods. `llm aliases set/show/list/remove/path` subcommands for managing model aliases in `config.toml`. `resolve_model()` (already existed) resolves aliases at runtime in prompt/chat. No transitive resolution (matches simonw/llm behavior).
 
-Phase 4 (v0.4) is complete. Phase 6 (budget tracking) is complete. Phase 7 (retry/backoff) is complete. Phase 8 (dry-run mode) is complete. See `doc/roadmap.md` for future work.
+Phase 4 (v0.4) is complete. Phase 6 (budget tracking) is complete. Phase 7 (retry/backoff) is complete. Phase 8 (dry-run mode) is complete. Phase 9 (parallel tool execution) is complete. See `doc/roadmap.md` for future work.
 
 Phase 5 agent config & discovery complete --- `AgentConfig` struct with TOML parsing (`model`, `system_prompt`, `tools`, `chain_limit`, `options`, plus `sub_agents`/`memory`/`budget` stubs). `Paths.agents_dir()`. Discovery: `discover_agents()` scans global (`$XDG_CONFIG_HOME/llm/agents/`) and local (`$CWD/.llm/agents/`) directories, local shadows global. `resolve_agent()` finds agent by name. CLI: `llm agent run <name> [prompt]` resolves config, model (CLI > agent TOML > global default), tools, builds prompt with system_prompt, calls `chain()`. `llm agent list/show/init/path` management commands. Shared helpers (`find_provider`, `resolve_prompt_text`, `format_chain_event`) extracted from `prompt.rs` as `pub(crate)` and reused by `agent.rs` and `chat.rs`.
 
@@ -154,6 +155,8 @@ Phase 6 budget tracking complete --- `Usage::add()` and `Usage::total()` accumul
 Phase 7 retry/backoff complete --- `LlmError::HttpError { status, message }` variant for HTTP-level errors (replacing opaque `Provider` strings for HTTP failures). `is_retryable()` method returns `true` for 429 and 5xx. `RetryConfig` struct in `llm-core/retry.rs` with exponential backoff + jitter (`delay_for_attempt()`). `RetryProvider` wrapper in `llm-cli/retry.rs` decorates any `Provider` with retry logic (pre-stream only). `--retries` flag on `prompt`, `chat`, and `agent run` commands. Agent TOML `[retry]` section wired — CLI `--retries` overrides agent config. Both OpenAI and Anthropic providers emit `HttpError` for non-success HTTP status codes.
 
 Phase 8 dry-run mode complete --- `--dry-run` flag on `llm agent run` resolves the full agent invocation pipeline (agent file, model + source, provider, system prompt, prompt text, tools with builtin/external classification, merged options, chain limit, budget, retry, logging flag) without calling the LLM, resolving the API key, or writing logs. `DryRunReport` struct in `llm-cli/commands/dry_run.rs` with `render_plain()` and `render_json()` methods. Plain output is a labeled block with stable field order, sorted options, and optional sections omitted when empty. `--dry-run --json` emits the same info as a JSON envelope (`#[serde(skip_serializing_if)]` on optional fields). `-v`/`-vv` under `--dry-run` populate `report.prompt` with the full serialized `Prompt` JSON the provider would have received (both verbosity levels behave the same). External tool discovery still runs so unknown tool names surface as errors. Tool resolution + prompt construction were reordered before `resolve_key` so the dry-run branch can skip key lookup entirely.
+
+Phase 9 parallel tool execution complete --- `ParallelConfig { enabled, max_concurrent }` in `llm-core/chain.rs`; `chain()` gains a trailing `parallel: ParallelConfig` parameter. `dispatch_tools()` helper runs sequentially when `enabled == false` or `calls.len() <= 1`, otherwise eagerly collects per-call futures into a `Vec` and drives them with `future::join_all` (unlimited) or `stream::iter(futs).buffered(n)` (bounded). Result order is guaranteed to match input order. `AgentConfig` adds `parallel_tools` (default `true`) and `max_parallel_tools` (`Option<usize>`) fields. `--sequential-tools` and `--max-parallel-tools` flags on `prompt`, `chat`, and `agent run`. Precedence for agent: CLI > agent TOML > default. `--tools-approve` forces sequential dispatch to avoid interleaved stdin prompts. `DryRunReport` surfaces the resolved `ParallelConfig` (used by integration tests to assert precedence without timing).
 
 ## Conventions
 
