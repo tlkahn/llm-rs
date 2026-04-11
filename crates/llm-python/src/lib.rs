@@ -1,14 +1,18 @@
+mod agent;
 mod conversation;
+mod log_store_py;
+mod response_build;
 mod retry;
 mod tools;
 
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Instant;
 
 use futures::StreamExt;
 use llm_anthropic::provider::AnthropicProvider;
 use llm_core::retry::RetryConfig;
 use llm_core::stream::Chunk;
-use llm_core::types::{Message, Prompt};
+use llm_core::types::{Message, Options, Prompt, Response, ToolCall, ToolResult, Usage};
 use llm_core::{
     chain, multi_schema, parse_schema_dsl as core_parse_schema_dsl, ChainEvent, ChainResult,
     ParallelConfig, Provider,
@@ -18,7 +22,10 @@ use pyo3::prelude::*;
 use pythonize::{depythonize, pythonize};
 use serde_json::Value;
 
+use crate::agent::PyAgentConfig;
 use crate::conversation::Conversation;
+use crate::log_store_py::PyLogStore;
+use crate::response_build::{synthesize_response, ResponseInputs};
 use crate::retry::RetryProvider;
 use crate::tools::{PyToolRegistry, ToolDecorator};
 
@@ -80,20 +87,25 @@ pub struct LlmClient {
     registry: PyToolRegistry,
     chain_limit: usize,
     retry_config: RetryConfig,
-    #[allow(dead_code)]
-    log_store: Option<llm_store::LogStore>,
+    pub(crate) log_store: Option<Arc<llm_store::LogStore>>,
+    /// Conversation id used for auto-logging successive top-level `prompt()`
+    /// calls. Created lazily on the first log and reused until the client
+    /// is dropped.
+    conversation_id: Mutex<Option<String>>,
 }
 
 #[pymethods]
 impl LlmClient {
     #[new]
-    #[pyo3(signature = (api_key, model="gpt-4o-mini", *, provider=None, base_url=None, log_dir=None, chain_limit=5, retries=0, retry_base_delay_ms=1000, retry_max_delay_ms=30000, retry_jitter=true))]
+    #[pyo3(signature = (api_key, model="gpt-4o-mini", *, provider=None, base_url=None, log_dir=None, log_store=None, chain_limit=5, retries=0, retry_base_delay_ms=1000, retry_max_delay_ms=30000, retry_jitter=true))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         api_key: &str,
         model: &str,
         provider: Option<&str>,
         base_url: Option<&str>,
         log_dir: Option<&str>,
+        log_store: Option<&PyLogStore>,
         chain_limit: usize,
         retries: u32,
         retry_base_delay_ms: u64,
@@ -122,10 +134,15 @@ impl LlmClient {
             ProviderImpl::OpenAi(OpenAiProvider::new(base))
         };
 
-        let log_store = log_dir
-            .map(|d| llm_store::LogStore::open(std::path::Path::new(d)))
-            .transpose()
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let log_store_arc: Option<Arc<llm_store::LogStore>> = if let Some(ls) = log_store {
+            Some(ls.inner.clone())
+        } else if let Some(dir) = log_dir {
+            let store = llm_store::LogStore::open(std::path::Path::new(dir))
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            Some(Arc::new(store))
+        } else {
+            None
+        };
 
         Ok(Self {
             runtime,
@@ -140,7 +157,8 @@ impl LlmClient {
                 max_delay_ms: retry_max_delay_ms,
                 jitter: retry_jitter,
             },
-            log_store,
+            log_store: log_store_arc,
+            conversation_id: Mutex::new(None),
         })
     }
 
@@ -176,7 +194,9 @@ impl LlmClient {
     ///
     /// If `schema` is a string it is parsed as schema DSL; if it is a dict
     /// it is used verbatim as JSON Schema. `schema_multi=True` wraps the
-    /// schema in an items array.
+    /// schema in an items array. If the client was constructed with a
+    /// `log_store`, the completed response is appended to the client's
+    /// rolling conversation automatically.
     #[pyo3(signature = (text, *, system=None, schema=None, schema_multi=false))]
     fn prompt(
         &self,
@@ -188,11 +208,11 @@ impl LlmClient {
     ) -> PyResult<String> {
         let schema_value = build_schema(py, schema.as_ref(), schema_multi)?;
         let _ = py;
-        let prompt = self.build_prompt(text, system, schema_value);
+        let prompt_obj = self.build_prompt(text, system, schema_value.clone());
         if self.registry.has_any() {
-            self.run_chain(prompt)
+            self.run_chain_logging(prompt_obj, text, system, schema_value)
         } else {
-            self.run_direct(prompt)
+            self.run_direct_logging(prompt_obj, text, system, schema_value)
         }
     }
 
@@ -243,6 +263,77 @@ impl LlmClient {
             .await
         });
         let r = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        build_chain_result(py, r)
+    }
+
+    /// Run a configured agent on `prompt`. Honors CLI-parity precedence:
+    ///
+    /// - **Model**: `config.model` if set, else the client's constructor
+    ///   model. The model must belong to the client's provider — cross-
+    ///   provider switching is out of scope.
+    /// - **System**: arg > `config.system_prompt` > none.
+    /// - **Retry**: arg `retries` > `config.retry` > client default.
+    /// - **Chain limit**: `config.chain_limit` (default 10).
+    /// - **Budget**: `config.budget.max_tokens` if set.
+    /// - **Tools**: `config.tools` is a whitelist against the client's
+    ///   registry. Unknown tool names error with
+    ///   `unknown tool in agent config: {name}`.
+    ///
+    /// Returns a `ChainResult`.
+    #[pyo3(signature = (config, prompt, *, system=None, retries=None))]
+    fn run_agent(
+        &self,
+        py: Python<'_>,
+        config: &PyAgentConfig,
+        prompt: &str,
+        system: Option<&str>,
+        retries: Option<u32>,
+    ) -> PyResult<PyChainResult> {
+        let agent_cfg = &config.inner;
+        let model = llm_core::resolve_agent_model(agent_cfg, &self.model).to_string();
+        let effective_system = llm_core::resolve_agent_system(system, agent_cfg);
+        let effective_retry =
+            llm_core::resolve_agent_retry(retries, agent_cfg, &self.retry_config);
+        let budget = llm_core::resolve_agent_budget(agent_cfg);
+
+        let registry_tools = self.registry.list_tools();
+        let tools = llm_core::resolve_agent_tools(agent_cfg, &registry_tools)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+        let mut p = Prompt::new(prompt).with_tools(tools);
+        if let Some(s) = effective_system {
+            p = p.with_system(s);
+        }
+        for (k, v) in &agent_cfg.options {
+            p = p.with_option(k, v.clone());
+        }
+
+        let parallel = ParallelConfig {
+            enabled: agent_cfg.parallel_tools,
+            max_concurrent: agent_cfg.max_parallel_tools,
+        };
+        let limit = agent_cfg.chain_limit;
+
+        let result: llm_core::Result<ChainResult> = self.runtime.block_on(async {
+            let mut on_chunk = |_: &Chunk| {};
+            let retry = RetryProvider::new(&self.provider, effective_retry);
+            chain(
+                &retry,
+                &model,
+                p,
+                Some(&self.api_key),
+                false,
+                &self.registry,
+                limit,
+                &mut on_chunk,
+                None,
+                budget,
+                parallel,
+            )
+            .await
+        });
+        let r =
+            result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         build_chain_result(py, r)
     }
 
@@ -392,27 +483,114 @@ impl LlmClient {
         p
     }
 
-    fn run_direct(&self, prompt: Prompt) -> PyResult<String> {
-        let result: llm_core::Result<String> = self.runtime.block_on(async {
-            let retry = RetryProvider::new(&self.provider, self.retry_config.clone());
-            let stream = retry
-                .execute(&self.model, &prompt, Some(&self.api_key), false)
-                .await?;
-            let mut pinned = std::pin::pin!(stream);
-            let mut text = String::new();
-            while let Some(item) = pinned.next().await {
-                match item? {
-                    Chunk::Text(t) => text.push_str(&t),
-                    Chunk::Done => break,
-                    _ => {}
-                }
-            }
-            Ok(text)
+    #[allow(clippy::too_many_arguments)]
+    fn auto_log(
+        &self,
+        user_text: &str,
+        system: Option<&str>,
+        options: &Options,
+        chunks: &[Chunk],
+        tool_calls: Vec<ToolCall>,
+        tool_results: Vec<ToolResult>,
+        total_usage: Option<Usage>,
+        schema: Option<Value>,
+        duration_ms: u64,
+    ) -> PyResult<()> {
+        let Some(store) = self.log_store.as_ref() else {
+            return Ok(());
+        };
+        let response = synthesize_response(ResponseInputs {
+            model: &self.model,
+            prompt: user_text,
+            system,
+            options: options.clone(),
+            chunks,
+            tool_calls,
+            tool_results,
+            total_usage,
+            schema,
+            schema_id: None,
+            duration_ms,
         });
-        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        let prev_cid = self.conversation_id.lock().unwrap().clone();
+        let new_cid = store
+            .log_response(prev_cid.as_deref(), &self.model, &response)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        *self.conversation_id.lock().unwrap() = Some(new_cid);
+        Ok(())
     }
 
-    fn run_chain(&self, prompt: Prompt) -> PyResult<String> {
+    /// Log a completed `Response` against `store` using `cid` as the active
+    /// conversation (or creating a new one). Returns the resulting cid.
+    /// Used by `Conversation` when it holds its own store.
+    pub(crate) fn log_response_external(
+        store: &Arc<llm_store::LogStore>,
+        cid: Option<&str>,
+        model: &str,
+        response: &Response,
+    ) -> PyResult<String> {
+        store
+            .log_response(cid, model, response)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    pub(crate) fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    fn run_direct_logging(
+        &self,
+        prompt: Prompt,
+        user_text: &str,
+        system: Option<&str>,
+        schema: Option<Value>,
+    ) -> PyResult<String> {
+        let start = Instant::now();
+        let result: llm_core::Result<(Vec<Chunk>, Option<Usage>)> =
+            self.runtime.block_on(async {
+                let retry = RetryProvider::new(&self.provider, self.retry_config.clone());
+                let stream = retry
+                    .execute(&self.model, &prompt, Some(&self.api_key), false)
+                    .await?;
+                let mut pinned = std::pin::pin!(stream);
+                let mut chunks = Vec::new();
+                while let Some(item) = pinned.next().await {
+                    let chunk = item?;
+                    if matches!(chunk, Chunk::Done) {
+                        break;
+                    }
+                    chunks.push(chunk);
+                }
+                let usage = llm_core::collect_usage(&chunks);
+                Ok((chunks, usage))
+            });
+        let (chunks, usage) =
+            result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let text = llm_core::collect_text(&chunks);
+        self.auto_log(
+            user_text,
+            system,
+            &prompt.options,
+            &chunks,
+            Vec::new(),
+            Vec::new(),
+            usage,
+            schema,
+            duration_ms,
+        )?;
+        Ok(text)
+    }
+
+    fn run_chain_logging(
+        &self,
+        prompt: Prompt,
+        user_text: &str,
+        system: Option<&str>,
+        schema: Option<Value>,
+    ) -> PyResult<String> {
+        let start = Instant::now();
+        let options = prompt.options.clone();
         let result: llm_core::Result<ChainResult> = self.runtime.block_on(async {
             let mut on_chunk = |_: &Chunk| {};
             let retry = RetryProvider::new(&self.provider, self.retry_config.clone());
@@ -433,16 +611,31 @@ impl LlmClient {
         });
         let chain_result =
             result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        Ok(llm_core::collect_text(&chain_result.chunks))
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let text = llm_core::collect_text(&chain_result.chunks);
+        let tool_calls = llm_core::collect_tool_calls(&chain_result.chunks);
+        self.auto_log(
+            user_text,
+            system,
+            &options,
+            &chain_result.chunks,
+            tool_calls,
+            chain_result.tool_results,
+            chain_result.total_usage,
+            schema,
+            duration_ms,
+        )?;
+        Ok(text)
     }
 
     /// Used by `Conversation`: run a multi-turn chain seeded with `messages`
-    /// and return (final_text, updated_messages).
+    /// and return a `TurnOutput` with everything the caller needs to update
+    /// its history and optionally auto-log the turn.
     pub(crate) fn send_messages(
         &self,
         messages: &[Message],
         system: Option<&str>,
-    ) -> PyResult<(String, Vec<Message>)> {
+    ) -> PyResult<TurnOutput> {
         let mut p = Prompt::new("")
             .with_tools(self.registry.list_tools())
             .with_messages(messages.to_vec());
@@ -450,6 +643,7 @@ impl LlmClient {
             p = p.with_system(s);
         }
 
+        let start = Instant::now();
         let result: llm_core::Result<ChainResult> = self.runtime.block_on(async {
             let mut on_chunk = |_: &Chunk| {};
             let retry = RetryProvider::new(&self.provider, self.retry_config.clone());
@@ -470,8 +664,8 @@ impl LlmClient {
         });
         let chain_result =
             result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        let text = llm_core::collect_text(&chain_result.chunks);
-        Ok((text, chain_result.messages))
+        let duration_ms = start.elapsed().as_millis() as u64;
+        Ok(TurnOutput::from_chain(chain_result, duration_ms))
     }
 
     pub(crate) fn send_messages_streaming(
@@ -480,7 +674,7 @@ impl LlmClient {
         system: Option<&str>,
         py: Python<'_>,
         callback: Py<PyAny>,
-    ) -> PyResult<(String, Vec<Message>)> {
+    ) -> PyResult<TurnOutput> {
         let mut p = Prompt::new("")
             .with_tools(self.registry.list_tools())
             .with_messages(messages.to_vec());
@@ -489,6 +683,7 @@ impl LlmClient {
         }
 
         let cb = callback;
+        let start = Instant::now();
         let result: llm_core::Result<ChainResult> = self.runtime.block_on(async {
             let mut on_chunk = |chunk: &Chunk| {
                 if let Chunk::Text(t) = chunk {
@@ -513,8 +708,37 @@ impl LlmClient {
         });
         let chain_result =
             result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        let text = llm_core::collect_text(&chain_result.chunks);
-        Ok((text, chain_result.messages))
+        let duration_ms = start.elapsed().as_millis() as u64;
+        Ok(TurnOutput::from_chain(chain_result, duration_ms))
+    }
+}
+
+/// One turn worth of data returned by `send_messages{_streaming}` so that
+/// `Conversation` can both update its history and, if it has an attached
+/// store, synthesize a `Response` and append it to the log.
+pub(crate) struct TurnOutput {
+    pub text: String,
+    pub chunks: Vec<Chunk>,
+    pub tool_calls: Vec<ToolCall>,
+    pub tool_results: Vec<ToolResult>,
+    pub total_usage: Option<Usage>,
+    pub duration_ms: u64,
+    pub messages: Vec<Message>,
+}
+
+impl TurnOutput {
+    fn from_chain(r: ChainResult, duration_ms: u64) -> Self {
+        let text = llm_core::collect_text(&r.chunks);
+        let tool_calls = llm_core::collect_tool_calls(&r.chunks);
+        Self {
+            text,
+            chunks: r.chunks,
+            tool_calls,
+            tool_results: r.tool_results,
+            total_usage: r.total_usage,
+            duration_ms,
+            messages: r.messages,
+        }
     }
 }
 
@@ -643,6 +867,8 @@ fn llm_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Conversation>()?;
     m.add_class::<ToolDecorator>()?;
     m.add_class::<PyChainResult>()?;
+    m.add_class::<PyLogStore>()?;
+    m.add_class::<PyAgentConfig>()?;
     m.add_function(wrap_pyfunction!(parse_schema_dsl, m)?)?;
     Ok(())
 }

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{LlmError, Result};
 use crate::retry::RetryConfig;
+use crate::types::Tool;
 
 // ---------------------------------------------------------------------------
 // AgentConfig
@@ -95,6 +96,71 @@ impl AgentConfig {
 pub struct BudgetConfig {
     #[serde(default)]
     pub max_tokens: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// Programmatic resolution helpers
+// ---------------------------------------------------------------------------
+//
+// Shared by `llm-python::run_agent` and `llm-wasm::runAgent`. Pure functions
+// so they can be unit-tested without any binding machinery.
+
+/// Resolve the model for an agent run: `config.model` if set, else the
+/// client's default.
+pub fn resolve_agent_model<'a>(config: &'a AgentConfig, client_default: &'a str) -> &'a str {
+    config.model.as_deref().unwrap_or(client_default)
+}
+
+/// Resolve the system prompt: arg > `config.system_prompt` > None.
+/// Mirrors the CLI precedence at `llm-cli/src/commands/agent.rs`.
+pub fn resolve_agent_system<'a>(
+    arg: Option<&'a str>,
+    config: &'a AgentConfig,
+) -> Option<&'a str> {
+    arg.or(config.system_prompt.as_deref())
+}
+
+/// Resolve the retry config: CLI arg > agent TOML > client default.
+pub fn resolve_agent_retry(
+    cli_arg: Option<u32>,
+    config: &AgentConfig,
+    client_default: &RetryConfig,
+) -> RetryConfig {
+    if let Some(n) = cli_arg {
+        let mut cfg = client_default.clone();
+        cfg.max_retries = n;
+        return cfg;
+    }
+    if let Some(agent_retry) = &config.retry {
+        return agent_retry.clone();
+    }
+    client_default.clone()
+}
+
+/// Filter an agent's tool whitelist against the set of tools registered on
+/// the host. Returns a `Vec<Tool>` in the order the agent requested them.
+/// Errors with the exact CLI message if any name is unknown.
+pub fn resolve_agent_tools(
+    config: &AgentConfig,
+    registry_tools: &[Tool],
+) -> Result<Vec<Tool>> {
+    let mut out = Vec::with_capacity(config.tools.len());
+    for name in &config.tools {
+        match registry_tools.iter().find(|t| t.name == *name) {
+            Some(t) => out.push(t.clone()),
+            None => {
+                return Err(LlmError::Config(format!(
+                    "unknown tool in agent config: {name}"
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Extract the budget (`max_tokens`) from an agent config, if set.
+pub fn resolve_agent_budget(config: &AgentConfig) -> Option<u64> {
+    config.budget.as_ref().and_then(|b| b.max_tokens)
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +584,139 @@ max_parallel_tools = 3
 
         let config = AgentConfig::load(&path).unwrap();
         assert!(config.retry.is_none());
+    }
+
+    // --- Programmatic resolution helpers (shared by Python/WASM bindings) ---
+
+    fn tool(name: &str) -> Tool {
+        Tool {
+            name: name.to_string(),
+            description: format!("{name} tool"),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    #[test]
+    fn resolve_model_uses_config_when_set() {
+        let mut cfg = AgentConfig::default();
+        cfg.model = Some("gpt-4o".into());
+        assert_eq!(resolve_agent_model(&cfg, "gpt-4o-mini"), "gpt-4o");
+    }
+
+    #[test]
+    fn resolve_model_falls_back_to_client_default() {
+        let cfg = AgentConfig::default();
+        assert_eq!(resolve_agent_model(&cfg, "gpt-4o-mini"), "gpt-4o-mini");
+    }
+
+    #[test]
+    fn resolve_system_prefers_arg_over_config() {
+        let mut cfg = AgentConfig::default();
+        cfg.system_prompt = Some("from config".into());
+        assert_eq!(
+            resolve_agent_system(Some("from arg"), &cfg),
+            Some("from arg")
+        );
+    }
+
+    #[test]
+    fn resolve_system_uses_config_when_no_arg() {
+        let mut cfg = AgentConfig::default();
+        cfg.system_prompt = Some("from config".into());
+        assert_eq!(resolve_agent_system(None, &cfg), Some("from config"));
+    }
+
+    #[test]
+    fn resolve_system_none_when_neither() {
+        let cfg = AgentConfig::default();
+        assert_eq!(resolve_agent_system(None, &cfg), None);
+    }
+
+    #[test]
+    fn resolve_retry_cli_arg_wins() {
+        let cfg = AgentConfig::default();
+        let client = RetryConfig::default();
+        let out = resolve_agent_retry(Some(7), &cfg, &client);
+        assert_eq!(out.max_retries, 7);
+    }
+
+    #[test]
+    fn resolve_retry_agent_config_wins_over_default() {
+        let mut cfg = AgentConfig::default();
+        cfg.retry = Some(RetryConfig {
+            max_retries: 5,
+            base_delay_ms: 123,
+            max_delay_ms: 456,
+            jitter: false,
+        });
+        let client = RetryConfig::default();
+        let out = resolve_agent_retry(None, &cfg, &client);
+        assert_eq!(out.max_retries, 5);
+        assert_eq!(out.base_delay_ms, 123);
+    }
+
+    #[test]
+    fn resolve_retry_falls_back_to_client() {
+        let cfg = AgentConfig::default();
+        let client = RetryConfig {
+            max_retries: 2,
+            base_delay_ms: 1000,
+            max_delay_ms: 30_000,
+            jitter: true,
+        };
+        let out = resolve_agent_retry(None, &cfg, &client);
+        assert_eq!(out.max_retries, 2);
+    }
+
+    #[test]
+    fn resolve_tools_filters_to_agent_whitelist() {
+        let mut cfg = AgentConfig::default();
+        cfg.tools = vec!["read_file".into(), "llm_time".into()];
+        let registry = vec![tool("read_file"), tool("ripgrep"), tool("llm_time")];
+
+        let out = resolve_agent_tools(&cfg, &registry).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "read_file");
+        assert_eq!(out[1].name, "llm_time");
+    }
+
+    #[test]
+    fn resolve_tools_errors_on_unknown_with_cli_format() {
+        let mut cfg = AgentConfig::default();
+        cfg.tools = vec!["missing".into()];
+        let registry = vec![tool("read_file")];
+
+        let err = resolve_agent_tools(&cfg, &registry).unwrap_err();
+        let msg = err.to_string();
+        // Byte-identical to the CLI error at
+        // llm-cli/src/commands/agent.rs:331-333.
+        assert!(
+            msg.contains("unknown tool in agent config: missing"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_tools_empty_config_returns_empty() {
+        let cfg = AgentConfig::default();
+        let registry = vec![tool("read_file")];
+        let out = resolve_agent_tools(&cfg, &registry).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn resolve_budget_extracts_max_tokens() {
+        let mut cfg = AgentConfig::default();
+        cfg.budget = Some(BudgetConfig {
+            max_tokens: Some(5000),
+        });
+        assert_eq!(resolve_agent_budget(&cfg), Some(5000));
+    }
+
+    #[test]
+    fn resolve_budget_none_when_unset() {
+        let cfg = AgentConfig::default();
+        assert_eq!(resolve_agent_budget(&cfg), None);
     }
 
     #[test]

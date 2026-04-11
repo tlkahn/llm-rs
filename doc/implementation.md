@@ -141,3 +141,23 @@ Collecting first places every borrow under one unified lifetime tied to the encl
 **`--tools-approve` must force sequential dispatch.** `CliToolExecutor` prompts on stdin before running each tool when `--tools-approve` is set. If parallel dispatch were allowed, multiple concurrent tool calls would race to read from the same stdin and interleave their approval prompts unreadably. The agent/prompt/chat handlers check `args.tools_approve` when building `ParallelConfig` and unconditionally set `enabled = false` — tested explicitly via dry-run JSON on `agent run` so a future refactor cannot regress it silently.
 
 **Known caveat: `--tools-debug` stdout interleaves under parallel dispatch.** `CliToolExecutor` prints `running tool X` / `tool X returned` lines from inside `execute()`. With the default parallel dispatch those lines can interleave across concurrent calls — visually noisy, but not a correctness bug. Fix options if users complain: buffer per-call output and flush in input order after dispatch, force sequential under `-vv`, or prefix each debug line with the `tool_call_id`.
+
+---
+
+## Phase C — Persistent logs + programmatic agents (bindings)
+
+**`ulid` on wasm32 forces target-gating the whole `logs` module.** `llm-store` needs to build for wasm32 so `llm-wasm` can import the `ConversationStore` trait. `ulid` transitively pulls `getrandom`, which needs the `js` feature on wasm32 — but `build_response` is the only user and is native-only. Cleanest fix: move `ulid` + `chrono` into `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]` and gate `logs`/`query` modules behind `cfg(not(target_arch = "wasm32"))`. The alternative (enabling `getrandom/js`) would leak a `js-sys` dep into `llm-store` for zero runtime benefit.
+
+**`ConversationSummary` module move.** The summary type lived in `query.rs` (native-only) but `ConversationStore::list_conversations` needs to return it from the wasm32-visible trait. Moved to the new `store.rs` module (wasm-safe) alongside the trait itself. `ConversationSummary` also picked up a `Deserialize` derive so `JsConversationStore` can round-trip it through `serde_wasm_bindgen::from_value`.
+
+**`pyo3` `extension-module` breaks `cargo test`.** llm-python tests that don't cross the pyo3 boundary (e.g. `response_build` pure helpers) need to compile without linking libpython. Fix: make `extension-module` an opt-out feature (`default = ["extension-module"]`, `extension-module = ["pyo3/extension-module"]`) and run unit tests with `--no-default-features`. `maturin develop` keeps the default, so the real extension build is unaffected.
+
+**`pyo3` `#[pyclass]` requires `Sync`.** Dropped `RefCell<Option<String>>` in favor of `Mutex<Option<String>>` for the client/conversation cid tracker. Same for the per-conversation store handle. `RefCell` is fine on wasm32 (single-threaded) but fails the `PyClassSync` assertion on native.
+
+**Auto-log `Response.prompt` = user turn, not chain history.** `reconstruct_messages` is lossy across multi-iteration chains (intermediate assistant reasoning text is dropped). The Python and WASM bindings log one `Response` per top-level `prompt()` / `Conversation.send()` call — the `prompt` field holds just the user turn text and `response` holds the final assistant reply. `tool_calls` / `tool_results` come from `ChainResult.tool_results` directly, not re-derived from messages.
+
+**`Conversation.persist_to` is attach-only.** If the conversation already has messages, `persist_to` errors with `persist_to must be called before first send` rather than backfilling synthetic Responses with no usage/duration data. Users with an existing cid should call `Conversation.load(client, store, cid)` instead.
+
+**WASM `build_response_wasm` parallel to `llm_store::build_response`.** The native helper pulls `ulid` + `chrono`; on wasm32 we use `crypto.randomUUID` via `js_sys::Reflect` and `js_sys::Date::new_0().to_iso_string()` for the RFC 3339 datetime. Same signature, same field layout — kept as a separate function to keep `llm-store` free of any `js-sys` dep.
+
+**Resolve helpers live in `llm-core::agent`, not duplicated.** `resolve_agent_model`/`system`/`retry`/`tools`/`budget` are pure functions in llm-core shared by both `llm-python::run_agent` and `llm-wasm::runAgent`. Tests live in `llm-core/src/agent.rs` and run via the workspace. The unknown-tool error message is byte-identical to the CLI at `llm-cli/src/commands/agent.rs:331-333` — asserted by a unit test so a future refactor can't diverge.

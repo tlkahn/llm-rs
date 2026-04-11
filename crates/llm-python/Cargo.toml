@@ -5,14 +5,18 @@ edition = "2024"
 
 [lib]
 name = "llm_rs"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 llm-core = { path = "../llm-core" }
 llm-openai = { path = "../llm-openai" }
 llm-anthropic = { path = "../llm-anthropic" }
 llm-store = { path = "../llm-store" }
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.23" }
 pythonize = "0.23"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"

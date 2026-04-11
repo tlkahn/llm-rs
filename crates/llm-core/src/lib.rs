@@ -10,7 +10,11 @@ pub mod tools;
 pub mod types;
 
 // Re-export key types at crate root for convenience
-pub use agent::{AgentConfig, AgentInfo, AgentSource, discover_agents, resolve_agent};
+pub use agent::{
+    AgentConfig, AgentInfo, AgentSource, BudgetConfig, discover_agents, resolve_agent,
+    resolve_agent_budget, resolve_agent_model, resolve_agent_retry, resolve_agent_system,
+    resolve_agent_tools,
+};
 pub use chain::{ChainEvent, ChainResult, ParallelConfig, ToolExecutor, chain};
 pub use config::{Config, KeyStore, Paths, parse_option_value, resolve_key};
 pub use error::{LlmError, Result};

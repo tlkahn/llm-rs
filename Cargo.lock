@@ -1037,11 +1037,13 @@ dependencies = [
 name = "llm-store"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "llm-core",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "ulid",
 ]
 

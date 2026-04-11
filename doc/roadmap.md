@@ -33,6 +33,7 @@ llm-rs is a library with a CLI, not an orchestration framework. Recursive sub-ag
 | 7 --- Retry/Backoff | v0.7 | Complete | `HttpError` variant, `RetryConfig`, `RetryProvider` wrapper, `--retries` flag on prompt/chat/agent |
 | 8 --- Dry-Run Mode | v0.8 | Complete | `--dry-run` on `llm agent run` resolves agent config and prints (plain or `--json`) without LLM call; `-v`/`-vv` dumps full `Prompt` JSON |
 | 9 --- Parallel Tool Execution | v0.9 | Complete | `ParallelConfig` dispatched via `future::join_all`/`buffered(n)`; order-preserving; `--sequential-tools`/`--max-parallel-tools` on prompt/chat/agent; `parallel_tools`/`max_parallel_tools` in agent TOML; `--tools-approve` forces sequential |
+| C --- Persistent logs + programmatic agents (bindings) | — | Complete | `ConversationStore` trait in `llm-store`, `LogStore` impl; `llm-python` `LogStore` pyclass + `Conversation.load`/`persist_to` + auto-logging + `AgentConfig` + `LlmClient.run_agent`; `llm-wasm` `JsConversationStore` JS-callback backend + `setConversationStore` + `Conversation.load` + `AgentConfig`/`runAgent` |
 
 ---
 

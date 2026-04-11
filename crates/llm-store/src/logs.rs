@@ -2,12 +2,14 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
 use chrono::Utc;
 use ulid::Ulid;
 
 use llm_core::{LlmError, Message, Response, Result};
 
 use crate::records::{ConversationRecord, LineRecord, ResponseRecord};
+use crate::store::{ConversationStore, ConversationSummary};
 
 /// Handle to the logs directory for reading/writing conversation JSONL files.
 pub struct LogStore {
@@ -21,6 +23,11 @@ impl LogStore {
         Ok(Self {
             logs_dir: logs_dir.to_path_buf(),
         })
+    }
+
+    /// Path to the directory backing this store.
+    pub fn logs_dir(&self) -> &Path {
+        &self.logs_dir
     }
 
     /// Log a response to a conversation file.
@@ -194,6 +201,37 @@ pub fn conversation_name(prompt: &str) -> Option<String> {
         // Truncate at a char boundary near 100
         let truncated = &collapsed[..collapsed.floor_char_boundary(100)];
         Some(format!("{truncated}..."))
+    }
+}
+
+/// Implement the abstract `ConversationStore` trait by delegating to the
+/// existing inherent methods and the `query` module. The trait is used by
+/// library consumers (llm-python, llm-wasm); llm-cli keeps calling the
+/// inherent methods directly.
+#[async_trait]
+impl ConversationStore for LogStore {
+    async fn log_response(
+        &self,
+        conversation_id: Option<&str>,
+        model: &str,
+        response: &Response,
+    ) -> Result<String> {
+        LogStore::log_response(self, conversation_id, model, response)
+    }
+
+    async fn read_conversation(
+        &self,
+        id: &str,
+    ) -> Result<(ConversationRecord, Vec<Response>)> {
+        LogStore::read_conversation(self, id)
+    }
+
+    async fn list_conversations(&self, limit: usize) -> Result<Vec<ConversationSummary>> {
+        crate::query::list_conversations(&self.logs_dir, limit)
+    }
+
+    async fn latest_conversation_id(&self) -> Result<Option<String>> {
+        crate::query::latest_conversation_id(&self.logs_dir)
     }
 }
 
@@ -716,5 +754,69 @@ mod tests {
     fn reconstruct_empty_responses_gives_empty() {
         let messages = reconstruct_messages(&[]);
         assert!(messages.is_empty());
+    }
+
+    // --- ConversationStore trait impl tests ---
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn trait_log_and_read_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let store = LogStore::open(dir.path()).unwrap();
+        let resp = sample_response("Hello", "Hi!");
+
+        let store_ref: &dyn ConversationStore = &store;
+        let cid = block_on(store_ref.log_response(None, "gpt-4o", &resp)).unwrap();
+        let (meta, responses) = block_on(store_ref.read_conversation(&cid)).unwrap();
+        assert_eq!(meta.id, cid);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].prompt, "Hello");
+    }
+
+    #[test]
+    fn trait_list_conversations_orders_newest_first() {
+        let dir = TempDir::new().unwrap();
+        let store = LogStore::open(dir.path()).unwrap();
+        let store_ref: &dyn ConversationStore = &store;
+
+        let id1 =
+            block_on(store_ref.log_response(None, "gpt-4o", &sample_response("one", "1"))).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let id2 =
+            block_on(store_ref.log_response(None, "gpt-4o", &sample_response("two", "2"))).unwrap();
+
+        let summaries = block_on(store_ref.list_conversations(10)).unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].id, id2);
+        assert_eq!(summaries[1].id, id1);
+    }
+
+    #[test]
+    fn trait_latest_conversation_id_returns_most_recent() {
+        let dir = TempDir::new().unwrap();
+        let store = LogStore::open(dir.path()).unwrap();
+        let store_ref: &dyn ConversationStore = &store;
+
+        assert_eq!(
+            block_on(store_ref.latest_conversation_id()).unwrap(),
+            None
+        );
+
+        block_on(store_ref.log_response(None, "gpt-4o", &sample_response("a", "1"))).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let id2 =
+            block_on(store_ref.log_response(None, "gpt-4o", &sample_response("b", "2"))).unwrap();
+
+        assert_eq!(
+            block_on(store_ref.latest_conversation_id()).unwrap(),
+            Some(id2)
+        );
     }
 }

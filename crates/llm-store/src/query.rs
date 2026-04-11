@@ -4,27 +4,8 @@ use std::path::Path;
 
 use llm_core::Result;
 
-use crate::records::{ConversationRecord, LineRecord};
-
-/// Summary of a conversation for listing.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ConversationSummary {
-    pub id: String,
-    pub model: String,
-    pub name: Option<String>,
-    pub created: String,
-}
-
-impl From<ConversationRecord> for ConversationSummary {
-    fn from(rec: ConversationRecord) -> Self {
-        Self {
-            id: rec.id,
-            model: rec.model,
-            name: rec.name,
-            created: rec.created,
-        }
-    }
-}
+use crate::records::LineRecord;
+use crate::store::ConversationSummary;
 
 /// Options for filtering conversation listings.
 #[derive(Debug, Default)]

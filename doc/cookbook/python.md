@@ -2,7 +2,7 @@
 
 `llm-python` exposes `llm-core` to Python as a native PyO3 extension built with [maturin](https://www.maturin.rs/). You get a single `LlmClient` class that talks to OpenAI, Anthropic, or any OpenAI-compatible endpoint, with a real Python iterator for streaming. No `httpx`, no `openai` package, no async event loop in your code — the Rust side runs Tokio internally and hands plain strings back across the FFI boundary.
 
-Phases A and B of the wrapper extension are in: you get **tool calling** (Python functions exposed to the model via a decorator), **multi-turn `Conversation`s` with shared message history, **structured output** via either a JSON-Schema dict or LLM-RS's terse schema DSL, the two built-in tools (`llm_version`, `llm_time`), a **chain loop wrapper** with per-iteration observability events, **retries with exponential backoff**, and **token budgets**. Persistent logs and programmatic agent runs are still CLI-only — see the bottom of this file for what's still missing.
+Phases A, B, and C of the wrapper extension are in: you get **tool calling** (Python functions exposed to the model via a decorator), **multi-turn `Conversation`s** with shared message history, **structured output** via either a JSON-Schema dict or LLM-RS's terse schema DSL, the two built-in tools (`llm_version`, `llm_time`), a **chain loop wrapper** with per-iteration observability events, **retries with exponential backoff**, **token budgets**, **persistent conversation logs** via a `LogStore`, reloadable `Conversation.load`, and **programmatic agent runs** via `AgentConfig` + `LlmClient.run_agent`.
 
 For the underlying class definitions, see [`crates/llm-python/src/lib.rs`](../../crates/llm-python/src/lib.rs), [`tools.rs`](../../crates/llm-python/src/tools.rs), and [`conversation.rs`](../../crates/llm-python/src/conversation.rs).
 
@@ -46,7 +46,8 @@ client = llm_rs.LlmClient(
     model="gpt-4o-mini",       # "claude-*" routes to Anthropic
     provider=None,             # "openai" | "anthropic" to force
     base_url=None,             # point at any OpenAI-compatible host
-    log_dir=None,              # currently a no-op placeholder
+    log_dir=None,              # path string — auto-opens a LogStore
+    log_store=None,            # or pass a pre-built LogStore instance
     chain_limit=5,             # max chain iterations when tools are registered
 )
 
@@ -551,12 +552,123 @@ Non-retryable errors (4xx other than 429, malformed responses, local bugs) surfa
 
 ---
 
+## Recipe 17: Persistent conversation logs
+
+Construct a `LogStore` against a directory and pass it to the client (or to a `Conversation`) — every `prompt()` / `Conversation.send()` call is then appended to a rolling JSONL conversation in the same on-disk format the CLI uses.
+
+```python
+import llm_rs, os, tempfile
+
+tmp = tempfile.mkdtemp()
+store = llm_rs.LogStore(tmp)
+
+client = llm_rs.LlmClient(
+    os.environ["OPENAI_API_KEY"],
+    "gpt-4o-mini",
+    log_store=store,
+)
+
+# Auto-logs: first call creates a new conversation, subsequent calls append.
+client.prompt("Remember the number 42.")
+client.prompt("What number did I ask you to remember?")
+
+cid = store.latest_conversation_id()
+print("conversation id:", cid)
+
+meta, responses = store.read_conversation(cid)
+print("turns:", len(responses))
+for r in responses:
+    print(r["prompt"], "->", r["response"])
+
+print(store.list_conversations(limit=10))
+```
+
+### Reloading a prior conversation
+
+`Conversation.load(client, store, cid)` rehydrates a `Conversation` from a persisted cid. The message history is reconstructed via `llm_store::reconstruct_messages` and the system prompt is seeded from the first stored response, so follow-up turns see the same context the original session did.
+
+```python
+# Resume a prior conversation by id.
+conv = llm_rs.Conversation.load(client, store, cid)
+reply = conv.send("Summarize what we discussed in one sentence.")
+print(reply)
+# This turn is also auto-logged as an append to the same cid.
+```
+
+`Conversation.load` is lossy across multi-iteration chain loops — intermediate assistant reasoning text between tool turns is dropped, matching the CLI's `-c/--cid` behavior.
+
+### Attaching a store to a fresh Conversation
+
+`Conversation.persist_to(store)` attaches a store to a conversation that inherited none from its client. It errors if the conversation already has messages — to resume a persisted session, call `Conversation.load` instead.
+
+```python
+conv = llm_rs.Conversation(client_without_store)
+conv.persist_to(store)     # OK on an empty conversation
+conv.send("hello")         # this turn is logged
+
+# Contrast:
+populated = llm_rs.Conversation(client)
+populated.send("hi")
+populated.persist_to(store)  # raises ValueError
+```
+
+---
+
+## Recipe 18: Programmatic agent runs
+
+`AgentConfig` mirrors the TOML schema used by `llm agent run` on the CLI. Build one in Python or load it from a TOML file, then call `client.run_agent(config, prompt)`.
+
+```python
+import llm_rs, os
+
+client = llm_rs.LlmClient(os.environ["OPENAI_API_KEY"], "gpt-4o-mini")
+client.enable_builtin_tools()
+
+# Build in-process.
+config = llm_rs.AgentConfig(
+    system_prompt="Respond with a single integer.",
+    tools=["llm_time"],        # whitelist against the client's registered tools
+    chain_limit=3,
+    options={"temperature": 0},
+    budget=5000,               # max_tokens
+    parallel_tools=True,
+)
+
+result = client.run_agent(config, "What is 2 + 2?")
+print(result.text)
+print("tool calls:", result.tool_calls)
+print("budget exhausted:", result.budget_exhausted)
+```
+
+Load from a TOML file (same format `llm agent run <name>` reads):
+
+```python
+config = llm_rs.AgentConfig.from_toml("./agents/reviewer.toml")
+result = client.run_agent(config, "Review this PR.", system="Be terse.", retries=2)
+```
+
+### Precedence rules (CLI parity)
+
+| Setting    | Resolution                                          |
+|------------|-----------------------------------------------------|
+| Model      | `config.model` if set, else the client's constructor model. Must belong to the client's provider — cross-provider switching is out of scope. |
+| System     | `system=` arg > `config.system_prompt` > none       |
+| Retry      | `retries=` arg > `config.retry` > client default    |
+| Chain limit| `config.chain_limit` (default 10)                   |
+| Budget     | `config.budget` (max tokens)                        |
+| Parallel   | `config.parallel_tools` + `config.max_parallel_tools` |
+| Tools      | `config.tools` filtered against the client's registry |
+
+Unknown tool names fail fast with the CLI's error message:
+`unknown tool in agent config: <name>`. The client's tool registry is not mutated — the filtered list only applies to this call.
+
+---
+
 ## What's intentionally missing (and what to use instead)
 
 | You want                       | Use this instead                                                       |
 |--------------------------------|------------------------------------------------------------------------|
-| Persistent conversation logs   | `llm` CLI writes JSONL to `$XDG_DATA_HOME/llm/logs/`. Read it back with `llm logs list`. Python `LogStore` exposure is Phase C. |
-| Programmatic agent runs        | `llm agent run …` from a subprocess. Native `AgentConfig` + `run_agent` is Phase C. |
-| External `llm-tool-*` subprocesses | Stays CLI-only — the browser/Python sandbox model doesn't grant `$PATH` access. |
+| Cross-provider model override  | Clients are constructed with a fixed provider binding. If you need to switch between OpenAI and Anthropic mid-session, construct a second client. |
+| External `llm-tool-*` subprocesses | Stays CLI-only — the Python extension has no clean `$PATH` discovery story. Shell out to `llm agent run --json` if you need them. |
 
-For persistent logs and TOML-defined agent runs, shell out to the CLI (`subprocess.run(["llm", "agent", "run", ...])`) — those are scoped to Phase C. Every Phase 1–9 CLI feature is available there, with stable JSON output via `--json` for parsing.
+For external `llm-tool-*` subprocesses, shell out to the CLI (`subprocess.run(["llm", "agent", "run", ...])`) with stable `--json` output for parsing.

@@ -476,13 +476,99 @@ Non-retryable errors (4xx other than 429, malformed responses) surface immediate
 
 ---
 
+## Persistent conversation store (IndexedDB recipe)
+
+Every `prompt` / `chain` / `conversation.send` call can be auto-persisted to a JS-provided store. Implement four async callbacks (returning Promises) and pass them to `client.setConversationStore`:
+
+```js
+// A minimal in-memory store. Swap the Map for `idb-keyval` / IndexedDB
+// to persist across page reloads.
+const records = new Map();     // cid → { meta, responses }
+let lastCid = null;
+const ulid = () =>
+  [...crypto.getRandomValues(new Uint8Array(13))]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
+client.setConversationStore({
+  async logResponse(cid, model, response) {
+    const id = cid ?? ulid();
+    if (!records.has(id)) {
+      records.set(id, {
+        meta: { v: 1, id, model, name: null, created: new Date().toISOString() },
+        responses: [],
+      });
+    }
+    records.get(id).responses.push(response);
+    lastCid = id;
+    return id;                 // MUST resolve to the cid
+  },
+  async readConversation(id) {
+    const rec = records.get(id);
+    if (!rec) throw new Error(`conversation not found: ${id}`);
+    return rec;                // { meta, responses }
+  },
+  async listConversations(limit) {
+    return Array.from(records.values())
+      .map((r) => r.meta)
+      .slice(0, limit);
+  },
+  async latestConversationId() {
+    return lastCid;
+  },
+});
+
+await client.prompt("Remember the number 42.");
+await client.prompt("What number did I ask you to remember?");
+
+console.log("turns:", records.get(lastCid).responses.length);
+```
+
+### Reloading a prior conversation
+
+```js
+const reloaded = await Conversation.load(client, lastCid);
+const reply = await reloaded.send("Summarize what we discussed.");
+```
+
+`Conversation.load` reads the cid from the attached store, reconstructs the message history (same algorithm as `reconstruct_messages` on native — lossy across multi-iteration chains), and seeds the system prompt from the first stored response. Future `send` calls auto-append to the same cid.
+
+---
+
+## Programmatic agent runs
+
+`AgentConfig` mirrors the CLI's TOML schema. Build one from a JS object (snake_case field names, matching the TOML) and call `client.runAgent(config, prompt, options)`:
+
+```js
+const agent = new AgentConfig({
+  system_prompt: "Respond with a single integer.",
+  tools: ["llm_time"],
+  chain_limit: 3,
+  options: { temperature: 0 },
+  budget: { max_tokens: 5000 },
+  parallel_tools: true,
+});
+
+const result = await client.runAgent(agent, "What is 2 + 2?", {
+  retries: 2,
+});
+console.log(result.text);
+console.log(result.toolCalls);
+```
+
+Precedence rules match the Python binding and the CLI: `config.model` > client default, `options.system` > `config.system_prompt`, `options.retries` > `config.retry` > client default, `config.tools` is a whitelist against the client's registered tools. Unknown tool names fail with `unknown tool in agent config: <name>`.
+
+There is no `AgentConfig.from_toml` in the browser — the DOM has no filesystem. Ship the agent spec as a JSON object instead (fetch it, bundle it, or construct it inline).
+
+---
+
 ## What's intentionally missing
 
 | Feature                          | Why                                                                            |
 |----------------------------------|--------------------------------------------------------------------------------|
 | External `llm-tool-*` subprocesses | Tools-by-`$PATH` is a CLI-only concept. JS callbacks are the substitute.       |
-| Logs / persistent conversation store | No filesystem in the browser. A JS-callback `ConversationStore` backend (IndexedDB-friendly) is scoped to Phase C. |
-| Programmatic agent runs          | `AgentConfig` + `runAgent` is scoped to Phase C.                               |
+| `AgentConfig.from_toml`          | The browser has no filesystem. Ship the config as a JSON object instead.       |
+| Cross-provider model override via `runAgent` | Clients are bound to a single provider at construction. Construct a second client if you need to switch between OpenAI and Anthropic. |
 
 If your use case starts to need any of these, you have two good options:
 

@@ -7,8 +7,12 @@ edition.workspace = true
 llm-core = { path = "../llm-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+async-trait = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ulid = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true }
