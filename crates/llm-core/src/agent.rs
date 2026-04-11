@@ -14,6 +14,10 @@ fn default_chain_limit() -> usize {
     10
 }
 
+fn default_parallel_tools() -> bool {
+    true
+}
+
 /// Configuration for an agent, loaded from a TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -52,6 +56,15 @@ pub struct AgentConfig {
     /// Retry configuration for transient HTTP errors.
     #[serde(default)]
     pub retry: Option<RetryConfig>,
+
+    /// Dispatch tool calls in parallel within a single chain iteration.
+    /// Default: true. Set to false for tools with ordering side-effects.
+    #[serde(default = "default_parallel_tools")]
+    pub parallel_tools: bool,
+
+    /// Optional cap on parallel tool dispatch. `None` = unlimited.
+    #[serde(default)]
+    pub max_parallel_tools: Option<usize>,
 }
 
 impl Default for AgentConfig {
@@ -66,6 +79,8 @@ impl Default for AgentConfig {
             memory: None,
             budget: None,
             retry: None,
+            parallel_tools: default_parallel_tools(),
+            max_parallel_tools: None,
         }
     }
 }
@@ -225,6 +240,8 @@ mod tests {
         assert!(config.memory.is_none());
         assert!(config.budget.is_none());
         assert!(config.retry.is_none());
+        assert!(config.parallel_tools);
+        assert!(config.max_parallel_tools.is_none());
     }
 
     #[test]
@@ -518,6 +535,37 @@ base_delay_ms = 500
         assert_eq!(retry.base_delay_ms, 1000);
         assert_eq!(retry.max_delay_ms, 30_000);
         assert!(retry.jitter);
+    }
+
+    // --- Parallel tool dispatch config tests ---
+
+    #[test]
+    fn agent_config_parses_parallel_tools_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("parallel.toml");
+        std::fs::write(
+            &path,
+            r#"
+parallel_tools = false
+max_parallel_tools = 3
+"#,
+        )
+        .unwrap();
+
+        let config = AgentConfig::load(&path).unwrap();
+        assert!(!config.parallel_tools);
+        assert_eq!(config.max_parallel_tools, Some(3));
+    }
+
+    #[test]
+    fn agent_config_parallel_tools_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("defaults.toml");
+        std::fs::write(&path, "model = \"gpt-4o-mini\"\n").unwrap();
+
+        let config = AgentConfig::load(&path).unwrap();
+        assert!(config.parallel_tools, "parallel_tools should default to true");
+        assert_eq!(config.max_parallel_tools, None);
     }
 
     #[test]
