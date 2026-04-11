@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 
 use crate::provider::Provider;
 use crate::stream::{Chunk, collect_text, collect_tool_calls, collect_usage};
@@ -10,6 +11,62 @@ use crate::types::{Message, Prompt, ToolCall, ToolResult, Usage};
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, call: &ToolCall) -> ToolResult;
+}
+
+/// Configuration for parallel tool dispatch within a single chain iteration.
+///
+/// When multiple tool calls are emitted in one turn, they are dispatched
+/// concurrently by default (tool work is almost entirely I/O-bound, so this
+/// collapses N serial latencies into ~1). Order of `tool_results` is preserved
+/// regardless of the dispatch strategy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParallelConfig {
+    /// If false, tool calls within a single iteration are executed sequentially.
+    pub enabled: bool,
+    /// Optional cap on the number of tool calls dispatched concurrently.
+    /// `None` = unlimited. `Some(n)` uses a bounded `buffered(n)` stream.
+    pub max_concurrent: Option<usize>,
+}
+
+impl Default for ParallelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_concurrent: None,
+        }
+    }
+}
+
+/// Dispatch a batch of tool calls, returning results in input order.
+async fn dispatch_tools(
+    executor: &dyn ToolExecutor,
+    calls: &[ToolCall],
+    parallel: &ParallelConfig,
+) -> Vec<ToolResult> {
+    // Sequential fast path: disabled or trivially single-call.
+    if !parallel.enabled || calls.len() <= 1 {
+        let mut out = Vec::with_capacity(calls.len());
+        for call in calls {
+            out.push(executor.execute(call).await);
+        }
+        return out;
+    }
+
+    // Eagerly collect the per-call futures into a Vec. This is the reliable
+    // way to pacify the borrow checker: `stream::iter(calls.iter()).map(|c|
+    // executor.execute(c)).buffered(n)` trips the elided lifetimes inside
+    // the async_trait-returned boxed future. Collecting first puts all
+    // borrows under a single lifetime tied to the enclosing `async fn`.
+    let futs: Vec<_> = calls.iter().map(|c| executor.execute(c)).collect();
+    match parallel.max_concurrent {
+        Some(n) if n > 0 => {
+            futures::stream::iter(futs)
+                .buffered(n)
+                .collect::<Vec<_>>()
+                .await
+        }
+        _ => futures::future::join_all(futs).await,
+    }
 }
 
 /// Event emitted during chain loop execution for observability.
@@ -80,6 +137,7 @@ pub async fn chain(
     on_chunk: &mut dyn FnMut(&Chunk),
     on_event: Option<&mut dyn FnMut(&ChainEvent)>,
     budget: Option<u64>,
+    parallel: ParallelConfig,
 ) -> crate::Result<ChainResult> {
     let mut all_chunks = Vec::new();
     let mut all_tool_results = Vec::new();
@@ -168,12 +226,8 @@ pub async fn chain(
             break;
         }
 
-        // Execute all tool calls
-        let mut tool_results = Vec::new();
-        for call in &tool_calls {
-            let result = executor.execute(call).await;
-            tool_results.push(result);
-        }
+        // Execute tool calls (parallel by default, order-preserving).
+        let tool_results = dispatch_tools(executor, &tool_calls, &parallel).await;
 
         all_tool_results.extend(tool_results.clone());
 
@@ -317,6 +371,7 @@ mod tests {
             &mut |_| callback_count += 1,
             None,
             None,
+            ParallelConfig::default(),
         )
         .await
         .unwrap();
@@ -346,6 +401,7 @@ mod tests {
             &mut |_| {},
             None,
             None,
+            ParallelConfig::default(),
         )
         .await
         .unwrap();
@@ -375,6 +431,7 @@ mod tests {
             &mut |_| {},
             None,
             None,
+            ParallelConfig::default(),
         )
         .await
         .unwrap();
@@ -417,6 +474,7 @@ mod tests {
             &mut |_| {},
             None,
             None,
+            ParallelConfig::default(),
         )
         .await
         .unwrap();
@@ -447,6 +505,7 @@ mod tests {
             &mut |_| {},
             None,
             None,
+            ParallelConfig::default(),
         )
         .await
         .unwrap();
@@ -475,6 +534,7 @@ mod tests {
             &mut |chunk| received_clone.lock().unwrap().push(chunk.clone()),
             None,
             None,
+            ParallelConfig::default(),
         )
         .await
         .unwrap();
@@ -498,6 +558,7 @@ mod tests {
         let _ = chain(
             &provider, "mock-model", prompt, None, false,
             &MockExecutor, 5, &mut |_| {}, None, None,
+            ParallelConfig::default(),
         ).await.unwrap();
 
         let prompts = provider.captured_prompts.lock().unwrap();
@@ -532,6 +593,7 @@ mod tests {
         let _ = chain(
             &provider, "mock-model", prompt, None, false,
             &MockExecutor, 5, &mut |_| {}, None, None,
+            ParallelConfig::default(),
         ).await.unwrap();
 
         let prompts = provider.captured_prompts.lock().unwrap();
@@ -556,6 +618,7 @@ mod tests {
         let _ = chain(
             &provider, "mock-model", prompt, None, false,
             &MockExecutor, 5, &mut |_| {}, None, None,
+            ParallelConfig::default(),
         ).await.unwrap();
 
         let prompts = provider.captured_prompts.lock().unwrap();
@@ -579,6 +642,7 @@ mod tests {
             &MockExecutor, 5, &mut |_| {},
             Some(&mut |e: &ChainEvent| events.push(e.clone())),
             None,
+            ParallelConfig::default(),
         ).await.unwrap();
 
         assert_eq!(events.len(), 2); // IterationStart + IterationEnd
@@ -624,6 +688,7 @@ mod tests {
             &MockExecutor, 5, &mut |_| {},
             Some(&mut |e: &ChainEvent| events.push(e.clone())),
             None,
+            ParallelConfig::default(),
         ).await.unwrap();
 
         // 2 iterations -> 4 events (start, end, start, end)
@@ -672,6 +737,7 @@ mod tests {
             &MockExecutor, 5, &mut |_| {},
             Some(&mut |e: &ChainEvent| events.push(e.clone())),
             None,
+            ParallelConfig::default(),
         ).await.unwrap();
 
         assert_eq!(events.len(), 6);
@@ -714,6 +780,7 @@ mod tests {
         let result = chain(
             &provider, "mock-model", prompt, None, false,
             &MockExecutor, 5, &mut |_| {}, None, None,
+            ParallelConfig::default(),
         ).await.unwrap();
 
         assert_eq!(crate::collect_text(&result.chunks), "Done!");
@@ -749,6 +816,7 @@ mod tests {
         let result = chain(
             &provider, "mock-model", prompt, None, false,
             &MockExecutor, 5, &mut |_| {}, None, None,
+            ParallelConfig::default(),
         ).await.unwrap();
 
         let usage = result.total_usage.unwrap();
@@ -768,6 +836,7 @@ mod tests {
         let result = chain(
             &provider, "mock-model", prompt, None, false,
             &MockExecutor, 5, &mut |_| {}, None, None,
+            ParallelConfig::default(),
         ).await.unwrap();
 
         let usage = result.total_usage.unwrap();
@@ -783,6 +852,7 @@ mod tests {
         let result = chain(
             &provider, "mock-model", prompt, None, false,
             &MockExecutor, 5, &mut |_| {}, None, None,
+            ParallelConfig::default(),
         ).await.unwrap();
 
         assert!(result.total_usage.is_none());
@@ -804,6 +874,7 @@ mod tests {
             &MockExecutor, 5, &mut |_| {},
             Some(&mut |e: &ChainEvent| events.push(e.clone())),
             None,
+            ParallelConfig::default(),
         ).await.unwrap();
 
         // 2 iterations -> 4 events
@@ -842,6 +913,7 @@ mod tests {
         let result = chain(
             &provider, "mock-model", prompt, None, false,
             &MockExecutor, 5, &mut |_| {}, None, Some(25),
+            ParallelConfig::default(),
         ).await.unwrap();
 
         assert!(result.budget_exhausted);
@@ -861,6 +933,7 @@ mod tests {
         let result = chain(
             &provider, "mock-model", prompt, None, false,
             &MockExecutor, 5, &mut |_| {}, None, Some(100),
+            ParallelConfig::default(),
         ).await.unwrap();
 
         assert!(!result.budget_exhausted);
@@ -880,6 +953,7 @@ mod tests {
         let result = chain(
             &provider, "mock-model", prompt, None, false,
             &MockExecutor, 5, &mut |_| {}, None, Some(40),
+            ParallelConfig::default(),
         ).await.unwrap();
 
         // iter1: 15 total (under 40), iter2: 30 total (under 40) → both allowed
@@ -904,6 +978,7 @@ mod tests {
         let result = chain(
             &provider, "mock-model", prompt, None, false,
             &MockExecutor, 5, &mut |_| {}, None, Some(25),
+            ParallelConfig::default(),
         ).await.unwrap();
 
         assert!(result.budget_exhausted);
@@ -923,6 +998,7 @@ mod tests {
         let result = chain(
             &provider, "mock-model", prompt, None, false,
             &MockExecutor, 5, &mut |_| {}, None, None,
+            ParallelConfig::default(),
         ).await.unwrap();
 
         assert!(!result.budget_exhausted);
@@ -943,6 +1019,7 @@ mod tests {
             &MockExecutor, 5, &mut |_| {},
             Some(&mut |e: &ChainEvent| events.push(e.clone())),
             Some(30),
+            ParallelConfig::default(),
         ).await.unwrap();
 
         // Should have: IterationStart, IterationEnd, BudgetExhausted

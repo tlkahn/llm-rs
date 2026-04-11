@@ -207,6 +207,7 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
                 },
                 on_event,
                 None,
+                llm_core::ParallelConfig::default(),
             )
             .await?;
             (result.chunks, result.tool_results, result.total_usage)

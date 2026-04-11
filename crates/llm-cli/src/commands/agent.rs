@@ -447,6 +447,7 @@ async fn run_agent(args: &AgentRunArgs) -> llm_core::Result<()> {
         },
         on_event,
         agent_budget,
+        llm_core::chain::ParallelConfig::default(),
     )
     .await?;
 
