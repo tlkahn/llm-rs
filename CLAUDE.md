@@ -7,12 +7,12 @@ LLM-RS: Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) (v0
 ## Commands
 
 ```bash
-cargo test --workspace           # Run all 516 tests
-cargo test -p llm-core           # Core types/traits/config/schema/chain/messages/agent/retry (192 tests)
+cargo test --workspace           # Run all 548 tests
+cargo test -p llm-core           # Core types/traits/config/schema/chain/messages/agent/retry (215 tests)
 cargo test -p llm-openai         # OpenAI provider (44 tests)
 cargo test -p llm-anthropic      # Anthropic provider (50 tests)
-cargo test -p llm-store          # JSONL storage (49 tests)
-cargo test -p llm-cli            # CLI unit (62) + integration (119) tests
+cargo test -p llm-store          # JSONL storage (55 tests)
+cargo test -p llm-cli            # CLI unit (57) + integration (127) tests
 cargo clippy --workspace         # Lint
 cargo build --release -p llm-cli # Build optimized binary
 
@@ -156,7 +156,7 @@ Phase 4 model options complete --- `-o/--option` flag on `prompt` and `chat` com
 
 Phase 4 aliases complete --- `Config.set_alias/remove_alias` methods. `llm aliases set/show/list/remove/path` subcommands for managing model aliases in `config.toml`. `resolve_model()` (already existed) resolves aliases at runtime in prompt/chat. No transitive resolution (matches simonw/llm behavior).
 
-Phase 4 (v0.4) is complete. Phase 6 (budget tracking) is complete. Phase 7 (retry/backoff) is complete. Phase 8 (dry-run mode) is complete. Phase 9 (parallel tool execution) is complete. See `doc/roadmap.md` for future work.
+Phase 4 (v0.4) is complete. Phase 6 (budget tracking) is complete. Phase 7 (retry/backoff) is complete. Phase 8 (dry-run mode) is complete. Phase 9 (parallel tool execution) is complete. Phase 10 (later-stage features in `llm-wasm` + `llm-python`) is complete. See `doc/roadmap.md` for future work.
 
 Phase 5 agent config & discovery complete --- `AgentConfig` struct with TOML parsing (`model`, `system_prompt`, `tools`, `chain_limit`, `options`, `budget` stub). `Paths.agents_dir()`. Discovery: `discover_agents()` scans global (`$XDG_CONFIG_HOME/llm/agents/`) and local (`$CWD/.llm/agents/`) directories, local shadows global. `resolve_agent()` finds agent by name. CLI: `llm agent run <name> [prompt]` resolves config, model (CLI > agent TOML > global default), tools, builds prompt with system_prompt, calls `chain()`. `llm agent list/show/init/path` management commands. Shared helpers (`find_provider`, `resolve_prompt_text`, `format_chain_event`) extracted from `prompt.rs` as `pub(crate)` and reused by `agent.rs` and `chat.rs`.
 
@@ -168,7 +168,13 @@ Phase 8 dry-run mode complete --- `--dry-run` flag on `llm agent run` resolves t
 
 Phase 9 parallel tool execution complete --- `ParallelConfig { enabled, max_concurrent }` in `llm-core/chain.rs`; `chain()` gains a trailing `parallel: ParallelConfig` parameter. `dispatch_tools()` helper runs sequentially when `enabled == false` or `calls.len() <= 1`, otherwise eagerly collects per-call futures into a `Vec` and drives them with `future::join_all` (unlimited) or `stream::iter(futs).buffered(n)` (bounded). Result order is guaranteed to match input order. `AgentConfig` adds `parallel_tools` (default `true`) and `max_parallel_tools` (`Option<usize>`) fields. `--sequential-tools` and `--max-parallel-tools` flags on `prompt`, `chat`, and `agent run`. Precedence for agent: CLI > agent TOML > default. `--tools-approve` forces sequential dispatch to avoid interleaved stdin prompts. `DryRunReport` surfaces the resolved `ParallelConfig` (used by integration tests to assert precedence without timing).
 
-Phase C persistent logs + programmatic agents (bindings) complete --- `ConversationStore` trait in `llm-store::store` with dual `Send + Sync` / `?Send` cfg blocks mirroring `ToolExecutor`; `LogStore` implements it natively. `llm-store` gains a wasm32-buildable surface (`records`, `store`, `ConversationSummary`) with `logs`/`query` + `ulid`/`chrono` cfg-gated off wasm32. `build_response` free fn for synthesizing a `Response` with ULID id + RFC 3339 datetime (native-only). `llm-core::agent` gains pure resolution helpers (`resolve_agent_model`/`system`/`retry`/`tools`/`budget`) shared by both bindings, with the CLI's byte-identical `unknown tool in agent config: {name}` error asserted by unit tests. `llm-python` adds `LogStore` pyclass, wires `LlmClient.prompt()` / `Conversation.send()` auto-logging, `Conversation.load`/`persist_to`, `AgentConfig`/`AgentConfig.from_toml(path)`, and `LlmClient.run_agent(config, prompt, *, system=None, retries=None)`. `llm-python` gains a `rlib` crate type and an `extension-module` feature (default on) so pure-Rust helper tests compile without libpython (`--no-default-features`). `llm-wasm` adds `JsConversationStore` backed by four JS `Function` callbacks (each may return a Promise), `LlmClient.setConversationStore(spec)`, auto-logging in `prompt`/`chain`/`Conversation.send`, `Conversation.load(client, cid)`, `AgentConfig` class, and `LlmClient.runAgent(config, text, options)`. WASM Response construction uses a parallel `build_response_wasm` that pulls a ULID-ish id via `crypto.randomUUID` and the datetime via `js_sys::Date`, so `llm-store` stays free of `js-sys` deps.
+Phase 10 wrap later-stage features into `llm-wasm` + `llm-python` complete (v0.10) --- delivered in three sub-phases.
+
+**Phase A (tools, multi-turn, structured output, built-ins).** Both bindings expose tool calling, multi-turn `Conversation`, structured output with the `parse_schema_dsl`/`multi_schema` helpers, and the built-in `llm_version` / `llm_time` tools.
+
+**Phase B (chain loop, retry, budget).** Both bindings expose a `chain()` wrapper that surfaces per-iteration events, a `RetryProvider` decorator backing the `retries` option, token budgets, and `budget_exhausted` on `ChainResult`.
+
+**Phase C (persistent logs + programmatic agents).** `ConversationStore` trait in `llm-store::store` with dual `Send + Sync` / `?Send` cfg blocks mirroring `ToolExecutor`; `LogStore` implements it natively. `llm-store` gains a wasm32-buildable surface (`records`, `store`, `ConversationSummary`) with `logs`/`query` + `ulid`/`chrono` cfg-gated off wasm32. `build_response` free fn for synthesizing a `Response` with ULID id + RFC 3339 datetime (native-only). `llm-core::agent` gains pure resolution helpers (`resolve_agent_model`/`system`/`retry`/`tools`/`budget`) shared by both bindings, with the CLI's byte-identical `unknown tool in agent config: {name}` error asserted by unit tests. `llm-python` adds `LogStore` pyclass, wires `LlmClient.prompt()` / `Conversation.send()` auto-logging, `Conversation.load`/`persist_to`, `AgentConfig`/`AgentConfig.from_toml(path)`, and `LlmClient.run_agent(config, prompt, *, system=None, retries=None)`. `llm-python` gains a `rlib` crate type and an `extension-module` feature (default on) so pure-Rust helper tests compile without libpython (`--no-default-features`). `llm-wasm` adds `JsConversationStore` backed by four JS `Function` callbacks (each may return a Promise), `LlmClient.setConversationStore(spec)`, auto-logging in `prompt`/`chain`/`Conversation.send`, `Conversation.load(client, cid)`, `AgentConfig` class, and `LlmClient.runAgent(config, text, options)`. WASM Response construction uses a parallel `build_response_wasm` that pulls a ULID-ish id via `crypto.randomUUID` and the datetime via `js_sys::Date`, so `llm-store` stays free of `js-sys` deps.
 
 ## Conventions
 
