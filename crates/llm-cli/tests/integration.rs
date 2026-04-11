@@ -3003,3 +3003,153 @@ async fn no_retry_on_401() {
         .failure()
         .stderr(predicate::str::contains("HTTP error 401"));
 }
+
+// ==========================================================================
+// Phase 9: Parallel tool execution — CLI plumbing via dry-run JSON
+// ==========================================================================
+
+fn dry_run_json(cmd: &mut Command) -> serde_json::Value {
+    let output = cmd
+        .env_remove("OPENAI_API_KEY")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    serde_json::from_str(&stdout).unwrap()
+}
+
+#[test]
+fn agent_run_parallel_defaults_are_parallel() {
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(&dir, "greeter", "model = \"gpt-4o-mini\"\n");
+
+    let parsed = dry_run_json(llm_with_dir(&dir).args([
+        "agent", "run", "greeter", "--dry-run", "--json", "hi",
+    ]));
+    assert_eq!(parsed["parallel"]["enabled"], true);
+    assert!(parsed["parallel"]["max_concurrent"].is_null());
+}
+
+#[test]
+fn agent_run_parallel_tools_toml_disables() {
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(
+        &dir,
+        "serial",
+        "model = \"gpt-4o-mini\"\nparallel_tools = false\nmax_parallel_tools = 2\n",
+    );
+
+    let parsed = dry_run_json(llm_with_dir(&dir).args([
+        "agent", "run", "serial", "--dry-run", "--json", "hi",
+    ]));
+    assert_eq!(parsed["parallel"]["enabled"], false);
+    assert_eq!(parsed["parallel"]["max_concurrent"], 2);
+}
+
+#[test]
+fn agent_run_parallel_tools_cli_overrides_toml() {
+    let dir = TempDir::new().unwrap();
+    // TOML says parallel=true; --sequential-tools should flip it.
+    write_dry_run_agent(
+        &dir,
+        "greeter",
+        "model = \"gpt-4o-mini\"\nparallel_tools = true\n",
+    );
+
+    let parsed = dry_run_json(llm_with_dir(&dir).args([
+        "agent",
+        "run",
+        "greeter",
+        "--dry-run",
+        "--json",
+        "--sequential-tools",
+        "hi",
+    ]));
+    assert_eq!(parsed["parallel"]["enabled"], false);
+}
+
+#[test]
+fn agent_run_max_parallel_tools_cli_overrides_toml() {
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(
+        &dir,
+        "greeter",
+        "model = \"gpt-4o-mini\"\nmax_parallel_tools = 2\n",
+    );
+
+    let parsed = dry_run_json(llm_with_dir(&dir).args([
+        "agent",
+        "run",
+        "greeter",
+        "--dry-run",
+        "--json",
+        "--max-parallel-tools",
+        "8",
+        "hi",
+    ]));
+    assert_eq!(parsed["parallel"]["max_concurrent"], 8);
+}
+
+#[test]
+fn agent_run_tools_approve_forces_sequential_even_with_max_parallel() {
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(&dir, "greeter", "model = \"gpt-4o-mini\"\n");
+
+    let parsed = dry_run_json(llm_with_dir(&dir).args([
+        "agent",
+        "run",
+        "greeter",
+        "--dry-run",
+        "--json",
+        "--tools-approve",
+        "--max-parallel-tools",
+        "8",
+        "hi",
+    ]));
+    assert_eq!(
+        parsed["parallel"]["enabled"], false,
+        "--tools-approve must force sequential dispatch"
+    );
+}
+
+#[test]
+fn prompt_sequential_tools_flag_parses() {
+    // Flag should be accepted by clap and appear in --help.
+    llm()
+        .args(["prompt", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--sequential-tools"))
+        .stdout(predicate::str::contains("--max-parallel-tools"));
+}
+
+#[test]
+fn chat_sequential_tools_flag_parses() {
+    llm()
+        .args(["chat", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--sequential-tools"))
+        .stdout(predicate::str::contains("--max-parallel-tools"));
+}
+
+#[test]
+fn agent_run_plain_dry_run_shows_parallel_config() {
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(
+        &dir,
+        "serial",
+        "model = \"gpt-4o-mini\"\nparallel_tools = false\nmax_parallel_tools = 4\n",
+    );
+
+    llm_with_dir(&dir)
+        .args(["agent", "run", "serial", "--dry-run", "hi"])
+        .env_remove("OPENAI_API_KEY")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Parallel:    enabled=false, max_concurrent=4",
+        ));
+}

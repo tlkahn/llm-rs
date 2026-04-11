@@ -90,6 +90,14 @@ pub struct AgentRunArgs {
     /// Resolve agent config and print what would be sent, without making an LLM call.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Force sequential tool dispatch (overrides agent TOML `parallel_tools`).
+    #[arg(long)]
+    pub sequential_tools: bool,
+
+    /// Cap parallel tool dispatch concurrency (overrides agent TOML `max_parallel_tools`).
+    #[arg(long)]
+    pub max_parallel_tools: Option<usize>,
 }
 
 #[derive(Args)]
@@ -355,6 +363,23 @@ async fn run_agent(args: &AgentRunArgs) -> llm_core::Result<()> {
 
     let chain_limit = args.chain_limit.unwrap_or(agent_config.chain_limit);
 
+    // Resolve parallel tool dispatch config: CLI > agent TOML > default.
+    // --tools-approve always forces sequential to avoid interleaved stdin prompts.
+    let parallel_config = {
+        let enabled = if args.tools_approve || args.sequential_tools {
+            false
+        } else {
+            agent_config.parallel_tools
+        };
+        let max_concurrent = args
+            .max_parallel_tools
+            .or(agent_config.max_parallel_tools);
+        llm_core::ParallelConfig {
+            enabled,
+            max_concurrent,
+        }
+    };
+
     // Dry-run: print resolved config and return without calling the provider.
     if args.dry_run {
         let prompt_json = if args.verbose > 0 {
@@ -378,6 +403,7 @@ async fn run_agent(args: &AgentRunArgs) -> llm_core::Result<()> {
             chain_limit,
             budget: agent_config.budget.as_ref().and_then(|b| b.max_tokens),
             retry: agent_config.retry.clone(),
+            parallel: parallel_config.clone(),
             logging_enabled: !args.no_log && config.logging,
             prompt: prompt_json,
         };
@@ -447,7 +473,7 @@ async fn run_agent(args: &AgentRunArgs) -> llm_core::Result<()> {
         },
         on_event,
         agent_budget,
-        llm_core::chain::ParallelConfig::default(),
+        parallel_config.clone(),
     )
     .await?;
 

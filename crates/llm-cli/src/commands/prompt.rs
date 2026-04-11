@@ -93,6 +93,14 @@ pub struct PromptArgs {
     /// Maximum number of retries for transient HTTP errors (429, 5xx)
     #[arg(long)]
     pub retries: Option<u32>,
+
+    /// Force sequential tool dispatch (default: parallel within a turn).
+    #[arg(long)]
+    pub sequential_tools: bool,
+
+    /// Cap parallel tool dispatch concurrency. `None` = unlimited.
+    #[arg(long)]
+    pub max_parallel_tools: Option<usize>,
 }
 
 pub async fn run(args: &PromptArgs) -> llm_core::Result<()> {
@@ -251,6 +259,12 @@ pub async fn run(args: &PromptArgs) -> llm_core::Result<()> {
     let start = std::time::Instant::now();
     let json_output = args.json;
 
+    // Resolve parallel tool dispatch config. --tools-approve forces sequential.
+    let parallel_config = llm_core::ParallelConfig {
+        enabled: !(args.tools_approve || args.sequential_tools),
+        max_concurrent: args.max_parallel_tools,
+    };
+
     let (chunks, chain_tool_results, chain_total_usage) = if !args.tool.is_empty() {
         // Tool chain mode — verbose > 0 implies tools-debug
         let debug = args.tools_debug || args.verbose > 0;
@@ -290,7 +304,7 @@ pub async fn run(args: &PromptArgs) -> llm_core::Result<()> {
             },
             on_event,
             None,
-            llm_core::ParallelConfig::default(),
+            parallel_config.clone(),
         )
         .await?;
         (result.chunks, result.tool_results, result.total_usage)

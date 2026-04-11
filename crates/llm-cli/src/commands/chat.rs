@@ -42,6 +42,14 @@ pub struct ChatArgs {
     /// Maximum number of retries for transient HTTP errors (429, 5xx)
     #[arg(long)]
     pub retries: Option<u32>,
+
+    /// Force sequential tool dispatch (default: parallel within a turn).
+    #[arg(long)]
+    pub sequential_tools: bool,
+
+    /// Cap parallel tool dispatch concurrency. `None` = unlimited.
+    #[arg(long)]
+    pub max_parallel_tools: Option<usize>,
 }
 
 pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
@@ -123,6 +131,12 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
             Some(ext) => e.with_external(ext),
             None => e,
         }
+    };
+
+    // Resolve parallel tool dispatch config for this chat session.
+    let parallel_config = llm_core::ParallelConfig {
+        enabled: !args.sequential_tools,
+        max_concurrent: args.max_parallel_tools,
     };
 
     eprintln!("Chatting with {model_id} (Ctrl-D to exit)");
@@ -207,7 +221,7 @@ pub async fn run(args: &ChatArgs) -> llm_core::Result<()> {
                 },
                 on_event,
                 None,
-                llm_core::ParallelConfig::default(),
+                parallel_config.clone(),
             )
             .await?;
             (result.chunks, result.tool_results, result.total_usage)

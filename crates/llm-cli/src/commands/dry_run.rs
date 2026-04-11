@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use llm_core::RetryConfig;
+use llm_core::{ParallelConfig, RetryConfig};
 use serde::Serialize;
 
 /// Source of the resolved model identifier.
@@ -66,6 +66,7 @@ pub struct DryRunReport {
     pub budget: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryConfig>,
+    pub parallel: ParallelConfig,
     pub logging_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<serde_json::Value>,
@@ -111,6 +112,15 @@ impl DryRunReport {
                 retry.max_retries, retry.base_delay_ms, retry.max_delay_ms, retry.jitter
             );
         }
+        let cap_str = match self.parallel.max_concurrent {
+            Some(n) => n.to_string(),
+            None => "unlimited".into(),
+        };
+        let _ = writeln!(
+            out,
+            "Parallel:    enabled={}, max_concurrent={cap_str}",
+            self.parallel.enabled,
+        );
         let _ = writeln!(
             out,
             "Logging:     {}",
@@ -164,6 +174,7 @@ mod tests {
             chain_limit: 10,
             budget: Some(5000),
             retry: Some(RetryConfig::default()),
+            parallel: ParallelConfig::default(),
             logging_enabled: true,
             prompt: None,
         }
@@ -183,6 +194,7 @@ mod tests {
             chain_limit: 5,
             budget: None,
             retry: None,
+            parallel: ParallelConfig::default(),
             logging_enabled: false,
             prompt: None,
         }
