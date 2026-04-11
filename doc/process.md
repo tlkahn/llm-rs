@@ -90,9 +90,17 @@ Order within each tier matters --- first item = highest priority within that tie
 
 ### 3a. Tag the version
 
+Bump the in-tree version strings to match the tag, then commit and tag:
+
 ```bash
-git tag vN.x <commit>
+./scripts/bump-version.sh v0.10
+# script self-verifies; aborts non-zero if any string didn't take
+git add Cargo.toml crates/llm-wasm/Cargo.toml crates/llm-python/Cargo.toml crates/llm-python/pyproject.toml
+git commit -m "Bump version to 0.10.0"
+git tag v0.10
 ```
+
+The bump matters most for `crates/llm-python/pyproject.toml` — uv keys its wheel cache on the version string, so a stale `0.1.0` will silently shadow a fresh `maturin develop` build (see commit `aed7d71`). The 5 in-workspace crates inherit `version` from `[workspace.package]` in the root `Cargo.toml` and need no per-bump edits.
 
 ### 3b. Hygiene checklist
 
