@@ -1208,4 +1208,87 @@ mod tests {
             "expected peak concurrency == cap, peak saturation"
         );
     }
+
+    #[tokio::test]
+    async fn chain_sequential_when_disabled() {
+        let provider = MockProvider::new(vec![
+            multi_tool_call_response(5),
+            text_response("Done!"),
+        ]);
+        let prompt = Prompt::new("Go").with_tools(vec![make_tool()]);
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let executor = ConcurrencyProbe {
+            live: live.clone(),
+            peak: peak.clone(),
+            sleep_ms: 20,
+        };
+
+        let _ = chain(
+            &provider,
+            "mock-model",
+            prompt,
+            None,
+            false,
+            &executor,
+            5,
+            &mut |_| {},
+            None,
+            None,
+            ParallelConfig {
+                enabled: false,
+                max_concurrent: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "expected peak == 1 when parallel dispatch is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_single_call_is_sequential() {
+        // One tool call: the single-call fast path should kick in and peak == 1.
+        let provider = MockProvider::new(vec![
+            tool_call_response("test_tool", "tc_0", "{}"),
+            text_response("Done!"),
+        ]);
+        let prompt = Prompt::new("Go").with_tools(vec![make_tool()]);
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let executor = ConcurrencyProbe {
+            live: live.clone(),
+            peak: peak.clone(),
+            sleep_ms: 20,
+        };
+
+        let _ = chain(
+            &provider,
+            "mock-model",
+            prompt,
+            None,
+            false,
+            &executor,
+            5,
+            &mut |_| {},
+            None,
+            None,
+            ParallelConfig {
+                enabled: true,
+                max_concurrent: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "expected peak == 1 on single-call fast path"
+        );
+    }
 }
