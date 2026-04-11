@@ -1138,4 +1138,74 @@ mod tests {
             "parallel dispatch took {elapsed:?}, expected << {sequential_sum_ms}ms"
         );
     }
+
+    /// Executor that tracks the maximum number of concurrent `execute()`
+    /// calls in flight. Used to verify that `max_concurrent` caps actual
+    /// parallelism.
+    struct ConcurrencyProbe {
+        live: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        sleep_ms: u64,
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    impl ToolExecutor for ConcurrencyProbe {
+        async fn execute(&self, call: &ToolCall) -> ToolResult {
+            let live_now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(live_now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(self.sleep_ms)).await;
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            ToolResult {
+                name: call.name.clone(),
+                output: "ok".into(),
+                tool_call_id: call.tool_call_id.clone(),
+                error: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_parallel_bounded_concurrency() {
+        const N: usize = 5;
+        const CAP: usize = 2;
+
+        let provider = MockProvider::new(vec![
+            multi_tool_call_response(N),
+            text_response("Done!"),
+        ]);
+        let prompt = Prompt::new("Go").with_tools(vec![make_tool()]);
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let executor = ConcurrencyProbe {
+            live: live.clone(),
+            peak: peak.clone(),
+            sleep_ms: 50,
+        };
+
+        let _ = chain(
+            &provider,
+            "mock-model",
+            prompt,
+            None,
+            false,
+            &executor,
+            5,
+            &mut |_| {},
+            None,
+            None,
+            ParallelConfig {
+                enabled: true,
+                max_concurrent: Some(CAP),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            CAP,
+            "expected peak concurrency == cap, peak saturation"
+        );
+    }
 }
