@@ -38,7 +38,7 @@ llm "What time is it?" -T llm_time
 # Multiple tools
 llm "What version are you and what time is it?" -T llm_version -T llm_time
 
-# Limit chain iterations (default: 5)
+# Limit chain iterations (default: 5 for prompt/chat, 10 for agents)
 llm "Do something" -T llm_version --chain-limit 3
 
 # Debug mode: show tool calls/results on stderr
@@ -175,6 +175,114 @@ llm chat -T llm_time -T llm_version
 
 # Chat with verbose tool chain output
 llm chat -T llm_time -v
+```
+
+### Parallel tool execution
+
+When the model requests multiple tool calls in a single turn, llm-rs dispatches them concurrently by default. Results are returned in the same order the model asked for them.
+
+```bash
+# Default: parallel dispatch, unlimited concurrency within a single iteration
+llm "Check version and time" -T llm_version -T llm_time
+
+# Cap concurrency
+llm "Run N tools" -T tool_a -T tool_b --max-parallel-tools 2
+
+# Force sequential dispatch (e.g. to inspect tools one at a time)
+llm "Run N tools" -T tool_a -T tool_b --sequential-tools
+```
+
+`--tools-approve` forces sequential dispatch automatically so approval prompts don't interleave on stdin. Flags apply to `prompt`, `chat`, and `agent run`. Agents can set `parallel_tools` / `max_parallel_tools` in TOML; CLI flags override.
+
+### Agents
+
+Agents are TOML files that bundle a system prompt, model, tools, chain limit, options, budget, retry, and parallel-tool config. Global agents live in `~/.config/llm/agents/`; project-local agents in `./.llm/agents/` (local shadows global).
+
+```bash
+llm agent init researcher              # Scaffold a local agent template
+llm agent init planner --global        # Scaffold a global agent
+llm agent list                         # List discovered agents (name, model, source)
+llm agent show researcher              # Print resolved agent config
+llm agent path                         # Print global and local agent directory paths
+
+# Run an agent
+llm agent run researcher "summarize recent changes"
+echo "some input" | llm agent run researcher
+
+# CLI flags override agent TOML
+llm agent run researcher "hi" -m claude-sonnet-4-6 --chain-limit 3 -v
+
+# Dry-run: resolve model, provider, tools, options, budget, retry, and parallel config without calling the LLM
+llm agent run researcher "hi" --dry-run
+llm agent run researcher "hi" --dry-run --json
+llm agent run researcher "hi" --dry-run -vv   # also includes the serialized Prompt payload
+```
+
+Example `~/.config/llm/agents/researcher.toml`:
+
+```toml
+model = "claude-sonnet-4-6"
+system_prompt = "You are a careful research assistant."
+tools = ["llm_time", "llm_version"]
+chain_limit = 10
+parallel_tools = true
+max_parallel_tools = 4
+
+[options]
+temperature = 0.2
+
+[budget]
+max_tokens = 50000
+
+[retry]
+max_retries = 3
+base_delay_ms = 1000
+```
+
+### Budget tracking
+
+Token usage accumulates across chain iterations. Pass `-u` to print cumulative totals; set `[budget] max_tokens` in an agent file to stop the chain when the total exceeds the cap. The chain finishes the current turn, emits a `[budget]` warning, and returns the partial result.
+
+```bash
+# Show cumulative usage across all chain iterations
+llm "Plan a trip" -T llm_time -u
+
+# llm chat prints a session-wide usage summary on exit
+llm chat -u
+```
+
+### Retry and backoff
+
+Transient HTTP errors (429, 5xx) are retried with exponential backoff and jitter before any response bytes are streamed. Configure per-invocation with `--retries` or per-agent via `[retry]`.
+
+```bash
+llm "Hello" --retries 5
+llm chat --retries 3
+llm agent run researcher "hi" --retries 5   # overrides agent TOML
+```
+
+### Options and aliases
+
+Set persistent per-model options and model-name aliases in `config.toml`. CLI `-o` flags override config defaults per invocation.
+
+```bash
+# Options
+llm options set gpt-4o temperature 0.7
+llm options set gpt-4o max_tokens 1000
+llm options get gpt-4o
+llm options list
+llm options clear gpt-4o temperature
+
+# Aliases
+llm aliases set fast gpt-4o-mini
+llm aliases set claude claude-sonnet-4-6
+llm aliases list
+llm aliases show fast
+llm aliases remove fast
+llm aliases path
+
+llm "Hello" -m claude                       # Uses the alias
+llm "Hello" -o temperature 0.9              # Overrides config default
 ```
 
 ### Structured output
@@ -459,32 +567,34 @@ See [`doc/design/architecture.md`](doc/design/architecture.md) for design ration
 ## Testing
 
 ```bash
-cargo test --workspace    # 369 tests (core workspace crates)
+cargo test --workspace    # 530 tests across core workspace crates
 ```
 
 | Crate | Tests | What's covered |
 |-------|------:|----------------|
-| `llm-core` | 123 | Types, config, keys, streams, schema DSL, chain loop, ChainEvent, messages (mock provider) |
-| `llm-openai` | 42 | HTTP mocking (wiremock), SSE parsing, tool calls, structured output, multi-turn |
-| `llm-anthropic` | 48 | HTTP mocking (wiremock), typed SSE, tool_use blocks, transparent schema wrapping, multi-turn |
+| `llm-core` | 198 | Types, config, keys, streams, schema DSL, chain loop, ChainEvent, ParallelConfig dispatch, messages, agent config, retry, budget (mock provider) |
+| `llm-openai` | 44 | HTTP mocking (wiremock), SSE parsing, tool calls, structured output, multi-turn, HttpError mapping |
+| `llm-anthropic` | 50 | HTTP mocking (wiremock), typed SSE, tool_use blocks, transparent schema wrapping, multi-turn, HttpError mapping |
 | `llm-store` | 49 | JSONL round-trips, unicode, malformed recovery, listing/queries, message reconstruction |
-| `llm-cli` | 107 | Subprocess protocol/discovery/execution (45 unit), CLI integration (62 e2e with assert_cmd) |
+| `llm-cli` | 189 | Subprocess protocol/discovery/execution, retry wrapper, dry-run rendering (62 unit), CLI integration (127 e2e with assert_cmd) |
 
 Library targets are verified by their build toolchains: `wasm-pack build` for WASM, `maturin develop` for Python.
 
 ## Status
 
-Phase 1 (v0.1) complete --- CLI, WASM library, and Python module working with both OpenAI and Anthropic providers.
+Current version: **v0.9**. Phases 1–9 complete. See [`doc/roadmap.md`](doc/roadmap.md) for the full status table and remaining work.
 
-Phase 2 complete --- tool calling, chain loop, built-in tools, structured output (both providers), schema DSL, CLI commands for tools and schemas.
+- **v0.1** --- CLI, WASM library, Python module; OpenAI + Anthropic providers end-to-end.
+- **v0.2** --- Tool calling, chain loop, built-in tools, structured output, schema DSL.
+- **v0.3** --- Multi-turn conversations, `-c`/`--cid`, `llm chat` REPL, full `llm logs`.
+- **v0.4** --- Subprocess extensibility (`llm-tool-*`, `llm-provider-*`), `llm plugins`, `-v/--verbose`, `-o/--option`, aliases.
+- **v0.5** --- Agent config & discovery (`llm agent run/list/show/init/path`).
+- **v0.6** --- Budget tracking with cumulative usage and per-chain enforcement.
+- **v0.7** --- Retry/backoff with exponential delay and jitter for transient HTTP errors.
+- **v0.8** --- `--dry-run` for `llm agent run` (plain or `--json`).
+- **v0.9** --- Parallel tool execution within a chain iteration, order-preserving, opt-out with `--sequential-tools`.
 
-Phase 3 complete --- multi-turn conversations with full history accumulation, conversation continuation (`-c`/`--cid`), `--messages`/`--json` flags, interactive `llm chat` REPL, expanded `llm logs` (path/status/on/off, model filter, text search, usage).
-
-Phase 4 core complete --- subprocess extensibility via `llm-tool-*` and `llm-provider-*` protocols. PATH-based discovery, JSON stdin/stdout invocation, streaming JSONL for providers, composite tool executor (builtin + external), `llm plugins list`, async provider registry.
-
-Phase 4 verbose observability complete --- `-v`/`--verbose` flag on `prompt` and `chat` with two levels (`-v` summary, `-vv` full message dump). `ChainEvent` callback system in the core chain loop. Per-iteration usage tracking. `--verbose` implies `--tools-debug`.
-
-Next: Phase 4 continued (Ollama provider, aliases, options, attachments, config resolution tracing).
+Next up: sub-agent delegation, memory system, Ollama provider, attachments, extract flags. See the Future Work section of the roadmap.
 
 ## License
 
