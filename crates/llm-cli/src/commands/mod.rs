@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod aliases;
 pub mod chat;
+pub mod dry_run;
 pub mod keys;
 pub mod logs;
 pub mod models;

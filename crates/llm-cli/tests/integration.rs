@@ -2543,6 +2543,238 @@ fn agent_run_unknown_tool() {
 }
 
 // ==========================================================================
+// Phase 8: --dry-run on `llm agent run`
+// ==========================================================================
+
+fn write_dry_run_agent(dir: &TempDir, name: &str, body: &str) {
+    let agents_dir = dir.path().join("agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+    fs::write(agents_dir.join(format!("{name}.toml")), body).unwrap();
+}
+
+#[test]
+fn agent_run_dry_run_prints_resolved_config() {
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(
+        &dir,
+        "researcher",
+        "model = \"gpt-4o-mini\"\n\
+         system_prompt = \"You are helpful.\"\n\
+         tools = [\"llm_version\"]\n\
+         chain_limit = 7\n\
+         \n\
+         [options]\n\
+         temperature = 0.7\n",
+    );
+
+    llm_with_dir(&dir)
+        .args(["agent", "run", "researcher", "--dry-run", "hello world"])
+        .env_remove("OPENAI_API_KEY")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Agent:       researcher"))
+        .stdout(predicate::str::contains("Model:       gpt-4o-mini"))
+        .stdout(predicate::str::contains("source: agent"))
+        .stdout(predicate::str::contains("Provider:    openai"))
+        .stdout(predicate::str::contains("System:      You are helpful."))
+        .stdout(predicate::str::contains("Prompt:      hello world"))
+        .stdout(predicate::str::contains("llm_version (builtin)"))
+        .stdout(predicate::str::contains("temperature: 0.7"))
+        .stdout(predicate::str::contains("Chain limit: 7"));
+}
+
+#[test]
+fn agent_run_dry_run_succeeds_without_api_key() {
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(&dir, "greeter", "model = \"gpt-4o-mini\"\n");
+
+    llm_with_dir(&dir)
+        .args(["agent", "run", "greeter", "--dry-run", "Hi"])
+        .env_remove("OPENAI_API_KEY")
+        .assert()
+        .success();
+}
+
+#[test]
+fn agent_run_dry_run_model_source_cli() {
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(&dir, "greeter", "model = \"gpt-4o-mini\"\n");
+
+    llm_with_dir(&dir)
+        .args([
+            "agent", "run", "greeter", "--dry-run", "-m", "gpt-4o", "Hi",
+        ])
+        .env_remove("OPENAI_API_KEY")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Model:       gpt-4o"))
+        .stdout(predicate::str::contains("source: cli"));
+}
+
+#[test]
+fn agent_run_dry_run_json_envelope() {
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(
+        &dir,
+        "researcher",
+        "model = \"gpt-4o-mini\"\ntools = [\"llm_version\"]\n",
+    );
+
+    let output = llm_with_dir(&dir)
+        .args(["agent", "run", "researcher", "--dry-run", "--json", "hi"])
+        .env_remove("OPENAI_API_KEY")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(parsed["agent_name"], "researcher");
+    assert_eq!(parsed["model"], "gpt-4o-mini");
+    assert_eq!(parsed["provider"], "openai");
+    assert_eq!(parsed["prompt_text"], "hi");
+    assert_eq!(parsed["tools"][0]["name"], "llm_version");
+    assert_eq!(parsed["tools"][0]["source"], "builtin");
+    assert!(parsed.get("system_prompt").is_none());
+    assert!(parsed.get("prompt").is_none());
+}
+
+#[test]
+fn agent_run_dry_run_verbose_includes_prompt_json() {
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(
+        &dir,
+        "greeter",
+        "model = \"gpt-4o-mini\"\nsystem_prompt = \"sys\"\n",
+    );
+
+    llm_with_dir(&dir)
+        .args(["agent", "run", "greeter", "--dry-run", "-v", "hello"])
+        .env_remove("OPENAI_API_KEY")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Prompt (full JSON):"))
+        .stdout(predicate::str::contains("\"system\""))
+        .stdout(predicate::str::contains("\"text\""));
+}
+
+#[test]
+fn agent_run_dry_run_verbose_vv_also_dumps_prompt_json() {
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(&dir, "greeter", "model = \"gpt-4o-mini\"\n");
+
+    llm_with_dir(&dir)
+        .args(["agent", "run", "greeter", "--dry-run", "-vv", "hello"])
+        .env_remove("OPENAI_API_KEY")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Prompt (full JSON):"));
+}
+
+#[test]
+fn agent_run_dry_run_json_verbose_includes_prompt_field() {
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(&dir, "greeter", "model = \"gpt-4o-mini\"\n");
+
+    let output = llm_with_dir(&dir)
+        .args(["agent", "run", "greeter", "--dry-run", "--json", "-v", "hi"])
+        .env_remove("OPENAI_API_KEY")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(parsed.get("prompt").is_some(), "expected prompt field");
+    assert_eq!(parsed["prompt"]["text"], "hi");
+}
+
+#[test]
+fn agent_run_dry_run_unknown_agent() {
+    let dir = TempDir::new().unwrap();
+    llm_with_dir(&dir)
+        .args(["agent", "run", "nonexistent", "--dry-run", "hi"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("agent not found"));
+}
+
+#[test]
+fn agent_run_dry_run_unknown_tool() {
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(
+        &dir,
+        "bad",
+        "model = \"gpt-4o-mini\"\ntools = [\"nonexistent_tool_xyz\"]\n",
+    );
+
+    llm_with_dir(&dir)
+        .args(["agent", "run", "bad", "--dry-run", "hi"])
+        .env_remove("OPENAI_API_KEY")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unknown tool"));
+}
+
+#[test]
+fn agent_run_dry_run_unknown_model() {
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(&dir, "bogus", "model = \"not-a-real-model-xyz\"\n");
+
+    llm_with_dir(&dir)
+        .args(["agent", "run", "bogus", "--dry-run", "hi"])
+        .env_remove("OPENAI_API_KEY")
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn agent_run_dry_run_does_not_log() {
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(&dir, "greeter", "model = \"gpt-4o-mini\"\n");
+
+    llm_with_dir(&dir)
+        .args(["agent", "run", "greeter", "--dry-run", "hi"])
+        .env_remove("OPENAI_API_KEY")
+        .assert()
+        .success();
+
+    let logs_dir = dir.path().join("logs");
+    if logs_dir.exists() {
+        let entries: Vec<_> = fs::read_dir(&logs_dir).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "dry-run must not write any log files, found {entries:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn agent_run_dry_run_does_not_call_provider() {
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+    write_dry_run_agent(&dir, "greeter", "model = \"gpt-4o-mini\"\n");
+
+    // Mount no mocks. If any HTTP request happens, wiremock will log
+    // an unmatched request and the test harness will observe it.
+    llm_with_dir(&dir)
+        .args(["agent", "run", "greeter", "--dry-run", "hi"])
+        .env("OPENAI_BASE_URL", server.uri())
+        .env_remove("OPENAI_API_KEY")
+        .assert()
+        .success();
+
+    let received = server.received_requests().await.unwrap();
+    assert!(
+        received.is_empty(),
+        "dry-run must not make any HTTP calls, got {} request(s)",
+        received.len()
+    );
+}
+
+// ==========================================================================
 // Phase 6: Budget tracking
 // ==========================================================================
 

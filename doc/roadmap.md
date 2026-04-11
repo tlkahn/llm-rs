@@ -29,6 +29,7 @@ Unix-philosophy agentic CLI for LLMs, inspired by [simonw/llm](https://github.co
 | 5 --- Agent Config & Discovery | v0.5 | Complete | Agent TOML config, directory discovery (local shadows global), `llm agent run/list/show/init/path` |
 | 6 --- Budget Tracking | v0.6 | Complete | `Usage::add()`/`total()`, cumulative chain usage, budget enforcement, `-u` totals, chat session usage |
 | 7 --- Retry/Backoff | v0.7 | Complete | `HttpError` variant, `RetryConfig`, `RetryProvider` wrapper, `--retries` flag on prompt/chat/agent |
+| 8 --- Dry-Run Mode | v0.8 | Complete | `--dry-run` on `llm agent run` resolves agent config and prints (plain or `--json`) without LLM call; `-v`/`-vv` dumps full `Prompt` JSON |
 
 ---
 
@@ -37,7 +38,6 @@ Unix-philosophy agentic CLI for LLMs, inspired by [simonw/llm](https://github.co
 ### Axe: Agent Features (prioritized, see [readiness assessment](research/axe-readiness-assessment.md))
 
 **Tier 2** — zero or newly-resolved deps:
-- Dry-run mode --- `--dry-run` resolves agent config and prints without LLM call
 - Parallel tool execution --- `JoinSet` in `chain()` tool dispatch
 
 **Tier 3** — higher complexity:

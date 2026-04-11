@@ -7,12 +7,12 @@ LLM-RS: Rust reimplementation of [simonw/llm](https://github.com/simonw/llm) (v0
 ## Commands
 
 ```bash
-cargo test --workspace           # Run all 497 tests
+cargo test --workspace           # Run all 516 tests
 cargo test -p llm-core           # Core types/traits/config/schema/chain/messages/agent/retry (192 tests)
 cargo test -p llm-openai         # OpenAI provider (44 tests)
 cargo test -p llm-anthropic      # Anthropic provider (50 tests)
 cargo test -p llm-store          # JSONL storage (49 tests)
-cargo test -p llm-cli            # CLI unit (55) + integration (107) tests
+cargo test -p llm-cli            # CLI unit (62) + integration (119) tests
 cargo clippy --workspace         # Lint
 cargo build --release -p llm-cli # Build optimized binary
 
@@ -109,7 +109,7 @@ Binary name: `llm`. Built with `clap` derive macros.
 - `llm options set/get/list/clear` --- manage per-model options in config.toml
 - `llm aliases set/show/list/remove/path` --- manage model aliases in config.toml
 - `llm plugins list` --- show compiled providers, external providers, and external tools
-- `llm agent run <name> [prompt]` --- run an agent (accepts stdin). Flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-v/--verbose`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--json`, `--retries`
+- `llm agent run <name> [prompt]` --- run an agent (accepts stdin). Flags: `-m`, `-s`, `--no-stream`, `-n/--no-log`, `--key`, `-u/--usage`, `-v/--verbose`, `--chain-limit`, `--tools-debug`, `--tools-approve`, `--json`, `--retries`, `--dry-run`
 - `llm agent list` --- list discovered agents (name, model, source)
 - `llm agent show <name>` --- print agent config details
 - `llm agent init <name> [--global]` --- scaffold TOML template (local by default)
@@ -145,13 +145,15 @@ Phase 4 model options complete --- `-o/--option` flag on `prompt` and `chat` com
 
 Phase 4 aliases complete --- `Config.set_alias/remove_alias` methods. `llm aliases set/show/list/remove/path` subcommands for managing model aliases in `config.toml`. `resolve_model()` (already existed) resolves aliases at runtime in prompt/chat. No transitive resolution (matches simonw/llm behavior).
 
-Phase 4 (v0.4) is complete. Phase 6 (budget tracking) is complete. Phase 7 (retry/backoff) is complete. See `doc/roadmap.md` for future work.
+Phase 4 (v0.4) is complete. Phase 6 (budget tracking) is complete. Phase 7 (retry/backoff) is complete. Phase 8 (dry-run mode) is complete. See `doc/roadmap.md` for future work.
 
 Phase 5 agent config & discovery complete --- `AgentConfig` struct with TOML parsing (`model`, `system_prompt`, `tools`, `chain_limit`, `options`, plus `sub_agents`/`memory`/`budget` stubs). `Paths.agents_dir()`. Discovery: `discover_agents()` scans global (`$XDG_CONFIG_HOME/llm/agents/`) and local (`$CWD/.llm/agents/`) directories, local shadows global. `resolve_agent()` finds agent by name. CLI: `llm agent run <name> [prompt]` resolves config, model (CLI > agent TOML > global default), tools, builds prompt with system_prompt, calls `chain()`. `llm agent list/show/init/path` management commands. Shared helpers (`find_provider`, `resolve_prompt_text`, `format_chain_event`) extracted from `prompt.rs` as `pub(crate)` and reused by `agent.rs` and `chat.rs`.
 
 Phase 6 budget tracking complete --- `Usage::add()` and `Usage::total()` accumulation helpers. `ChainResult.total_usage` accumulates usage across all chain iterations. `ChainEvent::IterationEnd` includes `cumulative_usage`. `chain()` gains `budget: Option<u64>` parameter — exceeding budget triggers `ChainEvent::BudgetExhausted` and graceful stop (like chain_limit). `ChainResult.budget_exhausted` flag. `-u` flag now shows cumulative usage across chain iterations. Verbose output includes cumulative usage per iteration. `BudgetConfig.max_tokens` wired from agent TOML to `chain()`. Agent budget exhaustion prints `[budget]` warning. Chat REPL tracks session-wide cumulative usage across turns, prints summary on exit.
 
 Phase 7 retry/backoff complete --- `LlmError::HttpError { status, message }` variant for HTTP-level errors (replacing opaque `Provider` strings for HTTP failures). `is_retryable()` method returns `true` for 429 and 5xx. `RetryConfig` struct in `llm-core/retry.rs` with exponential backoff + jitter (`delay_for_attempt()`). `RetryProvider` wrapper in `llm-cli/retry.rs` decorates any `Provider` with retry logic (pre-stream only). `--retries` flag on `prompt`, `chat`, and `agent run` commands. Agent TOML `[retry]` section wired — CLI `--retries` overrides agent config. Both OpenAI and Anthropic providers emit `HttpError` for non-success HTTP status codes.
+
+Phase 8 dry-run mode complete --- `--dry-run` flag on `llm agent run` resolves the full agent invocation pipeline (agent file, model + source, provider, system prompt, prompt text, tools with builtin/external classification, merged options, chain limit, budget, retry, logging flag) without calling the LLM, resolving the API key, or writing logs. `DryRunReport` struct in `llm-cli/commands/dry_run.rs` with `render_plain()` and `render_json()` methods. Plain output is a labeled block with stable field order, sorted options, and optional sections omitted when empty. `--dry-run --json` emits the same info as a JSON envelope (`#[serde(skip_serializing_if)]` on optional fields). `-v`/`-vv` under `--dry-run` populate `report.prompt` with the full serialized `Prompt` JSON the provider would have received (both verbosity levels behave the same). External tool discovery still runs so unknown tool names surface as errors. Tool resolution + prompt construction were reordered before `resolve_key` so the dry-run branch can skip key lookup entirely.
 
 ## Conventions
 

@@ -111,3 +111,13 @@ Surgical cfg-gating — `llm-core` had `tokio` as a dependency but never used it
 **Per-iteration `collect_usage()` before `all_chunks.extend()`.** Moving chunks into `all_chunks` consumes them; collect usage first. The `usage.clone()` in `IterationEnd` is cheap (`Option<Usage>`).
 
 **`format_chain_event` shared via `pub(crate)` on prompt module.** Called from `chat` and `agent` via `super::prompt::format_chain_event()`. `find_provider()` and `resolve_prompt_text()` are also `pub(crate)` in prompt, reused by agent. `chat.rs` had its own duplicate `find_provider()` which was removed. A shared `helpers.rs` module would be premature — move them when the third copy appears.
+
+---
+
+## Dry-run mode
+
+**Reorder tool resolution + prompt build before `resolve_key`.** Phase 8's `--dry-run` needs to skip API key lookup so it runs without any credentials set. In Phase 5 the order was `resolve_key` → tool resolution → prompt build → `chain()`. Moving tools + prompt build above `resolve_key` lets the dry-run branch fall through all validation (agent file, model, provider, tools) and return before touching the keystore. Non-dry-run paths see no behavior change since every step after key resolution was already independent of `key`.
+
+**`Prompt` serializes as `text`, not `prompt`.** Integration tests for `-v`/`-vv` Prompt JSON dump initially asserted on a `"prompt"` field name. The `Prompt` struct's text field is named `text` and serde serializes the field name as-is, so the top-level JSON key is `"text"`. Caught by the first test run. No rename — the existing wire format is load-bearing for log deserialization.
+
+**Tool source classification piggybacks on existing resolution loop.** Rather than re-classifying tools for the dry-run report, `run_agent` now builds a parallel `Vec<ToolEntry>` in the same loop that separates builtins from externals. Order is preserved (builtins first, then externals in discovery order) since that mirrors how `tools` itself is assembled. External tool discovery still runs under dry-run so unknown tool names fail fast with the same error as normal runs.

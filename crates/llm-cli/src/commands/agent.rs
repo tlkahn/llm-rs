@@ -7,6 +7,7 @@ use llm_core::{
     resolve_key,
 };
 
+use super::dry_run::{DryRunReport, ModelSource, ToolEntry, ToolSource};
 use super::prompt::{find_provider, format_chain_event, resolve_prompt_text};
 use super::providers;
 use super::tools::{BuiltinToolRegistry, CliToolExecutor};
@@ -85,6 +86,10 @@ pub struct AgentRunArgs {
     /// Maximum number of retries for transient HTTP errors (429, 5xx). Overrides agent TOML.
     #[arg(long)]
     pub retries: Option<u32>,
+
+    /// Resolve agent config and print what would be sent, without making an LLM call.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args)]
@@ -248,7 +253,7 @@ async fn run_agent(args: &AgentRunArgs) -> llm_core::Result<()> {
     let local_dir = std::env::current_dir()
         .map(|cwd| cwd.join(".llm").join("agents"))
         .ok();
-    let (agent_config, _agent_path) = resolve_agent(
+    let (agent_config, agent_path) = resolve_agent(
         &args.name,
         &paths.agents_dir(),
         local_dir.as_deref(),
@@ -260,11 +265,13 @@ async fn run_agent(args: &AgentRunArgs) -> llm_core::Result<()> {
     // Resolve model: CLI -m > agent TOML model > global default
     let effective_default = config.effective_default_model();
     let model_from_agent = agent_config.model.as_deref();
-    let model_input = args
-        .model
-        .as_deref()
-        .or(model_from_agent)
-        .unwrap_or(&effective_default);
+    let (model_input, model_source) = if let Some(m) = args.model.as_deref() {
+        (m, ModelSource::Cli)
+    } else if let Some(m) = model_from_agent {
+        (m, ModelSource::Agent)
+    } else {
+        (effective_default.as_str(), ModelSource::Default)
+    };
     let model_id = config.resolve_model(model_input).to_string();
 
     // Build options from agent TOML [options]
@@ -287,36 +294,37 @@ async fn run_agent(args: &AgentRunArgs) -> llm_core::Result<()> {
         provider
     };
 
-    // Resolve key
-    let key = if provider.needs_key().is_some() || args.key.is_some() {
-        Some(resolve_key(
-            args.key.as_deref(),
-            &key_store,
-            provider.needs_key().unwrap_or(""),
-            provider.key_env_var(),
-        )?)
-    } else {
-        None
-    };
-
-    // Resolve tools from agent config
+    // Resolve tools from agent config, tracking source for dry-run reporting.
     let mut tools = Vec::new();
-    let mut need_external: Vec<String> = Vec::new();
+    let mut tool_entries: Vec<ToolEntry> = Vec::new();
+    let mut need_external: Vec<(usize, String)> = Vec::new();
     if !agent_config.tools.is_empty() {
         let registry = BuiltinToolRegistry::new();
-        for name in &agent_config.tools {
+        for (idx, name) in agent_config.tools.iter().enumerate() {
             match registry.get(name) {
-                Some(tool) => tools.push(tool.clone()),
-                None => need_external.push(name.clone()),
+                Some(tool) => {
+                    tools.push(tool.clone());
+                    tool_entries.push(ToolEntry {
+                        name: name.clone(),
+                        source: ToolSource::Builtin,
+                    });
+                }
+                None => need_external.push((idx, name.clone())),
             }
         }
     }
 
     let external_executor = if !need_external.is_empty() || !agent_config.tools.is_empty() {
         let ext = ExternalToolExecutor::discover().await?;
-        for name in &need_external {
+        for (_idx, name) in &need_external {
             match ext.get_tool(name) {
-                Some((_, tool)) => tools.push(tool.clone()),
+                Some((_, tool)) => {
+                    tools.push(tool.clone());
+                    tool_entries.push(ToolEntry {
+                        name: name.clone(),
+                        source: ToolSource::External,
+                    });
+                }
                 None => {
                     return Err(llm_core::LlmError::Config(format!(
                         "unknown tool in agent config: {name}"
@@ -346,6 +354,56 @@ async fn run_agent(args: &AgentRunArgs) -> llm_core::Result<()> {
     }
 
     let chain_limit = args.chain_limit.unwrap_or(agent_config.chain_limit);
+
+    // Dry-run: print resolved config and return without calling the provider.
+    if args.dry_run {
+        let prompt_json = if args.verbose > 0 {
+            Some(
+                serde_json::to_value(&prompt)
+                    .map_err(|e| llm_core::LlmError::Config(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let report = DryRunReport {
+            agent_name: args.name.clone(),
+            agent_path: agent_path.display().to_string(),
+            model: model_id.clone(),
+            model_source,
+            provider: provider.id().to_string(),
+            system_prompt: system.map(|s| s.to_string()),
+            prompt_text: text.clone(),
+            tools: tool_entries,
+            options: options.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            chain_limit,
+            budget: agent_config.budget.as_ref().and_then(|b| b.max_tokens),
+            retry: agent_config.retry.clone(),
+            logging_enabled: !args.no_log && config.logging,
+            prompt: prompt_json,
+        };
+        let mut stdout = std::io::stdout().lock();
+        if args.json {
+            let json = report
+                .render_json()
+                .map_err(|e| llm_core::LlmError::Config(e.to_string()))?;
+            writeln!(stdout, "{json}").ok();
+        } else {
+            write!(stdout, "{}", report.render_plain()).ok();
+        }
+        return Ok(());
+    }
+
+    // Resolve key
+    let key = if provider.needs_key().is_some() || args.key.is_some() {
+        Some(resolve_key(
+            args.key.as_deref(),
+            &key_store,
+            provider.needs_key().unwrap_or(""),
+            provider.key_env_var(),
+        )?)
+    } else {
+        None
+    };
     let stream_mode = !args.no_stream && !args.json;
     let start = std::time::Instant::now();
     let json_output = args.json;
