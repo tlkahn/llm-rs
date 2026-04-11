@@ -2,7 +2,7 @@
 
 LLM-RS discovers and runs external tools as subprocess executables. Any program on `$PATH` whose name starts with `llm-tool-` becomes available as a tool that LLMs can call during a conversation.
 
-This document specifies the protocol and provides runnable examples.
+This document specifies the protocol and provides runnable examples. For worked examples of *specialist tools* — external tools that internally call `llm` with a narrow purpose-specific agent — see [doc/cookbook/specialist-tools.md](../cookbook/specialist-tools.md) and the design note [doc/research/specialist-tools-vs-sub-agents.md](../research/specialist-tools-vs-sub-agents.md).
 
 ---
 

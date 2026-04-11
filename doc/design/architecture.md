@@ -73,7 +73,11 @@ Agents are TOML files in discoverable directories, not database records or code 
 - **Global + local directories**: `$XDG_CONFIG_HOME/llm/agents/` for global, `$CWD/.llm/agents/` for project-local. Local shadows global (same name wins), analogous to `.gitignore` or `.env` layering.
 - **Name derived from filename**: `reviewer.toml` -> agent name `reviewer`. No separate name field, no registry, no ID generation. The filesystem is the index.
 - **All fields optional**: An empty `.toml` file is a valid agent that uses all defaults. This makes `llm agent init` trivial and lets users build up config incrementally.
-- **Stub fields for future tiers**: `sub_agents` and `memory` parse and persist but aren't wired. This avoids breaking config files when those features ship — users can start writing configs now. `budget` was a stub through Phase 5 and is now wired (Phase 6).
+- **`budget` wired, `sub_agents`/`memory` parked**: `budget` was stubbed through Phase 5 and wired in Phase 6. `sub_agents` and `memory` were also stubbed, and are now permanently parked — llm-rs delegates hierarchical workflows to the specialist tool pattern rather than building a recursive orchestration runtime. See [specialist-tools-vs-sub-agents.md](../research/specialist-tools-vs-sub-agents.md). Legacy TOML configs that still declare `sub_agents = [...]` or `[memory]` continue to load cleanly (serde ignores unknown fields).
+
+### Library with CLI, Not an Orchestration Framework
+
+llm-rs is a library (with a CLI), not an orchestration framework. The core responsibility is a solid single-agent loop with tools, conversations, structured output, parallel tool dispatch, retries, budgets, and dry-run — packaged as the `llm` CLI and exposed as Rust, WASM, and Python libraries. Hierarchical workflows compose *on top of* that core through the specialist tool pattern: an `llm-tool-*` executable that may internally invoke `llm prompt` with a narrow, purpose-specific agent, appearing to the parent LLM as an opaque leaf function. This deliberately avoids the failure modes of recursive multi-agent trees documented in current research. Rationale, worked examples, and sources: [specialist-tools-vs-sub-agents.md](../research/specialist-tools-vs-sub-agents.md).
 
 ### Budget Enforcement as Graceful Stop
 

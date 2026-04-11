@@ -2,6 +2,8 @@
 
 A Unix-philosophy agentic CLI for Large Language Models. Inspired by [simonw/llm](https://github.com/simonw/llm), built for composability --- stdin/stdout pipelines, subprocess-based tool and provider extensibility (`llm-tool-*`, `llm-provider-*`), and multi-target output (native CLI, WASM, Python).
 
+**Scope.** llm-rs is a library (with a CLI), not an orchestration framework. Hierarchical workflows compose via specialist tools — small `llm-tool-*` executables that may internally invoke `llm prompt` with a narrow agent. See [`doc/spec/external-tools.md`](doc/spec/external-tools.md) for the protocol, [`doc/cookbook/specialist-tools.md`](doc/cookbook/specialist-tools.md) for a worked example, and [`doc/research/specialist-tools-vs-sub-agents.md`](doc/research/specialist-tools-vs-sub-agents.md) for why llm-rs is not building recursive sub-agent delegation.
+
 ## Usage
 
 ```bash
@@ -113,6 +115,8 @@ Writing an external tool requires two things:
    ```
 
 Exit 0 means success (stdout = output). Non-zero means error (stderr = error message). Default timeout: 30 seconds.
+
+**Specialist tools.** An external tool can itself call `llm prompt` internally with a cheaper model and a narrow system prompt — an opaque "specialist" function from the parent LLM's perspective. This is llm-rs's answer to hierarchical workflows, in place of a recursive sub-agent runtime. Worked example: [`doc/cookbook/specialist-tools.md`](doc/cookbook/specialist-tools.md). Rationale: [`doc/research/specialist-tools-vs-sub-agents.md`](doc/research/specialist-tools-vs-sub-agents.md).
 
 ### External providers
 
@@ -594,7 +598,9 @@ Current version: **v0.9**. Phases 1–9 complete. See [`doc/roadmap.md`](doc/roa
 - **v0.8** --- `--dry-run` for `llm agent run` (plain or `--json`).
 - **v0.9** --- Parallel tool execution within a chain iteration, order-preserving, opt-out with `--sequential-tools`.
 
-Next up: sub-agent delegation, memory system, Ollama provider, attachments, extract flags. See the Future Work section of the roadmap.
+Next up: Ollama provider, attachments, extract flags. See the Future Work section of the roadmap. Sub-agent delegation and an agent memory system are explicitly parked — llm-rs delegates hierarchical workflows to [specialist tools](doc/cookbook/specialist-tools.md). See [the design note](doc/research/specialist-tools-vs-sub-agents.md) for the rationale.
+
+**Out of scope:** token budget enforcement across nested invocations. Each `llm` call tracks its own budget; users who need hierarchical budget caps should do shell-level accounting (e.g., sum usage from `--json` output across a wrapping script).
 
 ## License
 

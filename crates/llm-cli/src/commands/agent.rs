@@ -192,12 +192,6 @@ fn show_agent(name: &str) -> llm_core::Result<()> {
             println!("  {k}: {v}");
         }
     }
-    if !config.sub_agents.is_empty() {
-        println!("Sub-agents: {}", config.sub_agents.join(", "));
-    }
-    if let Some(mem) = &config.memory {
-        println!("Memory: enabled={}, last_n={:?}", mem.enabled, mem.last_n);
-    }
     if let Some(budget) = &config.budget {
         println!("Budget: max_tokens={:?}", budget.max_tokens);
     }

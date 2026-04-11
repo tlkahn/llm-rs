@@ -16,6 +16,8 @@ Living roadmap and planning document for LLM-RS development.
 
 Unix-philosophy agentic CLI for LLMs, inspired by [simonw/llm](https://github.com/simonw/llm). Core prompting, conversations, tool calling with chain loops, structured output, subprocess-based extensibility, JSONL file logging, multi-provider. Embeddings, templates, and fragments deferred to future work.
 
+llm-rs is a library with a CLI, not an orchestration framework. Recursive sub-agent orchestration is explicitly parked — hierarchical workflows compose through specialist tools and shell scripts. See [specialist-tools-vs-sub-agents.md](research/specialist-tools-vs-sub-agents.md).
+
 ---
 
 ## Phase Status
@@ -35,14 +37,6 @@ Unix-philosophy agentic CLI for LLMs, inspired by [simonw/llm](https://github.co
 ---
 
 ## Future Work
-
-### Axe: Agent Features (prioritized, see [readiness assessment](research/axe-readiness-assessment.md))
-
-**Tier 3** — higher complexity:
-- Sub-agent delegation --- `call_agent` tool spawning child `llm agent run` (+ exit-code-4, `LLM_BUDGET_REMAINING` env var)
-- Memory system --- per-agent JSONL storage; pluggable backends (markdown, SQLite, Redis) deferred
-
-### Other
 
 No fixed ordering:
 - Ollama provider (via subprocess or compiled `llm-ollama` crate)
@@ -68,4 +62,6 @@ All work follows strict TDD: write failing tests first, implement until they pas
 
 Items explicitly set aside. Not planned for current or next phases.
 
+- **Sub-agent delegation / `call_agent` recursion** — research shows recursive multi-agent trees amplify errors up to 17.2× ([MAST 2025](https://arxiv.org/abs/2503.13657)); `llm-tool-*` specialist tools cover the 80% case with none of the recursion semantics. See [specialist-tools-vs-sub-agents.md](research/specialist-tools-vs-sub-agents.md).
+- **Agent memory system** — superseded by specialist tools + JSONL logs; deferred to user composition. See the same [design note](research/specialist-tools-vs-sub-agents.md).
 - `llm import --from-sqlite` --- low demand; users can convert with `jq` scripts if needed

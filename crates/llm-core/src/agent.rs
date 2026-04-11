@@ -41,14 +41,6 @@ pub struct AgentConfig {
     #[serde(default)]
     pub options: HashMap<String, serde_json::Value>,
 
-    /// Sub-agent names (Tier 3 stub — parsed but not wired up).
-    #[serde(default)]
-    pub sub_agents: Vec<String>,
-
-    /// Memory configuration (Tier 3 stub).
-    #[serde(default)]
-    pub memory: Option<MemoryConfig>,
-
     /// Budget configuration (max_tokens enforced by chain loop).
     #[serde(default)]
     pub budget: Option<BudgetConfig>,
@@ -75,8 +67,6 @@ impl Default for AgentConfig {
             tools: Vec::new(),
             chain_limit: default_chain_limit(),
             options: HashMap::new(),
-            sub_agents: Vec::new(),
-            memory: None,
             budget: None,
             retry: None,
             parallel_tools: default_parallel_tools(),
@@ -98,15 +88,6 @@ impl AgentConfig {
         })?;
         toml::from_str(&contents).map_err(|e| LlmError::Config(e.to_string()))
     }
-}
-
-/// Memory configuration (Tier 3 stub — parsed but not wired up).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub last_n: Option<usize>,
 }
 
 /// Budget configuration. `max_tokens` is passed to `chain()` for enforcement.
@@ -236,8 +217,6 @@ mod tests {
         assert!(config.tools.is_empty());
         assert_eq!(config.chain_limit, 10);
         assert!(config.options.is_empty());
-        assert!(config.sub_agents.is_empty());
-        assert!(config.memory.is_none());
         assert!(config.budget.is_none());
         assert!(config.retry.is_none());
         assert!(config.parallel_tools);
@@ -255,14 +234,9 @@ model = "claude-sonnet-4-20250514"
 system_prompt = "You are a code reviewer."
 tools = ["ripgrep", "read_file", "llm_time"]
 chain_limit = 20
-sub_agents = ["security-checker"]
 
 [options]
 temperature = 0
-
-[memory]
-enabled = true
-last_n = 10
 
 [budget]
 max_tokens = 50000
@@ -276,11 +250,6 @@ max_tokens = 50000
         assert_eq!(config.tools, vec!["ripgrep", "read_file", "llm_time"]);
         assert_eq!(config.chain_limit, 20);
         assert_eq!(config.options["temperature"], serde_json::json!(0));
-        assert_eq!(config.sub_agents, vec!["security-checker"]);
-
-        let mem = config.memory.unwrap();
-        assert!(mem.enabled);
-        assert_eq!(mem.last_n, Some(10));
 
         let budget = config.budget.unwrap();
         assert_eq!(budget.max_tokens, Some(50000));
@@ -317,33 +286,6 @@ max_tokens = 200
         let config = AgentConfig::load(&path).unwrap();
         assert_eq!(config.options["temperature"], serde_json::json!(0.7));
         assert_eq!(config.options["max_tokens"], serde_json::json!(200));
-    }
-
-    #[test]
-    fn agent_config_load_with_stub_fields() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("stubs.toml");
-        std::fs::write(
-            &path,
-            r#"
-sub_agents = ["helper-a", "helper-b"]
-
-[memory]
-enabled = false
-
-[budget]
-max_tokens = 100000
-"#,
-        )
-        .unwrap();
-
-        let config = AgentConfig::load(&path).unwrap();
-        assert_eq!(config.sub_agents, vec!["helper-a", "helper-b"]);
-        let mem = config.memory.unwrap();
-        assert!(!mem.enabled);
-        assert!(mem.last_n.is_none());
-        let budget = config.budget.unwrap();
-        assert_eq!(budget.max_tokens, Some(100000));
     }
 
     #[test]

@@ -1,5 +1,7 @@
 # Unix-Philosophy Agent Architecture: Shell Tools + Rust Core Loop
 
+> **Status: Archived research.** This document explored Unix-philosophy agent design ideas that informed phases 5–9 of llm-rs. The `call_agent` / sub-agent delegation ideas in this document were ultimately not adopted. See [specialist-tools-vs-sub-agents.md](specialist-tools-vs-sub-agents.md) for the current position.
+
 ## Origin
 
 This idea grew out of comparing the ReAct loop implementations in two projects:

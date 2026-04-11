@@ -84,11 +84,11 @@ Phases 5 through 9 have all landed. Five tiered items from the prior plan are no
 
 **10. Retry/backoff** — Phase 7 added `LlmError::HttpError { status, message }` (with `is_retryable()` true for 429/5xx), `RetryConfig` with exponential backoff + jitter in `llm-core/retry.rs`, and `RetryProvider` wrapper in `llm-cli/retry.rs` (pre-stream only). `--retries` flag on `prompt`, `chat`, and `agent run`. Agent TOML `[retry]` section wired; CLI overrides agent config. Both OpenAI and Anthropic emit `HttpError` for non-success HTTP status codes.
 
-### Still Open
+### Parked (permanent)
 
-**8. Sub-agent delegation** — No parent/child orchestration. `--messages` + `--json` + agent TOML plumbing are all in place, but there is no `call_agent` dispatch tool, no exit-code-4 on budget exhaustion, and no `LLM_BUDGET_REMAINING` env var for child processes.
+**8. Sub-agent delegation** — **Parked.** Not a gap, a deliberate architectural divergence. llm-rs delegates hierarchical workflows to the *specialist tool* pattern (`llm-tool-*` executables that may internally call `llm prompt`), not to an in-process recursive runtime. Research on multi-agent systems informed this decision. See [specialist-tools-vs-sub-agents.md](specialist-tools-vs-sub-agents.md).
 
-**11. Memory system** — `MemoryConfig` is parsed from agent TOML as a stub (`enabled`, `last_n`) but not wired. No per-agent JSONL storage, no pluggable backends.
+**11. Memory system** — **Parked.** Superseded by specialist tools plus JSONL logs; per-agent memory is deferred to user composition rather than built into the runtime. See [specialist-tools-vs-sub-agents.md](specialist-tools-vs-sub-agents.md).
 
 ### v0.9 Summary Table
 
@@ -105,18 +105,15 @@ Phases 5 through 9 have all landed. Five tiered items from the prior plan are no
 | Agent TOML config | Not started | Still open | **Resolved** (v0.5) |
 | Dry-run mode | Not started | Still open | **Resolved** (v0.8) |
 | Retry/backoff | Not started | Still open | **Resolved** (v0.7) |
-| Sub-agent delegation | Not started | Still open | **Still open** |
-| Memory system | Not started | Still open | **Still open** |
+| Sub-agent delegation | Not started | Still open | **Parked** (v0.9+, see [design note](specialist-tools-vs-sub-agents.md)) |
+| Memory system | Not started | Still open | **Parked** (v0.9+, see [design note](specialist-tools-vs-sub-agents.md)) |
 
 ## Bottom Line (Post-Phase 9)
 
-11 of 13 axe features are resolved. Only sub-agent delegation and the memory system remain, both parked in Tier 3 of the roadmap's future work. Every seam they need — agent discovery, `--messages`/`--json` I/O, budget accounting, dry-run, retry, `MemoryConfig` stub — already exists; the remaining work is pure composition on top of the current architecture.
+11 of 13 axe features are resolved; 2 are deliberately parked. The axe-vs-llm-rs feature gap is now closed — the two remaining items are intentional architectural divergences, not gaps. Sub-agent delegation and the memory system are superseded by the specialist tool pattern, which gives users hierarchical composition without the failure modes of recursive multi-agent runtimes. See [specialist-tools-vs-sub-agents.md](specialist-tools-vs-sub-agents.md) for the full rationale.
 
 ---
 
-## Remaining Work
+## Design Divergence
 
-### Tier 3 — Agent Ecosystem (unchanged from prior plan)
-
-- **Sub-agent delegation** — `call_agent` as a special tool that spawns child `llm agent run`. Lands exit-code-4 on budget exhaustion and `LLM_BUDGET_REMAINING` env var plumbing at the same time.
-- **Memory system** — Per-agent JSONL storage (reuses `llm-store` patterns). `MemoryConfig` stub already parsed from agent TOML. Pluggable backends (markdown, SQLite, Redis) deferred.
+llm-rs does not build a recursive sub-agent runtime or an agent-scoped memory system. Hierarchical workflows compose through specialist tools (`llm-tool-*`), and cross-turn memory composes through the existing JSONL log store and user-level scripting. Full rationale and worked examples: [specialist-tools-vs-sub-agents.md](specialist-tools-vs-sub-agents.md). Parked items index: [roadmap.md](../roadmap.md).
