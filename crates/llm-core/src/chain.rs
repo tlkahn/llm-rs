@@ -1032,4 +1032,110 @@ mod tests {
             _ => panic!("expected BudgetExhausted, got {:?}", events[2]),
         }
     }
+
+    // --- Parallel tool dispatch tests ---
+
+    /// Executor whose call latency is inversely proportional to the call's
+    /// position in the input slice: the last call finishes first. If dispatch
+    /// is sequential, the wall-clock is ~sum(delays); if parallel, ~max(delays).
+    /// Order of `tool_results` must still match input order.
+    struct StaggeredExecutor {
+        total: usize,
+        per_call_ms: u64,
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    impl ToolExecutor for StaggeredExecutor {
+        async fn execute(&self, call: &ToolCall) -> ToolResult {
+            // Extract the input index from the tool_call_id (e.g. "tc_3" -> 3).
+            let idx: usize = call
+                .tool_call_id
+                .as_deref()
+                .and_then(|s| s.strip_prefix("tc_"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            // Later calls sleep shorter so they finish first.
+            let sleep_ms = self.per_call_ms * (self.total as u64 - idx as u64);
+            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+            ToolResult {
+                name: call.name.clone(),
+                output: format!("result for {}", call.tool_call_id.as_deref().unwrap_or("?")),
+                tool_call_id: call.tool_call_id.clone(),
+                error: None,
+            }
+        }
+    }
+
+    /// Build a provider response that emits N tool calls in a single turn,
+    /// followed by a text response for the next iteration.
+    fn multi_tool_call_response(n: usize) -> Vec<Chunk> {
+        let mut chunks = Vec::new();
+        for i in 0..n {
+            chunks.push(Chunk::ToolCallStart {
+                name: "test_tool".into(),
+                id: Some(format!("tc_{i}")),
+            });
+            chunks.push(Chunk::ToolCallDelta {
+                content: "{}".into(),
+            });
+        }
+        chunks.push(Chunk::Done);
+        chunks
+    }
+
+    #[tokio::test]
+    async fn chain_parallel_preserves_tool_call_order() {
+        const N: usize = 5;
+        const PER_CALL_MS: u64 = 100;
+
+        let provider = MockProvider::new(vec![
+            multi_tool_call_response(N),
+            text_response("Done!"),
+        ]);
+        let prompt = Prompt::new("Go").with_tools(vec![make_tool()]);
+        let executor = StaggeredExecutor {
+            total: N,
+            per_call_ms: PER_CALL_MS,
+        };
+
+        let start = std::time::Instant::now();
+        let result = chain(
+            &provider,
+            "mock-model",
+            prompt,
+            None,
+            false,
+            &executor,
+            5,
+            &mut |_| {},
+            None,
+            None,
+            ParallelConfig {
+                enabled: true,
+                max_concurrent: None,
+            },
+        )
+        .await
+        .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.tool_results.len(), N);
+        for i in 0..N {
+            assert_eq!(
+                result.tool_results[i].tool_call_id.as_deref(),
+                Some(format!("tc_{i}").as_str()),
+                "result {i} out of order"
+            );
+        }
+
+        // Sequential total would be PER_CALL_MS * (N + N-1 + ... + 1) = 1500ms.
+        // Parallel total should be dominated by the longest call (~500ms).
+        // Give a generous ceiling to avoid flakiness.
+        let sequential_sum_ms = PER_CALL_MS * (1..=N as u64).sum::<u64>();
+        assert!(
+            elapsed.as_millis() < (sequential_sum_ms as u128) / 2,
+            "parallel dispatch took {elapsed:?}, expected << {sequential_sum_ms}ms"
+        );
+    }
 }
