@@ -12,13 +12,26 @@ For the underlying class definitions, see [`crates/llm-python/src/lib.rs`](../..
 
 ```bash
 cd crates/llm-python
-uv run maturin develop          # builds and installs into the local .venv
-uv run python -c "import llm_rs; print(llm_rs.LlmClient)"
+make rebuild                    # sync deps, then maturin develop
+make smoke                      # sanity-check the .so by importing Phase A/B APIs
 ```
 
-`maturin develop` produces an editable install — re-run it after every Rust change. For a release wheel, use `uv run maturin build --release`.
+The Makefile in `crates/llm-python/Makefile` codifies the only workflow that reliably avoids uv's stale-wheel footgun (see the warning box below). After you edit Rust, re-run `make build`; after you edit `pyproject.toml` or pull new deps, `make rebuild`.
 
-> **Python 3.13 is the current target.** The pinned `pyo3 = "0.23"` does not yet support Python 3.14; either use the project's `.venv` (which `uv` creates at 3.13) or pass `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` and accept the warning.
+For ad-hoc commands against the freshly built `.so`, always prefix with `UV_NO_SYNC=1`:
+
+```bash
+UV_NO_SYNC=1 uv run python -c "import llm_rs; print(llm_rs.LlmClient)"
+# or, once per shell:
+export UV_NO_SYNC=1
+uv run python my_script.py
+```
+
+For a release wheel, use `UV_NO_SYNC=1 uv run maturin build --release`.
+
+> **⚠ Do not use raw `uv run …` after `make build`.** uv auto-syncs the venv on every `uv run`, and its wheel cache can reinstall a prior build of `llm-rs 0.1.0` over the fresh `.so` that `maturin develop` just installed. The version string never bumps during development, so uv happily keeps the stale wheel around indefinitely. Symptoms are nasty: "missing kwarg", "unknown attribute", or — if you only made Rust changes — your edits silently doing nothing. If you see one of those, run `make build` and re-run the command with `UV_NO_SYNC=1`. The `Makefile` targets all do this for you.
+
+> **Python 3.13 is the current target.** The pinned `pyo3 = "0.23"` does not yet support Python 3.14; either use the project's `.venv` (which `uv` creates at 3.13) or pass `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` and accept the warning. The Makefile sets this variable for you.
 
 ---
 

@@ -13,3 +13,8 @@ classifiers = [
 
 [tool.maturin]
 manifest-path = "Cargo.toml"
+
+[dependency-groups]
+dev = [
+    "maturin>=1.13.1",
+]

@@ -18,8 +18,10 @@ cargo build --release -p llm-cli # Build optimized binary
 
 # Library targets (excluded from workspace, built separately):
 wasm-pack build crates/llm-wasm --target web      # WASM for browser/Obsidian
-cd crates/llm-python && uv run maturin develop     # Python native module
+cd crates/llm-python && make rebuild              # Python native module (see Makefile)
 ```
+
+> **Python build footgun — use `make` not raw `uv run`.** `uv run` auto-syncs the venv every invocation, and uv's wheel cache silently reinstalls a stale prior build of `llm-rs 0.1.0` over the fresh `.so` from `maturin develop` (the version never bumps, so uv treats it as "already built"). Always use the Makefile targets in `crates/llm-python/Makefile` — they set `UV_NO_SYNC=1` so the maturin-installed extension sticks. For ad-hoc commands, prefix with `UV_NO_SYNC=1 uv run …` or `export UV_NO_SYNC=1` once per shell. Phase A and Phase B both burned time chasing phantom stale binaries from this.
 
 ## Architecture
 
