@@ -1,15 +1,17 @@
 mod conversation;
+mod retry;
 mod tools;
 
 use std::sync::{mpsc, Mutex};
 
 use futures::StreamExt;
 use llm_anthropic::provider::AnthropicProvider;
+use llm_core::retry::RetryConfig;
 use llm_core::stream::Chunk;
 use llm_core::types::{Message, Prompt};
 use llm_core::{
-    chain, multi_schema, parse_schema_dsl as core_parse_schema_dsl, ChainResult, ParallelConfig,
-    Provider,
+    chain, multi_schema, parse_schema_dsl as core_parse_schema_dsl, ChainEvent, ChainResult,
+    ParallelConfig, Provider,
 };
 use llm_openai::provider::OpenAiProvider;
 use pyo3::prelude::*;
@@ -17,6 +19,7 @@ use pythonize::{depythonize, pythonize};
 use serde_json::Value;
 
 use crate::conversation::Conversation;
+use crate::retry::RetryProvider;
 use crate::tools::{PyToolRegistry, ToolDecorator};
 
 const PY_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -76,6 +79,7 @@ pub struct LlmClient {
     api_key: String,
     registry: PyToolRegistry,
     chain_limit: usize,
+    retry_config: RetryConfig,
     #[allow(dead_code)]
     log_store: Option<llm_store::LogStore>,
 }
@@ -83,7 +87,7 @@ pub struct LlmClient {
 #[pymethods]
 impl LlmClient {
     #[new]
-    #[pyo3(signature = (api_key, model="gpt-4o-mini", *, provider=None, base_url=None, log_dir=None, chain_limit=5))]
+    #[pyo3(signature = (api_key, model="gpt-4o-mini", *, provider=None, base_url=None, log_dir=None, chain_limit=5, retries=0, retry_base_delay_ms=1000, retry_max_delay_ms=30000, retry_jitter=true))]
     fn new(
         api_key: &str,
         model: &str,
@@ -91,6 +95,10 @@ impl LlmClient {
         base_url: Option<&str>,
         log_dir: Option<&str>,
         chain_limit: usize,
+        retries: u32,
+        retry_base_delay_ms: u64,
+        retry_max_delay_ms: u64,
+        retry_jitter: bool,
     ) -> PyResult<Self> {
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -126,6 +134,12 @@ impl LlmClient {
             api_key: api_key.to_string(),
             registry: PyToolRegistry::new(),
             chain_limit,
+            retry_config: RetryConfig {
+                max_retries: retries,
+                base_delay_ms: retry_base_delay_ms,
+                max_delay_ms: retry_max_delay_ms,
+                jitter: retry_jitter,
+            },
             log_store,
         })
     }
@@ -182,6 +196,108 @@ impl LlmClient {
         }
     }
 
+    /// Run a chain loop with optional observability and budget enforcement.
+    ///
+    /// Returns a `ChainResult` exposing `text`, `tool_calls`, `total_usage`,
+    /// and `budget_exhausted`. If `on_event` is provided it is called with a
+    /// dict tagged by `type` (`iteration_start`, `iteration_end`,
+    /// `budget_exhausted`).
+    #[pyo3(signature = (text, *, system=None, chain_limit=None, budget=None, on_event=None))]
+    fn chain(
+        &self,
+        py: Python<'_>,
+        text: &str,
+        system: Option<&str>,
+        chain_limit: Option<usize>,
+        budget: Option<u64>,
+        on_event: Option<Py<PyAny>>,
+    ) -> PyResult<PyChainResult> {
+        let prompt = self.build_prompt(text, system, None);
+        let limit = chain_limit.unwrap_or(self.chain_limit);
+        let cb_opt = on_event;
+
+        let result: llm_core::Result<ChainResult> = self.runtime.block_on(async {
+            let mut on_chunk = |_: &Chunk| {};
+            let mut on_event_cb = |ev: &ChainEvent| {
+                if let Some(cb) = &cb_opt {
+                    let v = chain_event_to_value(ev);
+                    if let Ok(obj) = pythonize(py, &v) {
+                        let _ = cb.call1(py, (obj,));
+                    }
+                }
+            };
+            let retry = RetryProvider::new(&self.provider, self.retry_config.clone());
+            chain(
+                &retry,
+                &self.model,
+                prompt,
+                Some(&self.api_key),
+                false,
+                &self.registry,
+                limit,
+                &mut on_chunk,
+                Some(&mut on_event_cb),
+                budget,
+                ParallelConfig::default(),
+            )
+            .await
+        });
+        let r = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        build_chain_result(py, r)
+    }
+
+    /// Streaming variant: invokes `callback` with type-tagged dicts for both
+    /// text chunks (`{"type": "text", "content": str}`) and events, as they
+    /// are emitted. Returns the final `ChainResult`.
+    #[pyo3(signature = (text, callback, *, system=None, chain_limit=None, budget=None))]
+    fn chain_stream(
+        &self,
+        py: Python<'_>,
+        text: &str,
+        callback: Py<PyAny>,
+        system: Option<&str>,
+        chain_limit: Option<usize>,
+        budget: Option<u64>,
+    ) -> PyResult<PyChainResult> {
+        let prompt = self.build_prompt(text, system, None);
+        let limit = chain_limit.unwrap_or(self.chain_limit);
+        let cb = callback;
+
+        let result: llm_core::Result<ChainResult> = self.runtime.block_on(async {
+            let mut on_chunk = |chunk: &Chunk| {
+                if let Chunk::Text(t) = chunk {
+                    let v = serde_json::json!({"type": "text", "content": t});
+                    if let Ok(obj) = pythonize(py, &v) {
+                        let _ = cb.call1(py, (obj,));
+                    }
+                }
+            };
+            let mut on_event_cb = |ev: &ChainEvent| {
+                let v = chain_event_to_value(ev);
+                if let Ok(obj) = pythonize(py, &v) {
+                    let _ = cb.call1(py, (obj,));
+                }
+            };
+            let retry = RetryProvider::new(&self.provider, self.retry_config.clone());
+            chain(
+                &retry,
+                &self.model,
+                prompt,
+                Some(&self.api_key),
+                true,
+                &self.registry,
+                limit,
+                &mut on_chunk,
+                Some(&mut on_event_cb),
+                budget,
+                ParallelConfig::default(),
+            )
+            .await
+        });
+        let r = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        build_chain_result(py, r)
+    }
+
     /// Send a prompt and stream text chunks. Returns an iterator yielding strings.
     #[pyo3(signature = (text, *, system=None, schema=None, schema_multi=false))]
     fn prompt_stream(
@@ -206,8 +322,9 @@ impl LlmClient {
                         let _ = tx_clone.send(Some(t.clone()));
                     }
                 };
+                let retry = RetryProvider::new(&self.provider, self.retry_config.clone());
                 chain(
-                    &self.provider,
+                    &retry,
                     &self.model,
                     prompt,
                     Some(&self.api_key),
@@ -226,7 +343,8 @@ impl LlmClient {
         } else {
             // No-tool path: stream directly via spawned task.
             let stream_res = self.runtime.block_on(async {
-                self.provider
+                let retry = RetryProvider::new(&self.provider, self.retry_config.clone());
+                retry
                     .execute(&self.model, &prompt, Some(&self.api_key), true)
                     .await
             });
@@ -276,8 +394,8 @@ impl LlmClient {
 
     fn run_direct(&self, prompt: Prompt) -> PyResult<String> {
         let result: llm_core::Result<String> = self.runtime.block_on(async {
-            let stream = self
-                .provider
+            let retry = RetryProvider::new(&self.provider, self.retry_config.clone());
+            let stream = retry
                 .execute(&self.model, &prompt, Some(&self.api_key), false)
                 .await?;
             let mut pinned = std::pin::pin!(stream);
@@ -297,8 +415,9 @@ impl LlmClient {
     fn run_chain(&self, prompt: Prompt) -> PyResult<String> {
         let result: llm_core::Result<ChainResult> = self.runtime.block_on(async {
             let mut on_chunk = |_: &Chunk| {};
+            let retry = RetryProvider::new(&self.provider, self.retry_config.clone());
             chain(
-                &self.provider,
+                &retry,
                 &self.model,
                 prompt,
                 Some(&self.api_key),
@@ -333,8 +452,9 @@ impl LlmClient {
 
         let result: llm_core::Result<ChainResult> = self.runtime.block_on(async {
             let mut on_chunk = |_: &Chunk| {};
+            let retry = RetryProvider::new(&self.provider, self.retry_config.clone());
             chain(
-                &self.provider,
+                &retry,
                 &self.model,
                 p,
                 Some(&self.api_key),
@@ -368,8 +488,6 @@ impl LlmClient {
             p = p.with_system(s);
         }
 
-        // We hold the GIL throughout (this is a #[pymethods]-callable path).
-        // The closure invokes the Python callback via the same `py` token.
         let cb = callback;
         let result: llm_core::Result<ChainResult> = self.runtime.block_on(async {
             let mut on_chunk = |chunk: &Chunk| {
@@ -377,8 +495,9 @@ impl LlmClient {
                     let _ = cb.call1(py, (t.clone(),));
                 }
             };
+            let retry = RetryProvider::new(&self.provider, self.retry_config.clone());
             chain(
-                &self.provider,
+                &retry,
                 &self.model,
                 p,
                 Some(&self.api_key),
@@ -418,6 +537,74 @@ fn build_schema(
     Ok(Some(if multi { multi_schema(value) } else { value }))
 }
 
+/// Result of `LlmClient.chain()` / `chain_stream()`.
+#[pyclass(name = "ChainResult")]
+pub struct PyChainResult {
+    #[pyo3(get)]
+    text: String,
+    #[pyo3(get)]
+    tool_calls: Py<PyAny>,
+    #[pyo3(get)]
+    total_usage: Py<PyAny>,
+    #[pyo3(get)]
+    budget_exhausted: bool,
+}
+
+fn build_chain_result(py: Python<'_>, r: ChainResult) -> PyResult<PyChainResult> {
+    let text = llm_core::collect_text(&r.chunks);
+    let tool_calls = llm_core::collect_tool_calls(&r.chunks);
+    let tc_obj = pythonize(py, &tool_calls)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+        .unbind();
+    let usage_obj = match &r.total_usage {
+        Some(u) => pythonize(py, u)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+            .unbind(),
+        None => py.None(),
+    };
+    Ok(PyChainResult {
+        text,
+        tool_calls: tc_obj,
+        total_usage: usage_obj,
+        budget_exhausted: r.budget_exhausted,
+    })
+}
+
+fn chain_event_to_value(ev: &ChainEvent) -> Value {
+    match ev {
+        ChainEvent::IterationStart {
+            iteration,
+            limit,
+            messages,
+        } => serde_json::json!({
+            "type": "iteration_start",
+            "iteration": iteration,
+            "limit": limit,
+            "messages": messages,
+        }),
+        ChainEvent::IterationEnd {
+            iteration,
+            usage,
+            cumulative_usage,
+            tool_calls,
+        } => serde_json::json!({
+            "type": "iteration_end",
+            "iteration": iteration,
+            "usage": usage,
+            "cumulative_usage": cumulative_usage,
+            "tool_calls": tool_calls,
+        }),
+        ChainEvent::BudgetExhausted {
+            cumulative_usage,
+            budget,
+        } => serde_json::json!({
+            "type": "budget_exhausted",
+            "cumulative_usage": cumulative_usage,
+            "budget": budget,
+        }),
+    }
+}
+
 #[pyclass]
 pub struct ChunkIterator {
     receiver: Mutex<mpsc::Receiver<Option<String>>>,
@@ -455,6 +642,7 @@ fn llm_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ChunkIterator>()?;
     m.add_class::<Conversation>()?;
     m.add_class::<ToolDecorator>()?;
+    m.add_class::<PyChainResult>()?;
     m.add_function(wrap_pyfunction!(parse_schema_dsl, m)?)?;
     Ok(())
 }

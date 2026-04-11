@@ -2,7 +2,7 @@
 
 `llm-python` exposes `llm-core` to Python as a native PyO3 extension built with [maturin](https://www.maturin.rs/). You get a single `LlmClient` class that talks to OpenAI, Anthropic, or any OpenAI-compatible endpoint, with a real Python iterator for streaming. No `httpx`, no `openai` package, no async event loop in your code — the Rust side runs Tokio internally and hands plain strings back across the FFI boundary.
 
-Phase A of the wrapper extension is in: you also get **tool calling** (Python functions exposed to the model via a decorator), **multi-turn `Conversation`s** with shared message history, **structured output** via either a JSON-Schema dict or LLM-RS's terse schema DSL, and the two built-in tools (`llm_version`, `llm_time`). Retries, budgets, persistent logs, and chain observability events are still CLI-only — see the bottom of this file for what's still missing.
+Phases A and B of the wrapper extension are in: you get **tool calling** (Python functions exposed to the model via a decorator), **multi-turn `Conversation`s` with shared message history, **structured output** via either a JSON-Schema dict or LLM-RS's terse schema DSL, the two built-in tools (`llm_version`, `llm_time`), a **chain loop wrapper** with per-iteration observability events, **retries with exponential backoff**, and **token budgets**. Persistent logs and programmatic agent runs are still CLI-only — see the bottom of this file for what's still missing.
 
 For the underlying class definitions, see [`crates/llm-python/src/lib.rs`](../../crates/llm-python/src/lib.rs), [`tools.rs`](../../crates/llm-python/src/tools.rs), and [`conversation.rs`](../../crates/llm-python/src/conversation.rs).
 
@@ -447,14 +447,103 @@ Pass `schema_multi=True` to wrap a single-item DSL in the canonical `{"items": [
 
 ---
 
+## Recipe 14: Chain loop with observability
+
+The plain `prompt()` call runs the chain silently — fine when you just want text back. For instrumentation (per-iteration token usage, tool call inspection, or just watching the loop turn), use `client.chain(...)`:
+
+```python
+import os, llm_rs
+
+client = llm_rs.LlmClient(os.environ["OPENAI_API_KEY"], "gpt-4o-mini")
+
+@client.tool(description="Add two numbers")
+def add(a: int, b: int) -> int:
+    return a + b
+
+def trace(evt):
+    if evt["type"] == "iteration_start":
+        print(f"→ iteration {evt['iteration']}/{evt['limit']} "
+              f"({len(evt['messages'])} messages)")
+    elif evt["type"] == "iteration_end":
+        calls = ", ".join(c["name"] for c in evt["tool_calls"]) or "none"
+        tokens = (evt.get("cumulative_usage") or {}).get("input", 0) + \
+                 (evt.get("cumulative_usage") or {}).get("output", 0)
+        print(f"← tool_calls=[{calls}]  cumulative={tokens} tokens")
+
+result = client.chain(
+    "What is (17 + 25) + (100 + 1)? Use the add tool twice.",
+    on_event=trace,
+    chain_limit=10,
+)
+
+print(f"\nanswer: {result.text}")
+print(f"usage:  {result.total_usage}")
+```
+
+`result` is a `ChainResult` with `text`, `tool_calls` (list of dicts), `total_usage` (dict or `None`), and `budget_exhausted` (bool). Events come as type-tagged dicts: `iteration_start`, `iteration_end`, `budget_exhausted`.
+
+Streaming variant — `chain_stream(text, callback)` fires the same callback for each text chunk (`{"type": "text", "content": "..."}`) *and* each event, interleaved in emission order:
+
+```python
+def tap(evt):
+    if evt["type"] == "text":
+        print(evt["content"], end="", flush=True)
+    elif evt["type"] == "iteration_end":
+        print(f"\n[iter {evt['iteration']} done]")
+
+client.chain_stream("Tell me a story.", tap)
+```
+
+---
+
+## Recipe 15: Token budgets
+
+Chain loops can run away if a model decides to call a tool every turn. A budget caps total tokens across iterations:
+
+```python
+result = client.chain(
+    "Keep calling the echo tool until you give up.",
+    budget=2000,                     # cumulative tokens across the chain
+)
+
+if result.budget_exhausted:
+    print("[stopped: budget exhausted]")
+print(result.text)
+```
+
+When the budget is exceeded the chain stops gracefully after the current iteration (no mid-stream cancellation, so the last assistant message is always complete), emits a `budget_exhausted` event, and sets `result.budget_exhausted = True`. Pair this with `on_event` to log the final cumulative usage.
+
+---
+
+## Recipe 16: Retry with exponential backoff
+
+Transient HTTP errors (429 rate limits, 5xx upstream failures) are retryable. Pass `retries=N` to the constructor to wrap every provider call with an exponential-backoff retry policy:
+
+```python
+client = llm_rs.LlmClient(
+    os.environ["OPENAI_API_KEY"],
+    "gpt-4o-mini",
+    retries=3,                       # up to 3 retries on 429 / 5xx
+    retry_base_delay_ms=1000,        # 1s, 2s, 4s backoff schedule
+    retry_max_delay_ms=30_000,       # clamp to 30s
+    retry_jitter=True,               # randomize to avoid thundering herds
+)
+
+# Applies to prompt(), prompt_stream(), chain(), chain_stream(),
+# Conversation.send() — everything that touches the provider.
+text = client.prompt("Generate 5 haikus.")
+```
+
+Non-retryable errors (4xx other than 429, malformed responses, local bugs) surface immediately without retrying. Set `retries=0` — the default — to disable retry entirely.
+
+---
+
 ## What's intentionally missing (and what to use instead)
 
 | You want                       | Use this instead                                                       |
 |--------------------------------|------------------------------------------------------------------------|
-| Chain observability events     | Phase B of the wrapper plan — exposed in the CLI as `-v`/`-vv`.        |
-| Persistent conversation logs   | `llm` CLI writes JSONL to `$XDG_DATA_HOME/llm/logs/`. Read it back with `llm logs list`. |
-| Retry with backoff             | `llm prompt --retries 3` or set `[retry]` in an agent TOML.            |
-| Token budgets                  | `llm agent run` with `[budget] max_tokens = N`.                        |
+| Persistent conversation logs   | `llm` CLI writes JSONL to `$XDG_DATA_HOME/llm/logs/`. Read it back with `llm logs list`. Python `LogStore` exposure is Phase C. |
+| Programmatic agent runs        | `llm agent run …` from a subprocess. Native `AgentConfig` + `run_agent` is Phase C. |
 | External `llm-tool-*` subprocesses | Stays CLI-only — the browser/Python sandbox model doesn't grant `$PATH` access. |
 
-The Python wrapper still doesn't expose retries, budgets, or persistent log writes — those are scoped to Phase B and Phase C. For now, shell out to the CLI (`subprocess.run(["llm", "prompt", ...])`) when you need them; every Phase 1–9 feature is available there, with stable JSON output via `--json` for parsing.
+For persistent logs and TOML-defined agent runs, shell out to the CLI (`subprocess.run(["llm", "agent", "run", ...])`) — those are scoped to Phase C. Every Phase 1–9 CLI feature is available there, with stable JSON output via `--json` for parsing.

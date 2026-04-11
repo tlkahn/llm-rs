@@ -2,7 +2,7 @@
 
 `llm-wasm` compiles `llm-core` + the OpenAI / Anthropic providers to a single `.wasm` file you can drop into any browser page, web extension, or Obsidian plugin. There is no Node-only API, no fetch polyfill — the host's `fetch()` is used directly, so streaming "just works" anywhere a modern browser runs.
 
-Phase A of the wrapper extension is in: alongside the bare `prompt`/`promptStreaming` calls, you now also get **tool callbacks** (JS functions exposed to the model), **multi-turn `Conversation`s** with shared message history, **structured output** via `promptWithSchema`, and the two built-in tools (`llm_version`, `llm_time`). Logs, retries, and budgets are still CLI-only — see the bottom of this file for what's still off the table.
+Phases A and B of the wrapper extension are in: alongside the bare `prompt`/`promptStreaming` calls, you get **tool callbacks** (JS functions exposed to the model), **multi-turn `Conversation`s** with shared message history, **structured output** via `promptWithSchema`, the two built-in tools (`llm_version`, `llm_time`), a **`chain()` wrapper with per-iteration events**, **retries with exponential backoff**, and **token budgets**. Logs are still off the table — see the bottom of this file for what's still CLI-only.
 
 For the underlying type definitions, see [`crates/llm-wasm/pkg/llm_wasm.d.ts`](../../crates/llm-wasm/pkg/llm_wasm.d.ts) after running `wasm-pack build --target web crates/llm-wasm`.
 
@@ -401,14 +401,88 @@ console.log(JSON.parse(films).items);
 
 ---
 
+## Recipe: Chain loop with events, budget, and retry
+
+`client.chain(text, options)` runs the full chain loop and hands back a structured result. Pass `onEvent` to observe each iteration:
+
+```js
+import init, { LlmClient } from "./pkg/llm_wasm.js";
+await init();
+
+const client = new LlmClient(openaiKey, "gpt-4o-mini");
+client.registerTool({
+  name: "add",
+  description: "Add two numbers",
+  inputSchema: {
+    type: "object",
+    properties: { a: { type: "number" }, b: { type: "number" } },
+    required: ["a", "b"],
+  },
+  execute: ({ a, b }) => a + b,
+});
+
+const result = await client.chain(
+  "What is (17 + 25) + (100 + 1)? Use the add tool twice.",
+  {
+    chainLimit: 10,
+    budget: 2000,                      // cumulative tokens cap
+    onEvent: (evt) => {
+      if (evt.type === "iteration_start") {
+        console.log(`→ iteration ${evt.iteration}/${evt.limit}`);
+      } else if (evt.type === "iteration_end") {
+        const calls = evt.tool_calls.map((c) => c.name).join(", ") || "none";
+        console.log(`← tool_calls=[${calls}]`);
+      } else if (evt.type === "budget_exhausted") {
+        console.warn("budget exhausted", evt.cumulative_usage);
+      }
+    },
+  },
+);
+
+console.log("answer:", result.text);
+console.log("usage: ", result.totalUsage);
+console.log("stopped on budget?", result.budgetExhausted);
+```
+
+`result` is a plain JS object: `{ text, toolCalls, totalUsage, budgetExhausted }`. Events are type-tagged dicts: `iteration_start`, `iteration_end`, `budget_exhausted`.
+
+Streaming variant — `chainStreaming(text, callback, options)` fires the same callback for each text chunk (`{type: "text", content}`) *and* each event, interleaved:
+
+```js
+await client.chainStreaming(
+  "Tell me a story.",
+  (evt) => {
+    if (evt.type === "text") process.stdout.write(evt.content);
+    else console.log("\n[" + evt.type + "]");
+  },
+  { chainLimit: 5 },
+);
+```
+
+### Retry with exponential backoff
+
+Transient HTTP errors (429, 5xx) are retryable. Call `setRetryConfig` on the client and every subsequent provider call — `prompt`, `promptStreaming`, `chain`, `conversation.send` — wraps itself in an exponential-backoff retry loop:
+
+```js
+client.setRetryConfig(
+  3,        // max_retries
+  1000,     // base_delay_ms → 1s, 2s, 4s schedule
+  30_000,   // max_delay_ms  → clamp
+  true,     // jitter
+);
+```
+
+Non-retryable errors (4xx other than 429, malformed responses) surface immediately without retrying. Call with `max_retries = 0` to disable. The default is `max_retries = 0` — opt in when you need it.
+
+---
+
 ## What's intentionally missing
 
 | Feature                          | Why                                                                            |
 |----------------------------------|--------------------------------------------------------------------------------|
 | External `llm-tool-*` subprocesses | Tools-by-`$PATH` is a CLI-only concept. JS callbacks are the substitute.       |
-| Logs                             | No filesystem in the browser. Persist conversations in IndexedDB via `conv.messages`. |
-| Retry / budget                   | Phase B of the wrapper plan — wrap your own `for` loop in the meantime.        |
-| Chain observability events       | Phase B — `IterationStart`/`IterationEnd` aren't surfaced to JS yet.           |
+| Logs / persistent conversation store | No filesystem in the browser. A JS-callback `ConversationStore` backend (IndexedDB-friendly) is scoped to Phase C. |
+| Programmatic agent runs          | `AgentConfig` + `runAgent` is scoped to Phase C.                               |
 
 If your use case starts to need any of these, you have two good options:
 

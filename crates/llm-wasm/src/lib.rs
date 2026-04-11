@@ -1,4 +1,5 @@
 mod conversation;
+mod retry;
 mod tools;
 
 use std::collections::HashMap;
@@ -7,17 +8,19 @@ use std::rc::Rc;
 use async_trait::async_trait;
 use futures::StreamExt;
 use llm_anthropic::provider::AnthropicProvider;
+use llm_core::retry::RetryConfig;
 use llm_core::stream::Chunk;
 use llm_core::types::{Message, ModelInfo, Prompt};
 use llm_core::{
-    chain, multi_schema, parse_schema_dsl as core_parse_schema_dsl, ChainResult, ParallelConfig,
-    Provider,
+    chain, multi_schema, parse_schema_dsl as core_parse_schema_dsl, ChainEvent, ChainResult,
+    ParallelConfig, Provider,
 };
 use llm_openai::provider::OpenAiProvider;
 use serde_json::Value;
 use wasm_bindgen::prelude::*;
 
 pub use crate::conversation::Conversation;
+use crate::retry::RetryProvider;
 use crate::tools::WasmToolRegistry;
 
 const WASM_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -64,6 +67,7 @@ pub(crate) struct LlmClientInner {
     pub api_key: String,
     pub registry: WasmToolRegistry,
     pub chain_limit: std::cell::Cell<usize>,
+    pub retry_config: std::cell::RefCell<RetryConfig>,
 }
 
 #[wasm_bindgen]
@@ -92,6 +96,12 @@ impl LlmClient {
                 api_key: api_key.to_string(),
                 registry: WasmToolRegistry::new(),
                 chain_limit: std::cell::Cell::new(DEFAULT_CHAIN_LIMIT),
+                retry_config: std::cell::RefCell::new(RetryConfig {
+                    max_retries: 0,
+                    base_delay_ms: 1000,
+                    max_delay_ms: 30_000,
+                    jitter: true,
+                }),
             }),
         }
     }
@@ -110,6 +120,12 @@ impl LlmClient {
                 api_key: api_key.to_string(),
                 registry: WasmToolRegistry::new(),
                 chain_limit: std::cell::Cell::new(DEFAULT_CHAIN_LIMIT),
+                retry_config: std::cell::RefCell::new(RetryConfig {
+                    max_retries: 0,
+                    base_delay_ms: 1000,
+                    max_delay_ms: 30_000,
+                    jitter: true,
+                }),
             }),
         }
     }
@@ -131,6 +147,24 @@ impl LlmClient {
     #[wasm_bindgen(js_name = "setChainLimit")]
     pub fn set_chain_limit(&self, limit: usize) {
         self.inner.chain_limit.set(limit);
+    }
+
+    /// Configure retry policy for transient (429 / 5xx) errors.
+    /// Set `max_retries` to 0 to disable retries entirely.
+    #[wasm_bindgen(js_name = "setRetryConfig")]
+    pub fn set_retry_config(
+        &self,
+        max_retries: u32,
+        base_delay_ms: u64,
+        max_delay_ms: u64,
+        jitter: bool,
+    ) {
+        *self.inner.retry_config.borrow_mut() = RetryConfig {
+            max_retries,
+            base_delay_ms,
+            max_delay_ms,
+            jitter,
+        };
     }
 
     /// Construct a fresh `Conversation` that shares this client's provider,
@@ -212,6 +246,117 @@ impl LlmClient {
         self.run(prompt, true, Some(callback)).await
     }
 
+    /// Run a chain loop with optional observability and budget enforcement.
+    ///
+    /// `options` is an optional JS object:
+    /// `{ system?: string, chainLimit?: number, budget?: number, onEvent?: (evt) => void }`.
+    ///
+    /// Returns a `ChainResult`-shaped JS object:
+    /// `{ text, toolCalls, totalUsage, budgetExhausted }`. Event dicts are
+    /// type-tagged: `iteration_start`, `iteration_end`, `budget_exhausted`.
+    #[wasm_bindgen(js_name = "chain")]
+    pub async fn chain_js(
+        &self,
+        text: &str,
+        options: JsValue,
+    ) -> Result<JsValue, JsError> {
+        let opts = ChainOptions::parse(&options)?;
+        let mut prompt = Prompt::new(text).with_tools(self.inner.registry.list_tools());
+        if let Some(s) = &opts.system {
+            prompt = prompt.with_system(s);
+        }
+        let limit = opts.chain_limit.unwrap_or(self.inner.chain_limit.get());
+
+        let on_event_cb = opts.on_event.clone();
+        let this = JsValue::NULL;
+        let mut on_chunk = |_: &Chunk| {};
+        let mut on_event = move |ev: &ChainEvent| {
+            if let Some(cb) = &on_event_cb {
+                let v = chain_event_to_value(ev);
+                if let Ok(obj) = serde_wasm_bindgen::to_value(&v) {
+                    let _ = cb.call1(&this, &obj);
+                }
+            }
+        };
+
+        let retry_cfg = self.inner.retry_config.borrow().clone();
+        let retry = RetryProvider::new(&self.inner.provider, retry_cfg);
+        let result = chain(
+            &retry,
+            &self.inner.model,
+            prompt,
+            Some(&self.inner.api_key),
+            false,
+            &self.inner.registry,
+            limit,
+            &mut on_chunk,
+            Some(&mut on_event),
+            opts.budget,
+            ParallelConfig::default(),
+        )
+        .await
+        .map_err(|e| JsError::new(&e.to_string()))?;
+
+        build_chain_result_js(result)
+    }
+
+    /// Streaming variant of `chain`. Calls the provided `callback` with each
+    /// text chunk (`{type: 'text', content}`) and each chain event, interleaved
+    /// in order.
+    #[wasm_bindgen(js_name = "chainStreaming")]
+    pub async fn chain_streaming(
+        &self,
+        text: &str,
+        callback: js_sys::Function,
+        options: JsValue,
+    ) -> Result<JsValue, JsError> {
+        let opts = ChainOptions::parse(&options)?;
+        let mut prompt = Prompt::new(text).with_tools(self.inner.registry.list_tools());
+        if let Some(s) = &opts.system {
+            prompt = prompt.with_system(s);
+        }
+        let limit = opts.chain_limit.unwrap_or(self.inner.chain_limit.get());
+
+        let cb_text = callback.clone();
+        let this_text = JsValue::NULL;
+        let mut on_chunk = move |chunk: &Chunk| {
+            if let Chunk::Text(t) = chunk {
+                let v = serde_json::json!({"type": "text", "content": t});
+                if let Ok(obj) = serde_wasm_bindgen::to_value(&v) {
+                    let _ = cb_text.call1(&this_text, &obj);
+                }
+            }
+        };
+        let cb_evt = callback.clone();
+        let this_evt = JsValue::NULL;
+        let mut on_event = move |ev: &ChainEvent| {
+            let v = chain_event_to_value(ev);
+            if let Ok(obj) = serde_wasm_bindgen::to_value(&v) {
+                let _ = cb_evt.call1(&this_evt, &obj);
+            }
+        };
+
+        let retry_cfg = self.inner.retry_config.borrow().clone();
+        let retry = RetryProvider::new(&self.inner.provider, retry_cfg);
+        let result = chain(
+            &retry,
+            &self.inner.model,
+            prompt,
+            Some(&self.inner.api_key),
+            true,
+            &self.inner.registry,
+            limit,
+            &mut on_chunk,
+            Some(&mut on_event),
+            opts.budget,
+            ParallelConfig::default(),
+        )
+        .await
+        .map_err(|e| JsError::new(&e.to_string()))?;
+
+        build_chain_result_js(result)
+    }
+
     /// Send a prompt with a JSON-Schema-validated structured output.
     /// `schema_or_dsl` accepts either a schema DSL string (`"name str, age int"`)
     /// or a JS object representing JSON Schema directly.
@@ -266,9 +411,9 @@ impl LlmClient {
         stream: bool,
         callback: Option<&js_sys::Function>,
     ) -> Result<String, JsError> {
-        let response = self
-            .inner
-            .provider
+        let retry_cfg = self.inner.retry_config.borrow().clone();
+        let retry = RetryProvider::new(&self.inner.provider, retry_cfg);
+        let response = retry
             .execute(&self.inner.model, &prompt, Some(&self.inner.api_key), stream)
             .await
             .map_err(|e| JsError::new(&e.to_string()))?;
@@ -304,8 +449,10 @@ impl LlmClient {
                 let _ = c.call1(&this, &JsValue::from_str(t));
             }
         };
+        let retry_cfg = self.inner.retry_config.borrow().clone();
+        let retry = RetryProvider::new(&self.inner.provider, retry_cfg);
         let result = chain(
-            &self.inner.provider,
+            &retry,
             &self.inner.model,
             prompt,
             Some(&self.inner.api_key),
@@ -345,8 +492,10 @@ impl LlmClient {
             }
         };
 
+        let retry_cfg = self.inner.retry_config.borrow().clone();
+        let retry = RetryProvider::new(&self.inner.provider, retry_cfg);
         let result: ChainResult = chain(
-            &self.inner.provider,
+            &retry,
             &self.inner.model,
             p,
             Some(&self.inner.api_key),
@@ -364,6 +513,91 @@ impl LlmClient {
         let text = llm_core::collect_text(&result.chunks);
         Ok((text, result.messages))
     }
+}
+
+struct ChainOptions {
+    system: Option<String>,
+    chain_limit: Option<usize>,
+    budget: Option<u64>,
+    on_event: Option<js_sys::Function>,
+}
+
+impl ChainOptions {
+    fn parse(value: &JsValue) -> Result<Self, JsError> {
+        if value.is_undefined() || value.is_null() {
+            return Ok(Self {
+                system: None,
+                chain_limit: None,
+                budget: None,
+                on_event: None,
+            });
+        }
+        let get = |k: &str| -> JsValue {
+            js_sys::Reflect::get(value, &JsValue::from_str(k)).unwrap_or(JsValue::UNDEFINED)
+        };
+        let system = get("system").as_string();
+        let chain_limit = get("chainLimit").as_f64().map(|n| n as usize);
+        let budget = get("budget").as_f64().map(|n| n as u64);
+        let on_event_val = get("onEvent");
+        let on_event = if on_event_val.is_function() {
+            Some(on_event_val.unchecked_into::<js_sys::Function>())
+        } else {
+            None
+        };
+        Ok(Self {
+            system,
+            chain_limit,
+            budget,
+            on_event,
+        })
+    }
+}
+
+fn chain_event_to_value(ev: &ChainEvent) -> Value {
+    match ev {
+        ChainEvent::IterationStart {
+            iteration,
+            limit,
+            messages,
+        } => serde_json::json!({
+            "type": "iteration_start",
+            "iteration": iteration,
+            "limit": limit,
+            "messages": messages,
+        }),
+        ChainEvent::IterationEnd {
+            iteration,
+            usage,
+            cumulative_usage,
+            tool_calls,
+        } => serde_json::json!({
+            "type": "iteration_end",
+            "iteration": iteration,
+            "usage": usage,
+            "cumulative_usage": cumulative_usage,
+            "tool_calls": tool_calls,
+        }),
+        ChainEvent::BudgetExhausted {
+            cumulative_usage,
+            budget,
+        } => serde_json::json!({
+            "type": "budget_exhausted",
+            "cumulative_usage": cumulative_usage,
+            "budget": budget,
+        }),
+    }
+}
+
+fn build_chain_result_js(r: ChainResult) -> Result<JsValue, JsError> {
+    let text = llm_core::collect_text(&r.chunks);
+    let tool_calls = llm_core::collect_tool_calls(&r.chunks);
+    let v = serde_json::json!({
+        "text": text,
+        "toolCalls": tool_calls,
+        "totalUsage": r.total_usage,
+        "budgetExhausted": r.budget_exhausted,
+    });
+    serde_wasm_bindgen::to_value(&v).map_err(|e| JsError::new(&e.to_string()))
 }
 
 fn build_schema(js_value: JsValue, multi: bool) -> Result<Value, JsError> {
