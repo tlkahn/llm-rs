@@ -16,7 +16,7 @@ llm-core = { path = "../llm-core" }
 llm-openai = { path = "../llm-openai" }
 llm-anthropic = { path = "../llm-anthropic" }
 llm-store = { path = "../llm-store" }
-pyo3 = { version = "0.23" }
+pyo3 = { version = "0.23", features = ["abi3-py38"] }
 pythonize = "0.23"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"

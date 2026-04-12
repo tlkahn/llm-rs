@@ -15,7 +15,7 @@ thiserror = "2"
 futures = "0.3"
 async-trait = "0.1"
 tokio-stream = "0.1"
-reqwest = { version = "0.12", features = ["stream", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
 ulid = "1"
 chrono = { version = "0.4", features = ["serde"] }
 toml = "0.8"

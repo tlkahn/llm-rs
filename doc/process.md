@@ -102,6 +102,8 @@ git tag v0.10
 
 The bump matters most for `crates/llm-python/pyproject.toml` — uv keys its wheel cache on the version string, so a stale `0.1.0` will silently shadow a fresh `maturin develop` build (see commit `aed7d71`). The 5 in-workspace crates inherit `version` from `[workspace.package]` in the root `Cargo.toml` and need no per-bump edits.
 
+Pushing the tag to origin (`git push origin vX.Y`) triggers the GitHub Actions release workflow (`.github/workflows/release.yml`), which builds CLI binaries, WASM packages, and Python wheels and publishes them as a GitHub Release.
+
 ### 3b. Hygiene checklist
 
 | Doc | Action |
