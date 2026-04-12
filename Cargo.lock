@@ -901,7 +901,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "llm-anthropic"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "llm-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "assert_cmd",
  "async-stream",
@@ -945,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "llm-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "llm-openai"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "llm-store"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "chrono",
