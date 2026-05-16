@@ -6,6 +6,11 @@ exclude = ["crates/llm-wasm", "crates/llm-python"]
 [workspace.package]
 version = "0.11.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/tlkahn/llm-rs"
+authors = ["tlkahn <joshgy@gmail.com>"]
+rust-version = "1.85"
+readme = "README.md"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

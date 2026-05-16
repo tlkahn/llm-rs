@@ -20,10 +20,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build x86_64
-        run: cargo build --release -p llm-cli --target x86_64-apple-darwin
+        run: cargo build --release -p llm-cmd --target x86_64-apple-darwin
 
       - name: Build aarch64
-        run: cargo build --release -p llm-cli --target aarch64-apple-darwin
+        run: cargo build --release -p llm-cmd --target aarch64-apple-darwin
 
       - name: Create universal binary
         run: |
@@ -61,7 +61,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release -p llm-cli --target x86_64-unknown-linux-musl
+        run: cargo build --release -p llm-cmd --target x86_64-unknown-linux-musl
 
       - name: Package
         run: |

@@ -2,6 +2,14 @@
 name = "llm-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+description = "Core traits, types, and streaming primitives for the llm-cmd LLM toolkit"
+keywords = ["llm", "ai", "openai", "anthropic", "streaming"]
+categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 serde = { workspace = true }

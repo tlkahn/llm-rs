@@ -2,9 +2,17 @@
 name = "llm-anthropic"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+description = "Anthropic Messages API provider for the llm-cmd toolkit"
+keywords = ["llm", "anthropic", "claude", "streaming", "ai"]
+categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
-llm-core = { path = "../llm-core" }
+llm-core = { path = "../llm-core", version = "0.11.0" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

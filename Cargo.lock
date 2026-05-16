@@ -916,7 +916,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "llm-cli"
+name = "llm-cmd"
 version = "0.11.0"
 dependencies = [
  "assert_cmd",
