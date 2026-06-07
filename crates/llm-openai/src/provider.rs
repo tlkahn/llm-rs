@@ -15,6 +15,7 @@ use crate::types::{
 pub struct OpenAiProvider {
     base_url: String,
     client: Client,
+    extra_headers: Vec<(String, String)>,
 }
 
 impl OpenAiProvider {
@@ -22,6 +23,15 @@ impl OpenAiProvider {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: Client::new(),
+            extra_headers: Vec::new(),
+        }
+    }
+
+    pub fn with_extra_headers(base_url: &str, extra_headers: Vec<(String, String)>) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client: Client::new(),
+            extra_headers,
         }
     }
 }
@@ -121,11 +131,15 @@ impl Provider for OpenAiProvider {
             });
         }
 
-        let response = self
+        let mut req = self
             .client
             .post(format!("{}/v1/chat/completions", self.base_url))
             .bearer_auth(key)
-            .json(&request)
+            .json(&request);
+        for (name, value) in &self.extra_headers {
+            req = req.header(name, value);
+        }
+        let response = req
             .send()
             .await
             .map_err(|e| LlmError::Provider(e.to_string()))?;
@@ -743,5 +757,51 @@ data: [DONE]\n\n";
 
         let text = llm_core::collect_text(&chunks);
         assert_eq!(text, "{\"name\":\"John\",\"age\":30}");
+    }
+
+    #[tokio::test]
+    async fn extra_headers_sent_on_request() {
+        let server = MockServer::start().await;
+
+        let body = serde_json::json!({
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("HTTP-Referer", "https://lit.app"))
+            .and(header("X-Title", "Lit"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::with_extra_headers(
+            &server.uri(),
+            vec![
+                ("HTTP-Referer".into(), "https://lit.app".into()),
+                ("X-Title".into(), "Lit".into()),
+            ],
+        );
+        let prompt = Prompt::new("Hi");
+        let stream = provider
+            .execute("gpt-4o-mini", &prompt, Some("sk-test"), false)
+            .await
+            .unwrap();
+
+        let chunks: Vec<_> = stream.collect::<Vec<_>>().await;
+        assert!(chunks.iter().any(|r| matches!(r, Ok(Chunk::Done))));
     }
 }
