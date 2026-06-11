@@ -1,4 +1,6 @@
 use crate::types::{ContentBlock, Message, MessageContent};
+use llm_core::resolve_to_base64;
+use llm_core::types::{Attachment, AttachmentSource};
 use llm_core::Prompt;
 
 pub fn build_messages(prompt: &Prompt) -> Vec<Message> {
@@ -9,10 +11,62 @@ pub fn build_messages(prompt: &Prompt) -> Vec<Message> {
     }
 }
 
+/// Build a `MessageContent` for a user message, incorporating image attachments.
+///
+/// When attachments are present, produces `Blocks` with image blocks BEFORE the
+/// text block (Anthropic convention: images first, text after).
+/// When attachments are empty, produces `Text(text)`.
+fn build_user_content(text: &str, attachments: &[Attachment]) -> MessageContent {
+    if attachments.is_empty() {
+        return MessageContent::Text(text.to_string());
+    }
+
+    let mut blocks: Vec<ContentBlock> = Vec::new();
+
+    // Image blocks first (Anthropic convention)
+    for att in attachments {
+        match &att.source {
+            AttachmentSource::Url(url) => {
+                blocks.push(ContentBlock::image_url(url));
+            }
+            _ => {
+                // Path or Bytes: resolve to base64
+                if let Ok(resolved) = resolve_to_base64(att) {
+                    blocks.push(ContentBlock::image_base64(
+                        &resolved.media_type,
+                        &resolved.base64_data,
+                    ));
+                }
+                // If resolution fails (e.g. missing file), silently skip.
+                // The error is non-fatal: the model still gets the text.
+            }
+        }
+    }
+
+    // Text block last
+    if !text.is_empty() {
+        blocks.push(ContentBlock {
+            block_type: "text".into(),
+            text: Some(text.to_string()),
+            id: None,
+            name: None,
+            input: None,
+            tool_use_id: None,
+            content: None,
+            is_error: None,
+            source: None,
+        });
+    }
+
+    MessageContent::Blocks(blocks)
+}
+
 fn build_single_turn(prompt: &Prompt) -> Vec<Message> {
+    let content = build_user_content(&prompt.text, &prompt.attachments);
+
     let mut messages = vec![Message {
         role: "user".into(),
-        content: MessageContent::Text(prompt.text.clone()),
+        content,
     }];
 
     // If there are tool calls and tool results, add assistant + user tool_result messages
@@ -52,6 +106,7 @@ fn build_from_conversation(prompt: &Prompt) -> Vec<Message> {
                             tool_use_id: None,
                             content: None,
                             is_error: None,
+                            source: None,
                         });
                     }
                     for tc in &msg.tool_calls {
@@ -78,7 +133,74 @@ fn build_from_conversation(prompt: &Prompt) -> Vec<Message> {
         }
     }
 
+    // Inject attachments into the last user message
+    if !prompt.attachments.is_empty() {
+        inject_attachments_into_last_user_message(&mut messages, &prompt.attachments);
+    }
+
     messages
+}
+
+/// Inject image attachments into the last user-role message in the conversation.
+///
+/// If the last user message was `Text(s)`, it becomes `Blocks([images..., text])`.
+/// If it was already `Blocks(bs)`, image blocks are prepended.
+fn inject_attachments_into_last_user_message(
+    messages: &mut [Message],
+    attachments: &[Attachment],
+) {
+    // Find the last user message
+    let last_user = messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.role == "user");
+
+    let Some(msg) = last_user else { return };
+
+    let mut image_blocks: Vec<ContentBlock> = Vec::new();
+    for att in attachments {
+        match &att.source {
+            AttachmentSource::Url(url) => {
+                image_blocks.push(ContentBlock::image_url(url));
+            }
+            _ => {
+                if let Ok(resolved) = resolve_to_base64(att) {
+                    image_blocks.push(ContentBlock::image_base64(
+                        &resolved.media_type,
+                        &resolved.base64_data,
+                    ));
+                }
+            }
+        }
+    }
+
+    if image_blocks.is_empty() {
+        return;
+    }
+
+    match &msg.content {
+        MessageContent::Text(text) => {
+            let mut blocks = image_blocks;
+            if !text.is_empty() {
+                blocks.push(ContentBlock {
+                    block_type: "text".into(),
+                    text: Some(text.clone()),
+                    id: None,
+                    name: None,
+                    input: None,
+                    tool_use_id: None,
+                    content: None,
+                    is_error: None,
+                    source: None,
+                });
+            }
+            msg.content = MessageContent::Blocks(blocks);
+        }
+        MessageContent::Blocks(existing) => {
+            image_blocks.extend(existing.iter().cloned());
+            msg.content = MessageContent::Blocks(image_blocks);
+        }
+    }
 }
 
 fn map_tool_use(tc: &llm_core::ToolCall) -> ContentBlock {
@@ -91,6 +213,7 @@ fn map_tool_use(tc: &llm_core::ToolCall) -> ContentBlock {
         tool_use_id: None,
         content: None,
         is_error: None,
+        source: None,
     }
 }
 
@@ -104,6 +227,7 @@ fn map_tool_result(tr: &llm_core::ToolResult) -> ContentBlock {
         tool_use_id: tr.tool_call_id.clone(),
         content: Some(tr.output.clone()),
         is_error: tr.error.as_ref().map(|_| true),
+        source: None,
     }
 }
 
@@ -282,5 +406,120 @@ mod tests {
         }
         assert_eq!(messages[3].role, "assistant");
         assert_eq!(messages[4].role, "user");
+    }
+
+    #[test]
+    fn build_messages_with_attachments_single_turn() {
+        use llm_core::types::{Attachment, AttachmentSource};
+
+        let prompt = Prompt::new("Describe this image")
+            .with_attachments(vec![Attachment {
+                mime_type: Some("image/png".into()),
+                source: AttachmentSource::Bytes(vec![0x89, 0x50, 0x4e, 0x47]),
+            }]);
+
+        let messages = build_messages(&prompt);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+
+        // Should be Blocks, not Text
+        if let MessageContent::Blocks(blocks) = &messages[0].content {
+            // Image block first (Anthropic convention)
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(blocks[0].block_type, "image");
+            let source = blocks[0].source.as_ref().unwrap();
+            assert_eq!(source.source_type, "base64");
+            assert_eq!(source.media_type.as_deref(), Some("image/png"));
+            assert!(source.data.is_some());
+            // Text block last
+            assert_eq!(blocks[1].block_type, "text");
+            assert_eq!(blocks[1].text.as_deref(), Some("Describe this image"));
+        } else {
+            panic!("expected Blocks content when attachments present");
+        }
+    }
+
+    #[test]
+    fn build_messages_with_attachments_multi_turn() {
+        use llm_core::types::{Attachment, AttachmentSource};
+        use llm_core::Message as CoreMessage;
+
+        let prompt = Prompt::new("")
+            .with_messages(vec![
+                CoreMessage::user("Hello"),
+                CoreMessage::assistant("Hi! How can I help?"),
+                CoreMessage::user("What is in this image?"),
+            ])
+            .with_attachments(vec![Attachment {
+                mime_type: Some("image/jpeg".into()),
+                source: AttachmentSource::Bytes(vec![0xFF, 0xD8, 0xFF]),
+            }]);
+
+        let messages = build_messages(&prompt);
+        assert_eq!(messages.len(), 3);
+
+        // First two messages unchanged
+        if let MessageContent::Text(t) = &messages[0].content {
+            assert_eq!(t, "Hello");
+        } else {
+            panic!("first message should be Text");
+        }
+        if let MessageContent::Text(t) = &messages[1].content {
+            assert_eq!(t, "Hi! How can I help?");
+        } else {
+            panic!("second message should be Text");
+        }
+
+        // Last user message should have attachments injected
+        assert_eq!(messages[2].role, "user");
+        if let MessageContent::Blocks(blocks) = &messages[2].content {
+            assert_eq!(blocks.len(), 2);
+            // Image first
+            assert_eq!(blocks[0].block_type, "image");
+            let source = blocks[0].source.as_ref().unwrap();
+            assert_eq!(source.source_type, "base64");
+            assert_eq!(source.media_type.as_deref(), Some("image/jpeg"));
+            // Text last
+            assert_eq!(blocks[1].block_type, "text");
+            assert_eq!(blocks[1].text.as_deref(), Some("What is in this image?"));
+        } else {
+            panic!("last user message should be Blocks with attachments");
+        }
+    }
+
+    #[test]
+    fn without_attachments_unchanged() {
+        // Verify that prompts without attachments produce the same output as before
+        let prompt = Prompt::new("Hello");
+        let messages = build_messages(&prompt);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        if let MessageContent::Text(t) = &messages[0].content {
+            assert_eq!(t, "Hello");
+        } else {
+            panic!("expected Text content when no attachments");
+        }
+    }
+
+    #[test]
+    fn build_messages_with_url_attachment() {
+        use llm_core::types::{Attachment, AttachmentSource};
+
+        let prompt = Prompt::new("What is this?")
+            .with_attachments(vec![Attachment {
+                mime_type: Some("image/png".into()),
+                source: AttachmentSource::Url("https://example.com/cat.jpg".into()),
+            }]);
+
+        let messages = build_messages(&prompt);
+        if let MessageContent::Blocks(blocks) = &messages[0].content {
+            assert_eq!(blocks[0].block_type, "image");
+            let source = blocks[0].source.as_ref().unwrap();
+            assert_eq!(source.source_type, "url");
+            assert_eq!(source.url.as_deref(), Some("https://example.com/cat.jpg"));
+            assert_eq!(blocks[1].block_type, "text");
+        } else {
+            panic!("expected Blocks");
+        }
     }
 }

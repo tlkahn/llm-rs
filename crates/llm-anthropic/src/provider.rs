@@ -952,4 +952,68 @@ data: {\"type\":\"message_stop\"}\n\n";
         let tool_calls = llm_core::collect_tool_calls(&chunks);
         assert!(tool_calls.is_empty());
     }
+
+    #[tokio::test]
+    async fn request_includes_image_blocks_for_attachments() {
+        use llm_core::types::{Attachment, AttachmentSource};
+
+        let server = MockServer::start().await;
+
+        let body = serde_json::json!({
+            "id": "msg_img",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [{"type": "text", "text": "I see a cat"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 100, "output_tokens": 5}
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "sk-test"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = make_provider(&server.uri());
+        let prompt = Prompt::new("Describe this image")
+            .with_attachments(vec![Attachment {
+                mime_type: Some("image/png".into()),
+                source: AttachmentSource::Bytes(vec![0x89, 0x50, 0x4e, 0x47]),
+            }]);
+        let stream = provider
+            .execute("claude-sonnet-4-6", &prompt, Some("sk-test"), false)
+            .await
+            .unwrap();
+
+        // Consume the stream
+        let _chunks: Vec<_> = stream.collect::<Vec<_>>().await;
+
+        // Inspect the request that was sent to the server
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let req_body: serde_json::Value =
+            serde_json::from_slice(&received[0].body).unwrap();
+
+        // messages[0].content should be an array (Blocks), not a string
+        let content = &req_body["messages"][0]["content"];
+        assert!(content.is_array(), "content should be array of blocks, got: {content}");
+        let blocks = content.as_array().unwrap();
+
+        // First block: image
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["type"], "base64");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        // Verify base64 data is present and non-empty
+        assert!(!blocks[0]["source"]["data"].as_str().unwrap().is_empty());
+
+        // Second block: text
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "Describe this image");
+    }
 }

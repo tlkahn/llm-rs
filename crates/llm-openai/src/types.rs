@@ -31,11 +31,47 @@ pub struct StreamOptions {
 pub struct Message {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<MessageToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+/// Content can be a plain string or an array of content parts.
+/// Text variant listed first for backward-compatible deserialization:
+/// `"content": "Hello"` deserializes as `Text(String)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    /// Extract text content, returning None for multi-part content.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            MessageContent::Text(s) => Some(s),
+            MessageContent::Parts(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrl {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 // --- Non-streaming response ---
@@ -174,7 +210,7 @@ mod tests {
             model: "gpt-4o-mini".into(),
             messages: vec![Message {
                 role: "user".into(),
-                content: Some("Hello".into()),
+                content: Some(MessageContent::Text("Hello".into())),
                 tool_calls: None,
                 tool_call_id: None,
             }],
@@ -240,7 +276,7 @@ mod tests {
     fn message_system() {
         let msg = Message {
             role: "system".into(),
-            content: Some("You are helpful.".into()),
+            content: Some(MessageContent::Text("You are helpful.".into())),
             tool_calls: None,
             tool_call_id: None,
         };
@@ -273,7 +309,7 @@ mod tests {
         });
         let resp: ChatResponse = serde_json::from_value(json).unwrap();
         assert_eq!(resp.model, "gpt-4o-mini");
-        assert_eq!(resp.choices[0].message.as_ref().unwrap().content.as_deref(), Some("Hello!"));
+        assert_eq!(resp.choices[0].message.as_ref().unwrap().content.as_ref().and_then(|c| c.as_text()), Some("Hello!"));
         assert_eq!(resp.usage.as_ref().unwrap().prompt_tokens, 5);
     }
 
@@ -461,6 +497,82 @@ mod tests {
             tc.function.as_ref().unwrap().arguments.as_deref(),
             Some("{\"location\":")
         );
+    }
+
+    // --- MessageContent tests ---
+
+    #[test]
+    fn message_content_text_serializes_as_string() {
+        let content = MessageContent::Text("Hello".into());
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json, serde_json::json!("Hello"));
+    }
+
+    #[test]
+    fn message_content_parts_serializes_as_array() {
+        let content = MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "Look at this:".into(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/cat.jpg".into(),
+                    detail: Some("high".into()),
+                },
+            },
+        ]);
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json.is_array());
+        assert_eq!(json[0]["type"], "text");
+        assert_eq!(json[0]["text"], "Look at this:");
+        assert_eq!(json[1]["type"], "image_url");
+        assert_eq!(json[1]["image_url"]["url"], "https://example.com/cat.jpg");
+        assert_eq!(json[1]["image_url"]["detail"], "high");
+    }
+
+    #[test]
+    fn message_content_text_deserializes_from_string() {
+        let json = serde_json::json!("Hello");
+        let content: MessageContent = serde_json::from_value(json).unwrap();
+        assert_eq!(content.as_text(), Some("Hello"));
+    }
+
+    #[test]
+    fn message_content_parts_deserializes_from_array() {
+        let json = serde_json::json!([
+            {"type": "text", "text": "Hello"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}
+        ]);
+        let content: MessageContent = serde_json::from_value(json).unwrap();
+        match content {
+            MessageContent::Parts(parts) => {
+                assert_eq!(parts.len(), 2);
+                match &parts[0] {
+                    ContentPart::Text { text } => assert_eq!(text, "Hello"),
+                    _ => panic!("expected Text part"),
+                }
+                match &parts[1] {
+                    ContentPart::ImageUrl { image_url } => {
+                        assert_eq!(image_url.url, "https://example.com/img.png");
+                        assert_eq!(image_url.detail, None);
+                    }
+                    _ => panic!("expected ImageUrl part"),
+                }
+            }
+            _ => panic!("expected Parts variant"),
+        }
+    }
+
+    #[test]
+    fn image_url_detail_none_omitted() {
+        let part = ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "https://example.com/img.png".into(),
+                detail: None,
+            },
+        };
+        let json = serde_json::to_value(&part).unwrap();
+        assert!(json["image_url"].get("detail").is_none());
     }
 
     #[test]

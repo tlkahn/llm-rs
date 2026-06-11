@@ -9,7 +9,7 @@ use crate::messages::build_messages;
 use crate::sse::SseParser;
 use crate::types::{
     ChatRequest, ChatResponse, ChatTool, ChatToolFunction, ErrorResponse, JsonSchemaFormat,
-    ResponseFormat, StreamOptions,
+    MessageContent, ResponseFormat, StreamOptions,
 };
 
 pub struct OpenAiProvider {
@@ -249,7 +249,7 @@ impl Provider for OpenAiProvider {
             if let Some(choice) = resp.choices.first()
                 && let Some(msg) = &choice.message
             {
-                if let Some(content) = &msg.content {
+                if let Some(MessageContent::Text(content)) = &msg.content {
                     chunks.push(Ok(Chunk::Text(content.clone())));
                 }
                 // Handle tool calls in non-streaming response
@@ -803,5 +803,70 @@ data: [DONE]\n\n";
 
         let chunks: Vec<_> = stream.collect::<Vec<_>>().await;
         assert!(chunks.iter().any(|r| matches!(r, Ok(Chunk::Done))));
+    }
+
+    #[tokio::test]
+    async fn request_includes_image_parts_for_attachments() {
+        use llm_core::types::{Attachment, AttachmentSource};
+
+        let server = MockServer::start().await;
+
+        let body = serde_json::json!({
+            "id": "chatcmpl-img",
+            "object": "chat.completion",
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "I see a cat"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105}
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer sk-test"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = make_provider(&server.uri());
+        let prompt = Prompt::new("Describe this image")
+            .with_attachments(vec![Attachment {
+                mime_type: Some("image/png".into()),
+                source: AttachmentSource::Bytes(vec![0x89, 0x50, 0x4e, 0x47]),
+            }]);
+        let stream = provider
+            .execute("gpt-4o-mini", &prompt, Some("sk-test"), false)
+            .await
+            .unwrap();
+
+        // Consume the stream
+        let _chunks: Vec<_> = stream.collect::<Vec<_>>().await;
+
+        // Inspect the request that was sent to the server
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let req_body: serde_json::Value =
+            serde_json::from_slice(&received[0].body).unwrap();
+
+        // messages[0].content should be an array (Parts), not a string
+        let content = &req_body["messages"][0]["content"];
+        assert!(content.is_array(), "content should be array of parts, got: {content}");
+        let parts = content.as_array().unwrap();
+
+        // First part: text (OpenAI convention)
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "Describe this image");
+
+        // Second part: image_url with data URI
+        assert_eq!(parts[1]["type"], "image_url");
+        let url = parts[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"));
+        assert!(url.len() > "data:image/png;base64,".len());
     }
 }

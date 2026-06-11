@@ -28,3 +28,4 @@ clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 temp-env = "0.3"
 fastrand = "2"
+base64 = "0.22"

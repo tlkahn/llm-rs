@@ -74,6 +74,83 @@ pub struct ContentBlock {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
+    // image fields
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ImageSource>,
+}
+
+impl ContentBlock {
+    /// Create an image content block with base64-encoded data.
+    ///
+    /// Produces the Anthropic wire format:
+    /// ```json
+    /// {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}}
+    /// ```
+    #[must_use]
+    pub fn image_base64(media_type: &str, data: &str) -> Self {
+        Self {
+            block_type: "image".into(),
+            text: None,
+            id: None,
+            name: None,
+            input: None,
+            tool_use_id: None,
+            content: None,
+            is_error: None,
+            source: Some(ImageSource {
+                source_type: "base64".into(),
+                media_type: Some(media_type.to_string()),
+                data: Some(data.to_string()),
+                url: None,
+            }),
+        }
+    }
+
+    /// Create an image content block with a URL reference.
+    ///
+    /// Produces the Anthropic wire format:
+    /// ```json
+    /// {"type": "image", "source": {"type": "url", "url": "https://..."}}
+    /// ```
+    #[must_use]
+    pub fn image_url(url: &str) -> Self {
+        Self {
+            block_type: "image".into(),
+            text: None,
+            id: None,
+            name: None,
+            input: None,
+            tool_use_id: None,
+            content: None,
+            is_error: None,
+            source: Some(ImageSource {
+                source_type: "url".into(),
+                media_type: None,
+                data: None,
+                url: Some(url.to_string()),
+            }),
+        }
+    }
+}
+
+/// Image source for Anthropic's image content blocks.
+///
+/// Represents either a base64-encoded image or a URL reference.
+/// See: <https://docs.anthropic.com/en/docs/build-with-claude/vision>
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImageSource {
+    /// "base64" or "url"
+    #[serde(rename = "type")]
+    pub source_type: String,
+    /// MIME type, e.g. "image/png". Required for base64, absent for URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    /// Base64-encoded image data. Present when source_type is "base64".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// Image URL. Present when source_type is "url".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -423,6 +500,7 @@ mod tests {
             tool_use_id: Some("toolu_1".into()),
             content: Some("Sunny, 22C".into()),
             is_error: None,
+            source: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "tool_result");
@@ -446,5 +524,86 @@ mod tests {
         } else {
             panic!("expected ContentBlockStart");
         }
+    }
+
+    // --- Image content block tests ---
+
+    #[test]
+    fn image_block_base64_serializes_correctly() {
+        let block = ContentBlock::image_base64("image/png", "iVBORw0KGgo=");
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "image");
+        assert_eq!(json["source"]["type"], "base64");
+        assert_eq!(json["source"]["media_type"], "image/png");
+        assert_eq!(json["source"]["data"], "iVBORw0KGgo=");
+        // Optional fields should be absent
+        assert!(json["source"].get("url").is_none());
+        assert!(json.get("text").is_none());
+        assert!(json.get("id").is_none());
+        assert!(json.get("name").is_none());
+        assert!(json.get("input").is_none());
+        assert!(json.get("tool_use_id").is_none());
+        assert!(json.get("content").is_none());
+        assert!(json.get("is_error").is_none());
+    }
+
+    #[test]
+    fn image_block_url_serializes_correctly() {
+        let block = ContentBlock::image_url("https://example.com/cat.jpg");
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "image");
+        assert_eq!(json["source"]["type"], "url");
+        assert_eq!(json["source"]["url"], "https://example.com/cat.jpg");
+        // base64-specific fields should be absent
+        assert!(json["source"].get("media_type").is_none());
+        assert!(json["source"].get("data").is_none());
+    }
+
+    #[test]
+    fn image_block_base64_deserializes() {
+        let json = serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": "abc123=="
+            }
+        });
+        let block: ContentBlock = serde_json::from_value(json).unwrap();
+        assert_eq!(block.block_type, "image");
+        let source = block.source.unwrap();
+        assert_eq!(source.source_type, "base64");
+        assert_eq!(source.media_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(source.data.as_deref(), Some("abc123=="));
+        assert_eq!(source.url, None);
+    }
+
+    #[test]
+    fn image_block_url_deserializes() {
+        let json = serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "url",
+                "url": "https://example.com/img.png"
+            }
+        });
+        let block: ContentBlock = serde_json::from_value(json).unwrap();
+        assert_eq!(block.block_type, "image");
+        let source = block.source.unwrap();
+        assert_eq!(source.source_type, "url");
+        assert_eq!(source.url.as_deref(), Some("https://example.com/img.png"));
+        assert_eq!(source.media_type, None);
+        assert_eq!(source.data, None);
+    }
+
+    #[test]
+    fn image_source_absent_when_not_image_block() {
+        let json = serde_json::json!({
+            "type": "text",
+            "text": "Hello"
+        });
+        let block: ContentBlock = serde_json::from_value(json).unwrap();
+        assert_eq!(block.block_type, "text");
+        assert!(block.source.is_none());
     }
 }

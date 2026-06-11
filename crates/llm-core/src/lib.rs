@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod attachment;
 pub mod chain;
 pub mod config;
 pub mod error;
@@ -15,6 +16,7 @@ pub use agent::{
     resolve_agent_budget, resolve_agent_model, resolve_agent_retry, resolve_agent_system,
     resolve_agent_tools,
 };
+pub use attachment::{ResolvedAttachment, resolve_to_base64};
 pub use chain::{ChainEvent, ChainResult, ParallelConfig, ToolExecutor, chain};
 pub use config::{Config, KeyStore, Paths, parse_option_value, resolve_key};
 pub use error::{LlmError, Result};

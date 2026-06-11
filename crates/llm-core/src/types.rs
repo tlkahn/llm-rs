@@ -788,4 +788,11 @@ mod tests {
         let empty = Usage::default();
         assert_eq!(empty.total(), 0);
     }
+
+    #[test]
+    fn base64_dependency_available() {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"hello");
+        assert_eq!(encoded, "aGVsbG8=");
+    }
 }
