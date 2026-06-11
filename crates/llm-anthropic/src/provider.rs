@@ -91,6 +91,28 @@ impl Provider for AnthropicProvider {
             )
         })?;
 
+        // Pre-resolve Path attachments off the async runtime.
+        // resolve_prompt_paths returns Cow::Borrowed when no Path attachments
+        // exist, so this is zero-cost on the common path.
+        #[cfg(not(target_arch = "wasm32"))]
+        let resolved_prompt;
+        #[cfg(not(target_arch = "wasm32"))]
+        let prompt = if prompt.attachments.iter().any(|a| {
+            matches!(a.source, llm_core::types::AttachmentSource::Path(_))
+        }) {
+            let prompt_clone = prompt.clone();
+            resolved_prompt = tokio::task::spawn_blocking(move || {
+                llm_core::resolve_prompt_paths(&prompt_clone)
+                    .map(|cow| cow.into_owned())
+            })
+            .await
+            .map_err(|e| LlmError::Provider(format!("spawn_blocking join error: {e}")))?
+            ?;
+            &resolved_prompt
+        } else {
+            prompt
+        };
+
         let messages = build_messages(prompt)?;
 
         let system = prompt
@@ -1042,5 +1064,96 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Second block: text
         assert_eq!(blocks[1]["type"], "text");
         assert_eq!(blocks[1]["text"], "Describe this image");
+    }
+
+    // --- Path attachment tests (spawn_blocking pre-resolution) ---
+
+    #[tokio::test]
+    async fn path_attachment_resolves_through_execute() {
+        use llm_core::types::{Attachment, AttachmentSource};
+        use std::io::Write;
+
+        let server = MockServer::start().await;
+
+        let body = serde_json::json!({
+            "id": "msg_path",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [{"type": "text", "text": "I see the image"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 100, "output_tokens": 5}
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "sk-test"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&body),
+            )
+            .mount(&server)
+            .await;
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let content = b"fake png data for path test";
+        tmp.write_all(content).unwrap();
+        tmp.flush().unwrap();
+
+        let provider = make_provider(&server.uri());
+        let prompt = Prompt::new("Describe this image")
+            .with_attachments(vec![Attachment {
+                mime_type: Some("image/png".into()),
+                source: AttachmentSource::Path(tmp.path().to_path_buf()),
+            }]);
+        let stream = provider
+            .execute("claude-sonnet-4-6", &prompt, Some("sk-test"), false)
+            .await
+            .unwrap();
+
+        let chunks: Vec<_> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let text = llm_core::collect_text(&chunks);
+        assert_eq!(text, "I see the image");
+
+        // Verify the request body contains base64 data, not a file path
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let req_body: serde_json::Value =
+            serde_json::from_slice(&received[0].body).unwrap();
+        let content = &req_body["messages"][0]["content"];
+        assert!(content.is_array());
+        let blocks = content.as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["type"], "base64");
+        assert!(!blocks[0]["source"]["data"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn path_attachment_missing_file_returns_io_error() {
+        use llm_core::types::{Attachment, AttachmentSource};
+
+        let server = MockServer::start().await;
+        // No mock mounted -- request should never reach the server
+
+        let provider = make_provider(&server.uri());
+        let prompt = Prompt::new("Describe")
+            .with_attachments(vec![Attachment {
+                mime_type: Some("image/png".into()),
+                source: AttachmentSource::Path("/nonexistent/image.png".into()),
+            }]);
+        let result = provider
+            .execute("claude-sonnet-4-6", &prompt, Some("sk-test"), false)
+            .await;
+        assert!(matches!(result, Err(LlmError::Io(_))));
+
+        // Verify no request was sent
+        let received = server.received_requests().await.unwrap();
+        assert!(received.is_empty());
     }
 }

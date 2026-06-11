@@ -92,6 +92,28 @@ impl Provider for OpenAiProvider {
             )
         })?;
 
+        // Pre-resolve Path attachments off the async runtime.
+        // resolve_prompt_paths returns Cow::Borrowed when no Path attachments
+        // exist, so this is zero-cost on the common path.
+        #[cfg(not(target_arch = "wasm32"))]
+        let resolved_prompt;
+        #[cfg(not(target_arch = "wasm32"))]
+        let prompt = if prompt.attachments.iter().any(|a| {
+            matches!(a.source, llm_core::types::AttachmentSource::Path(_))
+        }) {
+            let prompt_clone = prompt.clone();
+            resolved_prompt = tokio::task::spawn_blocking(move || {
+                llm_core::resolve_prompt_paths(&prompt_clone)
+                    .map(|cow| cow.into_owned())
+            })
+            .await
+            .map_err(|e| LlmError::Provider(format!("spawn_blocking join error: {e}")))?
+            ?;
+            &resolved_prompt
+        } else {
+            prompt
+        };
+
         let messages = build_messages(prompt)?;
 
         // Convert llm_core::Tool -> ChatTool
@@ -953,5 +975,98 @@ data: [DONE]\n\n";
         let url = parts[1]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/png;base64,"));
         assert!(url.len() > "data:image/png;base64,".len());
+    }
+
+    // --- Path attachment tests (spawn_blocking pre-resolution) ---
+
+    #[tokio::test]
+    async fn path_attachment_resolves_through_execute() {
+        use llm_core::types::{Attachment, AttachmentSource};
+        use std::io::Write;
+
+        let server = MockServer::start().await;
+
+        let body = serde_json::json!({
+            "id": "chatcmpl-path",
+            "object": "chat.completion",
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "I see the image"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105}
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer sk-test"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&body),
+            )
+            .mount(&server)
+            .await;
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let content = b"fake png data for path test";
+        tmp.write_all(content).unwrap();
+        tmp.flush().unwrap();
+
+        let provider = make_provider(&server.uri());
+        let prompt = Prompt::new("Describe this image")
+            .with_attachments(vec![Attachment {
+                mime_type: Some("image/png".into()),
+                source: AttachmentSource::Path(tmp.path().to_path_buf()),
+            }]);
+        let stream = provider
+            .execute("gpt-4o-mini", &prompt, Some("sk-test"), false)
+            .await
+            .unwrap();
+
+        let chunks: Vec<_> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let text = llm_core::collect_text(&chunks);
+        assert_eq!(text, "I see the image");
+
+        // Verify the request body contains data URI, not a file path
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let req_body: serde_json::Value =
+            serde_json::from_slice(&received[0].body).unwrap();
+        let parts = req_body["messages"][0]["content"].as_array().unwrap();
+        // Text part first, then image
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        let url = parts[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
+    async fn path_attachment_missing_file_returns_io_error() {
+        use llm_core::types::{Attachment, AttachmentSource};
+
+        let server = MockServer::start().await;
+        // No mock mounted -- request should never reach the server
+
+        let provider = make_provider(&server.uri());
+        let prompt = Prompt::new("Describe")
+            .with_attachments(vec![Attachment {
+                mime_type: Some("image/png".into()),
+                source: AttachmentSource::Path("/nonexistent/image.png".into()),
+            }]);
+        let result = provider
+            .execute("gpt-4o-mini", &prompt, Some("sk-test"), false)
+            .await;
+        assert!(matches!(result, Err(LlmError::Io(_))));
+
+        // Verify no request was sent
+        let received = server.received_requests().await.unwrap();
+        assert!(received.is_empty());
     }
 }
