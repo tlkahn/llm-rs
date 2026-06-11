@@ -40,6 +40,8 @@ impl Provider for RetryProvider<'_> {
         key: Option<&str>,
         stream: bool,
     ) -> Result<ResponseStream> {
+        let resolved = llm_core::resolve_prompt_paths(prompt)?;
+        let prompt = resolved.as_ref();
         let mut last_err = None;
         for attempt in 0..=self.config.max_retries {
             match self.inner.execute(model, prompt, key, stream).await {

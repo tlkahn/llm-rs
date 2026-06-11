@@ -53,7 +53,22 @@ impl ModelInfo {
             attachment_types: Vec::new(),
         }
     }
+
+    /// Returns `true` if this model's `attachment_types` includes the given MIME type.
+    #[must_use]
+    pub fn supports_mime(&self, mime: &str) -> bool {
+        self.attachment_types.iter().any(|t| t == mime)
+    }
 }
+
+/// Conservative image MIME types supported by major vision-capable LLM providers.
+/// Used as the default attachment type list for models known to support vision.
+pub const DEFAULT_IMAGE_MIME_TYPES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AttachmentSource {
@@ -787,6 +802,45 @@ mod tests {
 
         let empty = Usage::default();
         assert_eq!(empty.total(), 0);
+    }
+
+    #[test]
+    fn default_image_mime_types_contains_four_types() {
+        assert_eq!(DEFAULT_IMAGE_MIME_TYPES.len(), 4);
+        assert!(DEFAULT_IMAGE_MIME_TYPES.contains(&"image/png"));
+        assert!(DEFAULT_IMAGE_MIME_TYPES.contains(&"image/jpeg"));
+        assert!(DEFAULT_IMAGE_MIME_TYPES.contains(&"image/webp"));
+        assert!(DEFAULT_IMAGE_MIME_TYPES.contains(&"image/gif"));
+    }
+
+    #[test]
+    fn model_info_supports_mime_positive() {
+        let info = ModelInfo {
+            id: "test".into(),
+            can_stream: true,
+            supports_tools: false,
+            supports_schema: false,
+            attachment_types: vec!["image/png".into()],
+        };
+        assert!(info.supports_mime("image/png"));
+    }
+
+    #[test]
+    fn model_info_supports_mime_negative() {
+        let info = ModelInfo {
+            id: "test".into(),
+            can_stream: true,
+            supports_tools: false,
+            supports_schema: false,
+            attachment_types: vec!["image/png".into()],
+        };
+        assert!(!info.supports_mime("audio/mp3"));
+    }
+
+    #[test]
+    fn model_info_supports_mime_empty() {
+        let info = ModelInfo::new("x");
+        assert!(!info.supports_mime("image/png"));
     }
 
     #[test]

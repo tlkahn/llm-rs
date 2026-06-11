@@ -18,6 +18,13 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// MIME types to accept for unknown models on this provider.
+    /// Override to return `DEFAULT_IMAGE_MIME_TYPES` (or similar) for providers
+    /// known to host vision-capable models.
+    fn default_attachment_types(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     async fn execute(
         &self,
         model: &str,
@@ -39,6 +46,13 @@ pub trait Provider {
 
     fn key_env_var(&self) -> Option<&str> {
         None
+    }
+
+    /// MIME types to accept for unknown models on this provider.
+    /// Override to return `DEFAULT_IMAGE_MIME_TYPES` (or similar) for providers
+    /// known to host vision-capable models.
+    fn default_attachment_types(&self) -> &'static [&'static str] {
+        &[]
     }
 
     async fn execute(
@@ -188,6 +202,12 @@ mod tests {
         } else {
             panic!("expected Text chunk");
         }
+    }
+
+    #[test]
+    fn default_attachment_types_returns_empty_by_default() {
+        let p = MockProvider;
+        assert!(p.default_attachment_types().is_empty());
     }
 
     #[tokio::test]

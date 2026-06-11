@@ -35,13 +35,15 @@ impl Provider for AnthropicProvider {
         "anthropic"
     }
 
+    fn default_attachment_types(&self) -> &'static [&'static str] {
+        llm_core::types::DEFAULT_IMAGE_MIME_TYPES
+    }
+
     fn models(&self) -> Vec<ModelInfo> {
-        let image_types = vec![
-            "image/png".into(),
-            "image/jpeg".into(),
-            "image/webp".into(),
-            "image/gif".into(),
-        ];
+        let image_types: Vec<String> = llm_core::types::DEFAULT_IMAGE_MIME_TYPES
+            .iter()
+            .map(|s| (*s).into())
+            .collect();
         vec![
             ModelInfo {
                 id: "claude-opus-4-6".into(),
@@ -89,7 +91,7 @@ impl Provider for AnthropicProvider {
             )
         })?;
 
-        let messages = build_messages(prompt);
+        let messages = build_messages(prompt)?;
 
         let system = prompt
             .system
@@ -368,6 +370,31 @@ mod tests {
             assert!(model.can_stream);
             assert!(model.supports_tools);
             assert!(model.supports_schema);
+        }
+    }
+
+    #[test]
+    fn provider_default_attachment_types_returns_image_mimes() {
+        let p = make_provider("http://unused");
+        assert_eq!(
+            p.default_attachment_types(),
+            llm_core::types::DEFAULT_IMAGE_MIME_TYPES
+        );
+    }
+
+    #[test]
+    fn provider_models_use_default_image_mime_types() {
+        let p = make_provider("http://unused");
+        let expected: Vec<String> = llm_core::types::DEFAULT_IMAGE_MIME_TYPES
+            .iter()
+            .map(|s| (*s).into())
+            .collect();
+        for model in p.models() {
+            assert_eq!(
+                model.attachment_types, expected,
+                "model {} should use DEFAULT_IMAGE_MIME_TYPES",
+                model.id
+            );
         }
     }
 
@@ -676,7 +703,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         // Verify the request was made (mock expectation passes)
         // The system prompt should be in the top-level field, not in messages.
         // We verify by checking build_messages only produces user messages.
-        let messages = build_messages(&prompt);
+        let messages = build_messages(&prompt).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
     }

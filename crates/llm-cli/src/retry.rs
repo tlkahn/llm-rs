@@ -41,6 +41,8 @@ impl Provider for RetryProvider<'_> {
         key: Option<&str>,
         stream: bool,
     ) -> Result<ResponseStream> {
+        let resolved = llm_core::resolve_prompt_paths(prompt)?;
+        let prompt = resolved.as_ref();
         let mut last_err = None;
         for attempt in 0..=self.config.max_retries {
             match self.inner.execute(model, prompt, key, stream).await {
@@ -245,6 +247,74 @@ mod tests {
         let result = retry.execute("mock-model", &prompt, None, false).await;
         assert!(result.is_err());
         assert_eq!(inner.call_count(), 1); // immediate failure, no retries
+    }
+
+    #[tokio::test]
+    async fn retry_resolves_path_attachments_before_inner_call() {
+        use llm_core::types::{Attachment, AttachmentSource};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        /// Mock that asserts no Path attachments reach it, fails once to test retry.
+        struct PathChecker {
+            calls: AtomicU32,
+        }
+
+        #[async_trait]
+        impl Provider for PathChecker {
+            fn id(&self) -> &str {
+                "mock"
+            }
+            fn models(&self) -> Vec<ModelInfo> {
+                vec![ModelInfo::new("m")]
+            }
+
+            async fn execute(
+                &self,
+                _model: &str,
+                prompt: &Prompt,
+                _key: Option<&str>,
+                _stream: bool,
+            ) -> Result<ResponseStream> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                // Assert: no Path sources should reach the inner provider
+                for att in &prompt.attachments {
+                    assert!(
+                        !matches!(att.source, AttachmentSource::Path(_)),
+                        "inner provider received unresolved Path attachment on attempt {}",
+                        n + 1
+                    );
+                }
+                if n == 0 {
+                    Err(LlmError::HttpError {
+                        status: 429,
+                        message: "rate limited".into(),
+                    })
+                } else {
+                    Ok(Box::pin(futures::stream::iter(vec![
+                        Ok(Chunk::Text("ok".into())),
+                        Ok(Chunk::Done),
+                    ])))
+                }
+            }
+        }
+
+        // Write a temp file
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, b"image bytes").unwrap();
+        std::io::Write::flush(&mut tmp).unwrap();
+
+        let prompt = Prompt::new("describe").with_attachments(vec![Attachment {
+            mime_type: Some("image/png".into()),
+            source: AttachmentSource::Path(tmp.path().to_path_buf()),
+        }]);
+
+        let inner = PathChecker {
+            calls: AtomicU32::new(0),
+        };
+        let retry = RetryProvider::new(&inner, no_jitter_config(1));
+        let result = retry.execute("m", &prompt, None, false).await;
+        assert!(result.is_ok());
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 2); // 1 fail + 1 success
     }
 
     #[test]

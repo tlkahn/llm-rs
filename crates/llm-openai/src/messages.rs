@@ -1,9 +1,9 @@
 use crate::types::{ContentPart, ImageUrl, Message, MessageContent, MessageToolCall, MessageToolCallFunction};
-use llm_core::resolve_to_base64;
-use llm_core::types::{Attachment, AttachmentSource};
+use llm_core::attachment::{ResolvedImageBlock, resolve_attachments};
+use llm_core::types::Attachment;
 use llm_core::Prompt;
 
-pub fn build_messages(prompt: &Prompt) -> Vec<Message> {
+pub fn build_messages(prompt: &Prompt) -> llm_core::Result<Vec<Message>> {
     if prompt.messages.is_empty() {
         build_single_turn(prompt)
     } else {
@@ -11,16 +11,41 @@ pub fn build_messages(prompt: &Prompt) -> Vec<Message> {
     }
 }
 
+/// Map resolved image blocks to OpenAI `ContentPart`s.
+fn resolved_to_parts(resolved: Vec<ResolvedImageBlock>) -> Vec<ContentPart> {
+    resolved
+        .into_iter()
+        .map(|r| match r {
+            ResolvedImageBlock::Base64 { media_type, base64_data } => {
+                let data_uri = format!("data:{media_type};base64,{base64_data}");
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: data_uri,
+                        detail: None,
+                    },
+                }
+            }
+            ResolvedImageBlock::Url { url } => ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url,
+                    detail: None,
+                },
+            },
+        })
+        .collect()
+}
+
 /// Build a `MessageContent` for a user message, incorporating image attachments.
 ///
 /// When attachments are present, produces `Parts` with the text part FIRST, then
 /// image parts (OpenAI convention: text first, images after).
 /// When attachments are empty, produces `Text(text)`.
-fn build_user_content(text: &str, attachments: &[Attachment]) -> MessageContent {
+fn build_user_content(text: &str, attachments: &[Attachment]) -> llm_core::Result<MessageContent> {
     if attachments.is_empty() {
-        return MessageContent::Text(text.to_string());
+        return Ok(MessageContent::Text(text.to_string()));
     }
 
+    let resolved = resolve_attachments(attachments)?;
     let mut parts: Vec<ContentPart> = Vec::new();
 
     // Text part first (OpenAI convention)
@@ -29,39 +54,19 @@ fn build_user_content(text: &str, attachments: &[Attachment]) -> MessageContent 
     }
 
     // Image parts after text
-    for att in attachments {
-        match &att.source {
-            AttachmentSource::Url(url) => {
-                parts.push(ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: url.clone(),
-                        detail: None,
-                    },
-                });
-            }
-            _ => {
-                // Path or Bytes: resolve to base64 data URI
-                if let Ok(resolved) = resolve_to_base64(att) {
-                    let data_uri = format!(
-                        "data:{};base64,{}",
-                        resolved.media_type, resolved.base64_data
-                    );
-                    parts.push(ContentPart::ImageUrl {
-                        image_url: ImageUrl {
-                            url: data_uri,
-                            detail: None,
-                        },
-                    });
-                }
-                // If resolution fails (e.g. missing file), silently skip.
-            }
-        }
+    parts.extend(resolved_to_parts(resolved));
+
+    // Guard: OpenAI rejects an empty content array with 400.
+    if parts.is_empty() {
+        return Err(llm_core::LlmError::Provider(
+            "empty content: no text and no image parts were produced from attachments".into(),
+        ));
     }
 
-    MessageContent::Parts(parts)
+    Ok(MessageContent::Parts(parts))
 }
 
-fn build_single_turn(prompt: &Prompt) -> Vec<Message> {
+fn build_single_turn(prompt: &Prompt) -> llm_core::Result<Vec<Message>> {
     let mut messages = Vec::new();
 
     if let Some(system) = &prompt.system
@@ -75,7 +80,7 @@ fn build_single_turn(prompt: &Prompt) -> Vec<Message> {
         });
     }
 
-    let user_content = build_user_content(&prompt.text, &prompt.attachments);
+    let user_content = build_user_content(&prompt.text, &prompt.attachments)?;
     messages.push(Message {
         role: "user".into(),
         content: Some(user_content),
@@ -88,10 +93,10 @@ fn build_single_turn(prompt: &Prompt) -> Vec<Message> {
         append_tool_exchange(&mut messages, &prompt.tool_calls, &prompt.tool_results);
     }
 
-    messages
+    Ok(messages)
 }
 
-fn build_from_conversation(prompt: &Prompt) -> Vec<Message> {
+fn build_from_conversation(prompt: &Prompt) -> llm_core::Result<Vec<Message>> {
     let mut messages = Vec::new();
 
     // System prompt as first message
@@ -153,10 +158,10 @@ fn build_from_conversation(prompt: &Prompt) -> Vec<Message> {
 
     // Inject attachments into the last user message
     if !prompt.attachments.is_empty() {
-        inject_attachments_into_last_user_message(&mut messages, &prompt.attachments);
+        inject_attachments_into_last_user_message(&mut messages, &prompt.attachments)?;
     }
 
-    messages
+    Ok(messages)
 }
 
 /// Inject image attachments into the last user-role message in the conversation.
@@ -166,65 +171,49 @@ fn build_from_conversation(prompt: &Prompt) -> Vec<Message> {
 fn inject_attachments_into_last_user_message(
     messages: &mut [Message],
     attachments: &[Attachment],
-) {
+) -> llm_core::Result<()> {
     let last_user = messages
         .iter_mut()
         .rev()
         .find(|m| m.role == "user");
 
-    let Some(msg) = last_user else { return };
+    let Some(msg) = last_user else { return Ok(()) };
 
-    let mut image_parts: Vec<ContentPart> = Vec::new();
-    for att in attachments {
-        match &att.source {
-            AttachmentSource::Url(url) => {
-                image_parts.push(ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: url.clone(),
-                        detail: None,
-                    },
-                });
-            }
-            _ => {
-                if let Ok(resolved) = resolve_to_base64(att) {
-                    let data_uri = format!(
-                        "data:{};base64,{}",
-                        resolved.media_type, resolved.base64_data
-                    );
-                    image_parts.push(ContentPart::ImageUrl {
-                        image_url: ImageUrl {
-                            url: data_uri,
-                            detail: None,
-                        },
-                    });
-                }
-            }
-        }
-    }
+    let resolved = resolve_attachments(attachments)?;
+    let image_parts = resolved_to_parts(resolved);
 
     if image_parts.is_empty() {
-        return;
+        return Ok(());
     }
 
-    match &msg.content {
+    // Move existing content out to avoid cloning large payloads.
+    match msg.content.take() {
         Some(MessageContent::Text(text)) => {
             let mut parts = Vec::new();
             // Text first (OpenAI convention)
             if !text.is_empty() {
-                parts.push(ContentPart::Text { text: text.clone() });
+                parts.push(ContentPart::Text { text });
             }
             parts.extend(image_parts);
+            // Guard: OpenAI rejects an empty content array with 400.
+            if parts.is_empty() {
+                return Err(llm_core::LlmError::Provider(
+                    "empty content: no text and no image parts were produced from attachments"
+                        .into(),
+                ));
+            }
             msg.content = Some(MessageContent::Parts(parts));
         }
-        Some(MessageContent::Parts(existing)) => {
-            let mut parts = existing.clone();
-            parts.extend(image_parts);
-            msg.content = Some(MessageContent::Parts(parts));
+        Some(MessageContent::Parts(mut existing)) => {
+            existing.extend(image_parts);
+            msg.content = Some(MessageContent::Parts(existing));
         }
         None => {
             msg.content = Some(MessageContent::Parts(image_parts));
         }
     }
+
+    Ok(())
 }
 
 fn map_tool_calls(calls: &[llm_core::ToolCall]) -> Vec<MessageToolCall> {
@@ -270,7 +259,7 @@ mod tests {
     #[test]
     fn build_messages_user_only() {
         let prompt = Prompt::new("Hello");
-        let messages = build_messages(&prompt);
+        let messages = build_messages(&prompt).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content.as_ref().and_then(|c| c.as_text()), Some("Hello"));
@@ -279,7 +268,7 @@ mod tests {
     #[test]
     fn build_messages_with_system() {
         let prompt = Prompt::new("Hello").with_system("Be brief.");
-        let messages = build_messages(&prompt);
+        let messages = build_messages(&prompt).unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[0].content.as_ref().and_then(|c| c.as_text()), Some("Be brief."));
@@ -290,7 +279,7 @@ mod tests {
     #[test]
     fn build_messages_empty_system_is_skipped() {
         let prompt = Prompt::new("Hello").with_system("");
-        let messages = build_messages(&prompt);
+        let messages = build_messages(&prompt).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
     }
@@ -312,7 +301,7 @@ mod tests {
                 error: None,
             }]);
 
-        let messages = build_messages(&prompt);
+        let messages = build_messages(&prompt).unwrap();
         // system(0) + user(1) + assistant(2) + tool(3) = 3 messages (no system)
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role, "user");
@@ -329,7 +318,7 @@ mod tests {
     #[test]
     fn build_messages_without_tool_results_unchanged() {
         let prompt = Prompt::new("Hello");
-        let messages = build_messages(&prompt);
+        let messages = build_messages(&prompt).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
     }
@@ -346,7 +335,7 @@ mod tests {
                 CoreMessage::user("How are you?"),
             ]);
 
-        let messages = build_messages(&prompt);
+        let messages = build_messages(&prompt).unwrap();
         assert_eq!(messages.len(), 4); // system + 3 conversation
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].role, "user");
@@ -382,7 +371,7 @@ mod tests {
                 CoreMessage::user("Thanks!"),
             ]);
 
-        let messages = build_messages(&prompt);
+        let messages = build_messages(&prompt).unwrap();
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[1].role, "assistant");
@@ -405,7 +394,7 @@ mod tests {
                 source: AttachmentSource::Bytes(vec![0x89, 0x50, 0x4e, 0x47]),
             }]);
 
-        let messages = build_messages(&prompt);
+        let messages = build_messages(&prompt).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
 
@@ -447,7 +436,7 @@ mod tests {
                 source: AttachmentSource::Bytes(vec![0xFF, 0xD8, 0xFF]),
             }]);
 
-        let messages = build_messages(&prompt);
+        let messages = build_messages(&prompt).unwrap();
         assert_eq!(messages.len(), 3);
 
         // First two messages unchanged
@@ -479,10 +468,147 @@ mod tests {
     #[test]
     fn without_attachments_unchanged() {
         let prompt = Prompt::new("Hello");
-        let messages = build_messages(&prompt);
+        let messages = build_messages(&prompt).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content.as_ref().and_then(|c| c.as_text()), Some("Hello"));
+    }
+
+    #[test]
+    fn build_messages_path_attachment_not_found_returns_error() {
+        use llm_core::types::{Attachment, AttachmentSource};
+
+        // Single-turn: nonexistent path should error
+        let prompt = Prompt::new("Describe this image")
+            .with_attachments(vec![Attachment {
+                mime_type: Some("image/png".into()),
+                source: AttachmentSource::Path("/nonexistent/image.png".into()),
+            }]);
+
+        let result = build_messages(&prompt);
+        assert!(result.is_err(), "expected Err for nonexistent path attachment (single-turn)");
+        assert!(matches!(result.unwrap_err(), llm_core::LlmError::Io(_)));
+    }
+
+    #[test]
+    fn build_messages_multi_turn_bad_path_attachment_returns_error() {
+        use llm_core::types::{Attachment, AttachmentSource};
+        use llm_core::Message as CoreMessage;
+
+        let prompt = Prompt::new("")
+            .with_messages(vec![
+                CoreMessage::user("Hello"),
+                CoreMessage::assistant("Hi!"),
+                CoreMessage::user("What is this?"),
+            ])
+            .with_attachments(vec![Attachment {
+                mime_type: Some("image/png".into()),
+                source: AttachmentSource::Path("/nonexistent/image.png".into()),
+            }]);
+
+        let result = build_messages(&prompt);
+        assert!(result.is_err(), "expected Err for nonexistent path attachment (multi-turn)");
+        assert!(matches!(result.unwrap_err(), llm_core::LlmError::Io(_)));
+    }
+
+    #[test]
+    fn build_messages_mixed_url_and_bad_path_returns_error() {
+        use llm_core::types::{Attachment, AttachmentSource};
+
+        let prompt = Prompt::new("Describe")
+            .with_attachments(vec![
+                Attachment {
+                    mime_type: Some("image/png".into()),
+                    source: AttachmentSource::Url("https://example.com/cat.jpg".into()),
+                },
+                Attachment {
+                    mime_type: Some("image/png".into()),
+                    source: AttachmentSource::Path("/nonexistent/bad.png".into()),
+                },
+            ]);
+
+        let result = build_messages(&prompt);
+        assert!(result.is_err(), "one bad path should fail the whole request");
+    }
+
+    #[test]
+    fn empty_text_with_valid_attachment_produces_image_only_parts() {
+        use llm_core::types::{Attachment, AttachmentSource};
+
+        let prompt = Prompt::new("")
+            .with_attachments(vec![Attachment {
+                mime_type: Some("image/png".into()),
+                source: AttachmentSource::Bytes(vec![0x89, 0x50, 0x4e, 0x47]),
+            }]);
+
+        let messages = build_messages(&prompt).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+
+        // Should be Parts with only an ImageUrl part (no Text part since text is empty)
+        match &messages[0].content {
+            Some(MessageContent::Parts(parts)) => {
+                assert_eq!(parts.len(), 1, "expected exactly 1 image part, no text part");
+                match &parts[0] {
+                    ContentPart::ImageUrl { image_url } => {
+                        assert!(image_url.url.starts_with("data:image/png;base64,"));
+                    }
+                    _ => panic!("expected ImageUrl part"),
+                }
+            }
+            _ => panic!("expected Parts content when attachments present"),
+        }
+    }
+
+    #[test]
+    fn empty_text_no_attachments_produces_text_not_parts() {
+        let prompt = Prompt::new("");
+        let messages = build_messages(&prompt).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+
+        // Should be Text(""), NOT Parts([])
+        match &messages[0].content {
+            Some(MessageContent::Text(t)) => {
+                assert_eq!(t, "");
+            }
+            _ => panic!("expected Text content for empty text with no attachments, not Parts"),
+        }
+    }
+
+    #[test]
+    fn inject_empty_text_with_attachments_multi_turn() {
+        use llm_core::types::{Attachment, AttachmentSource};
+        use llm_core::Message as CoreMessage;
+
+        let prompt = Prompt::new("")
+            .with_messages(vec![
+                CoreMessage::user("Hello"),
+                CoreMessage::assistant("Hi!"),
+                CoreMessage::user(""),
+            ])
+            .with_attachments(vec![Attachment {
+                mime_type: Some("image/jpeg".into()),
+                source: AttachmentSource::Bytes(vec![0xFF, 0xD8, 0xFF]),
+            }]);
+
+        let messages = build_messages(&prompt).unwrap();
+        assert_eq!(messages.len(), 3);
+
+        // Last user message should have image part only, no text part
+        assert_eq!(messages[2].role, "user");
+        match &messages[2].content {
+            Some(MessageContent::Parts(parts)) => {
+                assert_eq!(parts.len(), 1, "expected 1 image part, no text part for empty text");
+                match &parts[0] {
+                    ContentPart::ImageUrl { image_url } => {
+                        assert!(image_url.url.starts_with("data:image/jpeg;base64,"));
+                    }
+                    _ => panic!("expected ImageUrl part"),
+                }
+            }
+            _ => panic!("expected Parts content on last user message after injection"),
+        }
     }
 
     #[test]
@@ -495,7 +621,7 @@ mod tests {
                 source: AttachmentSource::Url("https://example.com/cat.jpg".into()),
             }]);
 
-        let messages = build_messages(&prompt);
+        let messages = build_messages(&prompt).unwrap();
         match &messages[0].content {
             Some(MessageContent::Parts(parts)) => {
                 // Text first

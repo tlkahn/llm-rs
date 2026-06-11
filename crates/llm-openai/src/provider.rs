@@ -9,7 +9,7 @@ use crate::messages::build_messages;
 use crate::sse::SseParser;
 use crate::types::{
     ChatRequest, ChatResponse, ChatTool, ChatToolFunction, ErrorResponse, JsonSchemaFormat,
-    MessageContent, ResponseFormat, StreamOptions,
+    ResponseFormat, StreamOptions,
 };
 
 pub struct OpenAiProvider {
@@ -43,21 +43,29 @@ impl Provider for OpenAiProvider {
         "openai"
     }
 
+    fn default_attachment_types(&self) -> &'static [&'static str] {
+        llm_core::types::DEFAULT_IMAGE_MIME_TYPES
+    }
+
     fn models(&self) -> Vec<ModelInfo> {
+        let image_types: Vec<String> = llm_core::types::DEFAULT_IMAGE_MIME_TYPES
+            .iter()
+            .map(|s| (*s).into())
+            .collect();
         vec![
             ModelInfo {
                 id: "gpt-4o".into(),
                 can_stream: true,
                 supports_tools: true,
                 supports_schema: true,
-                attachment_types: vec!["image/png".into(), "image/jpeg".into(), "image/webp".into(), "image/gif".into()],
+                attachment_types: image_types.clone(),
             },
             ModelInfo {
                 id: "gpt-4o-mini".into(),
                 can_stream: true,
                 supports_tools: true,
                 supports_schema: true,
-                attachment_types: vec!["image/png".into(), "image/jpeg".into(), "image/webp".into(), "image/gif".into()],
+                attachment_types: image_types,
             },
         ]
     }
@@ -84,7 +92,7 @@ impl Provider for OpenAiProvider {
             )
         })?;
 
-        let messages = build_messages(prompt);
+        let messages = build_messages(prompt)?;
 
         // Convert llm_core::Tool -> ChatTool
         let tools = if prompt.tools.is_empty() {
@@ -249,8 +257,11 @@ impl Provider for OpenAiProvider {
             if let Some(choice) = resp.choices.first()
                 && let Some(msg) = &choice.message
             {
-                if let Some(MessageContent::Text(content)) = &msg.content {
-                    chunks.push(Ok(Chunk::Text(content.clone())));
+                if let Some(content) = &msg.content {
+                    let text = content.text_content();
+                    if !text.is_empty() {
+                        chunks.push(Ok(Chunk::Text(text)));
+                    }
                 }
                 // Handle tool calls in non-streaming response
                 if let Some(tool_calls) = &msg.tool_calls {
@@ -308,6 +319,31 @@ mod tests {
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"gpt-4o"));
         assert!(ids.contains(&"gpt-4o-mini"));
+    }
+
+    #[test]
+    fn provider_default_attachment_types_returns_image_mimes() {
+        let p = make_provider("http://unused");
+        assert_eq!(
+            p.default_attachment_types(),
+            llm_core::types::DEFAULT_IMAGE_MIME_TYPES
+        );
+    }
+
+    #[test]
+    fn provider_models_use_default_image_mime_types() {
+        let p = make_provider("http://unused");
+        let expected: Vec<String> = llm_core::types::DEFAULT_IMAGE_MIME_TYPES
+            .iter()
+            .map(|s| (*s).into())
+            .collect();
+        for model in p.models() {
+            assert_eq!(
+                model.attachment_types, expected,
+                "model {} should use DEFAULT_IMAGE_MIME_TYPES",
+                model.id
+            );
+        }
     }
 
     #[test]
@@ -803,6 +839,55 @@ data: [DONE]\n\n";
 
         let chunks: Vec<_> = stream.collect::<Vec<_>>().await;
         assert!(chunks.iter().any(|r| matches!(r, Ok(Chunk::Done))));
+    }
+
+    #[tokio::test]
+    async fn non_streaming_response_with_array_content() {
+        let server = MockServer::start().await;
+
+        // Simulate an OpenAI-compatible gateway that returns content as an array
+        let body = serde_json::json!({
+            "id": "chatcmpl-arr",
+            "object": "chat.completion",
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Hello from array"}]
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = make_provider(&server.uri());
+        let prompt = Prompt::new("Hi");
+        let stream = provider
+            .execute("gpt-4o-mini", &prompt, Some("sk-test"), false)
+            .await
+            .unwrap();
+
+        let chunks: Vec<_> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let text = llm_core::collect_text(&chunks);
+        assert_eq!(text, "Hello from array");
+        assert!(matches!(chunks.last(), Some(Chunk::Done)));
     }
 
     #[tokio::test]

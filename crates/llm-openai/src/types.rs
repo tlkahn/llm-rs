@@ -56,6 +56,26 @@ impl MessageContent {
             MessageContent::Parts(_) => None,
         }
     }
+
+    /// Extract all text content from any variant.
+    ///
+    /// For `Text(s)`, returns the string directly.
+    /// For `Parts(parts)`, concatenates all `ContentPart::Text` parts.
+    /// Returns an empty string if there is no text.
+    pub fn text_content(&self) -> String {
+        match self {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Parts(parts) => {
+                let mut buf = String::new();
+                for part in parts {
+                    if let ContentPart::Text { text } = part {
+                        buf.push_str(text);
+                    }
+                }
+                buf
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -561,6 +581,68 @@ mod tests {
             }
             _ => panic!("expected Parts variant"),
         }
+    }
+
+    // --- text_content() tests ---
+
+    #[test]
+    fn text_content_from_text_variant() {
+        let content = MessageContent::Text("Hello".into());
+        assert_eq!(content.text_content(), "Hello");
+    }
+
+    #[test]
+    fn text_content_from_parts_single_text() {
+        let content = MessageContent::Parts(vec![ContentPart::Text {
+            text: "Hello".into(),
+        }]);
+        assert_eq!(content.text_content(), "Hello");
+    }
+
+    #[test]
+    fn text_content_from_parts_multiple_text() {
+        let content = MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "Hello".into(),
+            },
+            ContentPart::Text {
+                text: " world".into(),
+            },
+        ]);
+        assert_eq!(content.text_content(), "Hello world");
+    }
+
+    #[test]
+    fn text_content_from_parts_mixed_with_images() {
+        let content = MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "Caption".into(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/img.png".into(),
+                    detail: None,
+                },
+            },
+        ]);
+        assert_eq!(content.text_content(), "Caption");
+    }
+
+    #[test]
+    fn text_content_from_parts_empty() {
+        let content = MessageContent::Parts(vec![]);
+        assert_eq!(content.text_content(), "");
+    }
+
+    #[test]
+    fn text_content_from_parts_image_only() {
+        let content = MessageContent::Parts(vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "https://example.com/img.png".into(),
+                detail: Some("high".into()),
+            },
+        }]);
+        assert_eq!(content.text_content(), "");
     }
 
     #[test]

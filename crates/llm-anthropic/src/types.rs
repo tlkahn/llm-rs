@@ -87,7 +87,7 @@ impl ContentBlock {
     /// {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}}
     /// ```
     #[must_use]
-    pub fn image_base64(media_type: &str, data: &str) -> Self {
+    pub fn image_base64(media_type: impl Into<String>, data: impl Into<String>) -> Self {
         Self {
             block_type: "image".into(),
             text: None,
@@ -99,10 +99,31 @@ impl ContentBlock {
             is_error: None,
             source: Some(ImageSource {
                 source_type: "base64".into(),
-                media_type: Some(media_type.to_string()),
-                data: Some(data.to_string()),
+                media_type: Some(media_type.into()),
+                data: Some(data.into()),
                 url: None,
             }),
+        }
+    }
+
+    /// Create a text content block.
+    ///
+    /// Produces the Anthropic wire format:
+    /// ```json
+    /// {"type": "text", "text": "..."}
+    /// ```
+    #[must_use]
+    pub fn text(s: impl Into<String>) -> Self {
+        Self {
+            block_type: "text".into(),
+            text: Some(s.into()),
+            id: None,
+            name: None,
+            input: None,
+            tool_use_id: None,
+            content: None,
+            is_error: None,
+            source: None,
         }
     }
 
@@ -113,7 +134,7 @@ impl ContentBlock {
     /// {"type": "image", "source": {"type": "url", "url": "https://..."}}
     /// ```
     #[must_use]
-    pub fn image_url(url: &str) -> Self {
+    pub fn image_url(url: impl Into<String>) -> Self {
         Self {
             block_type: "image".into(),
             text: None,
@@ -127,7 +148,7 @@ impl ContentBlock {
                 source_type: "url".into(),
                 media_type: None,
                 data: None,
-                url: Some(url.to_string()),
+                url: Some(url.into()),
             }),
         }
     }
@@ -594,6 +615,58 @@ mod tests {
         assert_eq!(source.url.as_deref(), Some("https://example.com/img.png"));
         assert_eq!(source.media_type, None);
         assert_eq!(source.data, None);
+    }
+
+    // --- ContentBlock::text() tests ---
+
+    #[test]
+    fn text_block_serializes_correctly() {
+        let block = ContentBlock::text("Hello");
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["text"], "Hello");
+        // No other fields present
+        assert!(json.get("id").is_none());
+        assert!(json.get("name").is_none());
+        assert!(json.get("input").is_none());
+        assert!(json.get("tool_use_id").is_none());
+        assert!(json.get("content").is_none());
+        assert!(json.get("is_error").is_none());
+        assert!(json.get("source").is_none());
+    }
+
+    #[test]
+    fn text_block_empty_string() {
+        let block = ContentBlock::text("");
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["text"], "");
+    }
+
+    #[test]
+    fn image_base64_accepts_owned_strings() {
+        let media = String::from("image/png");
+        let data = String::from("iVBORw0KGgo=");
+        let block = ContentBlock::image_base64(media, data);
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["source"]["media_type"], "image/png");
+        assert_eq!(json["source"]["data"], "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn image_url_accepts_owned_string() {
+        let url = String::from("https://example.com/cat.jpg");
+        let block = ContentBlock::image_url(url);
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["source"]["url"], "https://example.com/cat.jpg");
+    }
+
+    #[test]
+    fn text_accepts_owned_string() {
+        let s = String::from("Hello");
+        let block = ContentBlock::text(s);
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["text"], "Hello");
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub use agent::{
     resolve_agent_budget, resolve_agent_model, resolve_agent_retry, resolve_agent_system,
     resolve_agent_tools,
 };
-pub use attachment::{ResolvedAttachment, resolve_to_base64};
+pub use attachment::{ResolvedAttachment, ResolvedImageBlock, resolve_attachments, resolve_prompt_paths, resolve_to_base64};
 pub use chain::{ChainEvent, ChainResult, ParallelConfig, ToolExecutor, chain};
 pub use config::{Config, KeyStore, Paths, parse_option_value, resolve_key};
 pub use error::{LlmError, Result};
@@ -26,6 +26,6 @@ pub use schema::{multi_schema, parse_schema_dsl};
 pub use stream::{Chunk, ResponseStream, collect_text, collect_tool_calls, collect_usage};
 pub use tools::BuiltinToolRegistry;
 pub use types::{
-    Attachment, AttachmentSource, Message, ModelInfo, Options, Prompt, Response, Role, Tool,
-    ToolCall, ToolResult, Usage,
+    Attachment, AttachmentSource, DEFAULT_IMAGE_MIME_TYPES, Message, ModelInfo, Options, Prompt,
+    Response, Role, Tool, ToolCall, ToolResult, Usage,
 };
